@@ -49,7 +49,6 @@ def _applications() -> list[dict]:
     return [
         _human_app("*.sligolabs.com"),
         _human_app("claw.sligolabs.com"),
-        _human_app("pid.sligolabs.com"),
         _bypass_app("sligo.sligolabs.com/webhooks/*"),
         _bypass_app("hermes.sligolabs.com/api/status"),
         _bypass_app("hermes.sligolabs.com/api/cron/fire"),
@@ -74,7 +73,6 @@ def _tunnel() -> dict:
             },
             {"hostname": "sligo.sligolabs.com", "service": "http://127.0.0.1:9119"},
             {"hostname": "claw.sligolabs.com", "service": "http://127.0.0.1:8720"},
-            {"hostname": "pid.sligolabs.com", "service": "http://127.0.0.1:5173"},
             {"service": "http_status:404"},
         ],
     }
@@ -196,20 +194,18 @@ def test_wrong_machine_action_is_drift(tmp_path, capsys):
     assert "expected bypass" in stdout
 
 
-def test_wildcard_and_pid_action_issues_are_drift(tmp_path, capsys):
+def test_missing_wildcard_is_drift(tmp_path, capsys):
     apps = [app for app in _applications() if app["domain"] != "*.sligolabs.com"]
-    pid = next(app for app in apps if app["domain"] == "pid.sligolabs.com")
-    pid["policies"][0]["decision"] = "bypass"
 
     result, stdout, _stderr = _run(tmp_path, apps, capsys)
 
     assert result == 1
     assert "required application missing: *.sligolabs.com" in stdout
-    assert "pid.sligolabs.com expected allow" in stdout
 
 
 def test_unapproved_exact_override_and_dev_namespace_are_drift(tmp_path, capsys):
     apps = _applications()
+    apps.append(_human_app("pid.sligolabs.com"))
     apps.append(_bypass_app("other.sligolabs.com"))
     apps.append(_human_app("*.dev.sligolabs.com"))
 

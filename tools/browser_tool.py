@@ -3515,6 +3515,7 @@ def browser_authenticate(
             password_selector=selected.password_selector,
             submit_selector=selected.submit_selector,
             success_selector=selected.success_selector,
+            expected_origin=str(current.get("origin") or ""),
             timeout=selected.timeout_s,
         )
         username = password = ""

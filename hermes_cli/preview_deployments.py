@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import re
+from base64 import b64decode
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 CommandRunner = Callable[..., Any]
+VERCEL_GITHUB_APP_ID = 8329
 
 
 @dataclass(frozen=True)
@@ -72,25 +75,139 @@ def _deployment_sort_key(value: Mapping[str, Any]) -> tuple[str, int]:
     return created_at, deployment_id
 
 
-def _vercel_branch_preview_url(comments: Any) -> str:
+def _is_vercel_bot(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and str(value.get("login") or "").lower() == "vercel[bot]"
+        and str(value.get("type") or "").lower() == "bot"
+    )
+
+
+def _vercel_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def _utc_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _vercel_comment_payload(body: str) -> Mapping[str, Any] | None:
+    first_line = body.splitlines()[0] if body else ""
+    match = re.fullmatch(r"\[vc\]: #[^:\s]+:([A-Za-z0-9+/=]+)", first_line)
+    if match is None:
+        return None
+    try:
+        decoded = b64decode(match.group(1), validate=True).decode("utf-8")
+        payload = json.loads(decoded)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _vercel_branch_preview_url(
+    comments: Any,
+    *,
+    repository: str,
+    branch: str,
+    pr_number: int,
+    deployment_url: str,
+    deployment_updated_at: Any,
+) -> str:
     if not isinstance(comments, list):
         return ""
+    try:
+        owner, repository_name = repository.split("/", 1)
+    except ValueError:
+        return ""
+    team_slug = _vercel_slug(owner)
+    project_slug = _vercel_slug(repository_name)
+    branch_slug = _vercel_slug(branch)
+    if not team_slug or not project_slug or not branch_slug:
+        return ""
+    expected_url = (
+        f"https://{project_slug}-git-{branch_slug}-{team_slug}.vercel.app"
+    )
+    deployment_host = str(urlsplit(deployment_url).hostname or "").lower()
+    if not (
+        deployment_host.startswith(f"{project_slug}-")
+        and deployment_host.endswith(f"-{team_slug}.vercel.app")
+    ):
+        return ""
+    deployment_time = _utc_timestamp(deployment_updated_at)
+    if deployment_time is None:
+        return ""
+
     for comment in reversed(comments[-100:]):
         if not isinstance(comment, Mapping):
             continue
         author = comment.get("user")
-        login = (
-            str(author.get("login") or "").lower()
-            if isinstance(author, Mapping)
-            else ""
-        )
-        if "vercel" not in login:
+        app = comment.get("performed_via_github_app")
+        if not _is_vercel_bot(author) or not isinstance(app, Mapping):
+            continue
+        if app.get("id") != VERCEL_GITHUB_APP_ID or app.get("slug") != "vercel":
+            continue
+        comment_time = _utc_timestamp(comment.get("updated_at"))
+        if comment_time is None or comment_time < deployment_time:
             continue
         body = str(comment.get("body") or "")
-        for candidate in re.findall(r"https://[a-z0-9.-]+\.vercel\.app", body):
-            hostname = str(urlsplit(candidate).hostname or "").lower()
-            if "-git-" in hostname and _is_vercel_preview_url(candidate):
-                return candidate
+        payload = _vercel_comment_payload(body)
+        if payload is None:
+            continue
+        projects = payload.get("projects")
+        if not isinstance(projects, list):
+            continue
+        project = next(
+            (
+                item
+                for item in projects
+                if isinstance(item, Mapping)
+                and str(item.get("name") or "").lower() == project_slug
+            ),
+            None,
+        )
+        if project is None:
+            continue
+        expected_host = str(urlsplit(expected_url).hostname or "")
+        preview_url = str(project.get("previewUrl") or "").strip()
+        if preview_url not in {expected_url, expected_host}:
+            continue
+        if str(project.get("nextCommitStatus") or "") != "DEPLOYED":
+            continue
+        inspector_url = str(project.get("inspectorUrl") or "").strip()
+        if not inspector_url.startswith(
+            f"https://vercel.com/{team_slug}/{project_slug}/"
+        ):
+            continue
+        review_url = urlsplit(str(payload.get("requestReviewUrl") or ""))
+        review_query = parse_qs(review_url.query)
+        if (
+            review_url.scheme != "https"
+            or review_url.netloc != "vercel.com"
+            or review_url.path != "/vercel-agent/request-review"
+            or review_query.get("owner") != [owner]
+            or review_query.get("repo") != [repository_name]
+            or review_query.get("pr") != [str(pr_number)]
+        ):
+            continue
+        if (
+            f"[{project_slug}](https://vercel.com/{team_slug}/{project_slug})"
+            not in body.lower()
+        ):
+            continue
+        if f"[preview]({expected_url})" not in body.lower():
+            continue
+        if inspector_url not in body:
+            continue
+        return expected_url
     return ""
 
 
@@ -141,13 +258,7 @@ def collect_vercel_preview(
     for deployment in deployments[:100]:
         if not isinstance(deployment, Mapping):
             continue
-        creator = deployment.get("creator")
-        creator_login = (
-            str(creator.get("login") or "").lower()
-            if isinstance(creator, Mapping)
-            else ""
-        )
-        if "vercel" not in creator_login:
+        if not _is_vercel_bot(deployment.get("creator")):
             continue
         if str(deployment.get("sha") or "").strip().lower() != head_sha:
             continue
@@ -200,7 +311,11 @@ def collect_vercel_preview(
 
     state = str(latest.get("state") or "").strip().lower()
     deployment_url = str(latest.get("environment_url") or "").strip()
-    if state == "success" and _is_vercel_preview_url(deployment_url):
+    if (
+        state == "success"
+        and _is_vercel_preview_url(deployment_url)
+        and _is_vercel_bot(latest.get("creator"))
+    ):
         comments_result = run(
             [
                 "gh",
@@ -212,7 +327,17 @@ def collect_vercel_preview(
             github=True,
         )
         branch_url = _vercel_branch_preview_url(
-            _json_payload(comments_result, default=[])
+            _json_payload(comments_result, default=[]),
+            repository=repository,
+            branch=branch,
+            pr_number=int(pr_number),
+            deployment_url=deployment_url,
+            deployment_updated_at=(
+                latest.get("updated_at")
+                or latest.get("created_at")
+                or deployment.get("updated_at")
+                or deployment.get("created_at")
+            ),
         )
         if not branch_url:
             return PreviewDeployment(

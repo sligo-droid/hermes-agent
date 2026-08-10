@@ -8,7 +8,6 @@ The repository owns the desired semantics and offline validator. Cloudflare acco
 
 - Create one human Access application for `*.sligolabs.com` with the same IdP, allow/group semantics, and session behavior as the existing exact `claw.sligolabs.com` application.
 - Preserve the exact Claw application. Claw consumes `CF-Access-Authenticated-User-Email` for local authorization; a Bypass would remove that identity boundary.
-- Keep the exact `pid.sligolabs.com` human Access application. PID uses the same email-code edge login pattern as the other Sligo Labs hosts, then keeps its native Agora/Supabase authorization inside the application.
 - Do not add `*.dev.sligolabs.com`. Access `*.sligolabs.com` covers one hostname level and does not cover deeper development hosts.
 - Keep Hermes dashboard, gateway webhook receiver, trace resolver, and Claw origins bound to loopback.
 - Keep origin authenticators and authorization in place: webhook HMAC, NAS cron-fire JWT, Hermes session/application auth, Claw role checks, and the trace resolver's required Cloudflare identity headers.
@@ -22,10 +21,9 @@ The operator-managed local tunnel configuration is `/home/droid/.cloudflared/sli
 2. `sligo.sligolabs.com` trace paths to loopback port `8788`.
 3. The remaining `sligo.sligolabs.com` traffic to loopback port `9119`.
 4. `claw.sligolabs.com` to loopback port `8720`.
-5. `pid.sligolabs.com` to loopback port `5173`.
-6. A terminal `http_status:404` rule.
+5. A terminal `http_status:404` rule.
 
-The PID ingress and hostname are active. Its exact Access application must remain a human Allow so the native PID login is not exposed directly to the public edge.
+PID is deployed through Vercel feature branches and is outside this Cloudflare tunnel contract. A `pid.sligolabs.com` Access application or tunnel ingress is retired state and should be removed by the Cloudflare operator.
 
 `hermes.sligolabs.com` reaches the dashboard through a separately managed remote tunnel. Do not pretend that route is present in the local YAML. Verify it manually or provide the validator a sanitized route-only export.
 
@@ -45,7 +43,6 @@ The canonical, secret-free topology is in `sligolabs-cloudflare-access.expected.
 | --- | --- | --- |
 | `*.sligolabs.com` | Allow | Human policy semantics and session behavior match exact Claw. First-level hosts only. |
 | `claw.sligolabs.com` | Allow | Preserve the existing exact application and policy. It remains the policy reference. |
-| `pid.sligolabs.com` | Allow | Email-code Access runs before PID's native login and application authorization. |
 | `*.dev.sligolabs.com` | None | Explicitly excluded from this rollout. |
 
 Cloudflare resolves more-specific exact host/path applications before the wildcard. Create all exceptions before enabling the wildcard.
@@ -68,7 +65,7 @@ A future migration from cron Bypass to Service Auth is allowed only after every 
 1. Confirm the merged Hermes deployment includes forwarded/Cloudflare `/api/status` redaction and shared public-path handling.
 2. Export Access applications and embedded policies with a read-only Cloudflare credential to an operator-owned secure location.
 3. Confirm the exact Claw application, its human allow policy semantics, IdP configuration, and session duration.
-4. Confirm there is no conflicting wildcard, PID Bypass, duplicate path application, or `*.dev.sligolabs.com` application.
+4. Confirm there is no conflicting wildcard, retired PID application, duplicate path application, or `*.dev.sligolabs.com` application.
 5. Confirm which public host monitoring uses for `/api/status` and which callback host Chronos uses for `/api/cron/fire`; update the expected manifest if the observed hosts differ.
 6. Inspect the local tunnel ingress ordering and separately verify the remote Hermes route.
 7. Save an operator-owned rollback export. Do not attach it to the public PR or copy it into this repository.
@@ -114,7 +111,7 @@ Before sharing output, confirm it contains no IDs, identities, raw rules, creden
 2. Verify direct-loopback `/api/status` still has operator detail and a simulated forwarded/Cloudflare request has only the safe liveness shape.
 3. Verify dashboard roots do not emit an origin Basic challenge, while sensitive APIs still require Hermes session/application authentication and `/api/status` and `/api/cron/fire` retain their narrow public-path behavior.
 4. Verify invalid webhook HMAC and invalid cron JWT requests are rejected at the origin.
-5. Confirm the exact PID human application uses the email-code login and does not Bypass Access.
+5. Remove any retired `pid.sligolabs.com` Access application and tunnel ingress through the operator-owned Cloudflare configuration.
 6. Create the Sligo webhook Bypass, every configured status Bypass, every configured cron Bypass, and the Sligo trace human application.
 7. Confirm trace Access policy matches Claw and the trace resolver rejects requests missing Cloudflare identity headers without emitting `WWW-Authenticate: Basic`.
 8. Confirm the exact Claw application is unchanged.
@@ -140,10 +137,11 @@ Do not remove origin authentication during this sequence.
 - Cron bypasses Access only on configured hosts. An invalid NAS JWT is rejected; a valid fire request succeeds with `Authorization` unchanged.
 - Trace paths require human Access. The origin accepts the forwarded Cloudflare identity headers and never returns a Basic challenge.
 
-### PID and development non-impact
+### PID and development boundary
 
 - `pid.sligo-labs.vercel.app` login and bearer-authenticated APIs behave exactly as before.
-- `pid.sligolabs.com` presents the Cloudflare email-code login first, then preserves PID's native login and authorization behavior.
+- PID feature work uses its branch-specific `pid-git-*-sligo-labs.vercel.app` URL.
+- No PID hostname or origin is served by the Sligo Labs Cloudflare tunnel.
 - No `*.dev.sligolabs.com` application, DNS, tunnel, or TLS change is made.
 
 ## Rollback
@@ -152,8 +150,8 @@ Do not remove origin authentication during this sequence.
 2. Disable only the wildcard human application first.
 3. Restore the previously exported Claw/policy state if any unintended change occurred.
 4. Do not expose a browser surface without Access. If Access cannot be restored, stop the affected tunnel route instead of restoring Basic Auth.
-5. Recheck webhook HMAC, status redaction, cron JWT rejection, trace Cloudflare-header rejection, Claw role checks, and PID login.
-6. Retain the exact PID human application and narrow machine-path exceptions until the public edge is stable; removing exceptions before the parent can invert precedence during rollback.
+5. Recheck webhook HMAC, status redaction, cron JWT rejection, trace Cloudflare-header rejection, Claw role checks, and the Vercel-hosted PID login.
+6. Retain narrow machine-path exceptions until the public edge is stable; removing exceptions before the parent can invert precedence during rollback.
 7. Record the incident using sanitized facts only. Keep account exports and secrets in operator-owned storage.
 
 ## Ownership boundary

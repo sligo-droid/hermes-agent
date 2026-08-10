@@ -723,6 +723,7 @@ class CDPSupervisor:
         password_selector: str,
         submit_selector: str,
         success_selector: str,
+        expected_origin: str,
         timeout: float = 30.0,
     ) -> Dict[str, Any]:
         """Fill one trusted login form without exposing credentials to tools.
@@ -733,6 +734,9 @@ class CDPSupervisor:
         """
 
         timeout = max(1.0, min(float(timeout or 30.0), 30.0))
+        approved_origin = _http_origin(expected_origin)
+        if not approved_origin:
+            return {"ok": False, "error": "browser authentication origin is invalid"}
         loop = self._loop
         if loop is None or not loop.is_running():
             return {"ok": False, "error": "browser supervisor is unavailable"}
@@ -804,8 +808,23 @@ class CDPSupervisor:
                 )
                 return response.get("result", {}).get("result", {}).get("value") is True
 
+            async def _origin_is_approved() -> bool:
+                response = await self._cdp(
+                    "Runtime.evaluate",
+                    {"expression": "location.origin", "returnByValue": True},
+                    session_id=session_id,
+                    timeout=min(timeout, 10.0),
+                )
+                current_origin = response.get("result", {}).get("result", {}).get("value")
+                return current_origin == approved_origin
+
             if not await _focus(username_selector):
                 return {"ok": False, "error": "browser login form was not available"}
+            if not await _origin_is_approved():
+                return {
+                    "ok": False,
+                    "error": "browser origin changed before protected credentials were inserted",
+                }
             await self._cdp(
                 "Input.insertText",
                 {"text": username},
@@ -814,6 +833,11 @@ class CDPSupervisor:
             )
             if not await _focus(password_selector):
                 return {"ok": False, "error": "browser login form was not available"}
+            if not await _origin_is_approved():
+                return {
+                    "ok": False,
+                    "error": "browser origin changed before protected credentials were inserted",
+                }
             await self._cdp(
                 "Input.insertText",
                 {"text": password},

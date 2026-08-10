@@ -258,11 +258,17 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
         if method == "Runtime.evaluate" and params.get("expression") == "globalThis":
             return {"result": {"result": {"objectId": "global-1"}}}
         if method == "Runtime.evaluate":
-            value = (
-                True
-                if params.get("expression") == "document.readyState === 'complete'"
-                else submitted
-            )
+            expression = params.get("expression")
+            if expression == "location.origin":
+                return {
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": "https://pid.sligolabs.com",
+                        }
+                    }
+                }
+            value = True if expression == "document.readyState === 'complete'" else submitted
             return {"result": {"result": {"type": "boolean", "value": value}}}
         if method == "Runtime.callFunctionOn":
             if "requestSubmit" in params["functionDeclaration"]:
@@ -281,6 +287,7 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
             password_selector="#login-pass",
             submit_selector="button[type=submit]",
             success_selector="#header",
+            expected_origin="https://pid.sligolabs.com",
             timeout=2,
         )
     finally:
@@ -324,6 +331,14 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
             return {"result": {"result": {"objectId": "global-1"}}}
         if method == "Runtime.evaluate":
             expression = params.get("expression", "")
+            if expression == "location.origin":
+                return {
+                    "result": {
+                        "result": {
+                            "value": "https://pid.sligolabs.com",
+                        }
+                    }
+                }
             if expression == "document.readyState === 'complete'":
                 value = True
             elif expression == "performance.timeOrigin":
@@ -353,6 +368,7 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
             password_selector="#login-pass",
             submit_selector="button[type=submit]",
             success_selector="#header",
+            expected_origin="https://pid.sligolabs.com",
             timeout=2,
         )
     finally:
@@ -367,6 +383,67 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
             "use a stable local preview without external HMR redirects"
         ),
     }
+    assert "hermes_qa" not in json.dumps(result)
+    assert "top-secret-password" not in json.dumps(result)
+
+
+def test_supervisor_rechecks_origin_before_inserting_credentials():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    supervisor = CDPSupervisor(task_id="auth-origin-test", cdp_url="ws://example.test")
+    supervisor._loop = loop
+    supervisor._active = True
+    supervisor._page_session_id = "page-1"
+    inserted = []
+
+    async def fake_cdp(method, params=None, **kwargs):
+        if method == "Runtime.evaluate" and params.get("expression") == "globalThis":
+            return {"result": {"result": {"objectId": "global-1"}}}
+        if method == "Runtime.evaluate":
+            expression = params.get("expression", "")
+            if expression == "location.origin":
+                return {
+                    "result": {
+                        "result": {"value": "https://attacker.example"}
+                    }
+                }
+            if expression == "document.readyState === 'complete'":
+                value = True
+            elif expression == "performance.timeOrigin":
+                value = 1000.0
+            else:
+                value = False
+            return {"result": {"result": {"value": value}}}
+        if method == "Runtime.callFunctionOn":
+            return {"result": {"result": {"value": True}}}
+        if method == "Input.insertText":
+            inserted.append(params["text"])
+            return {"result": {}}
+        raise AssertionError(method)
+
+    supervisor._cdp = fake_cdp
+    try:
+        result = supervisor.authenticate_form(
+            username="hermes_qa",
+            password="top-secret-password",
+            username_selector="#login-user",
+            password_selector="#login-pass",
+            submit_selector="button[type=submit]",
+            success_selector="#header",
+            expected_origin="https://pid.sligolabs.com",
+            timeout=2,
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+    assert result == {
+        "ok": False,
+        "error": "browser origin changed before protected credentials were inserted",
+    }
+    assert inserted == []
     assert "hermes_qa" not in json.dumps(result)
     assert "top-secret-password" not in json.dumps(result)
 
