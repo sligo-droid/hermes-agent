@@ -2124,14 +2124,14 @@ shell text.
 
 ```yaml
 project_observations:
-  pid-runtime-status:
-    description: Authoritative PID lifecycle and health status
-    cwd: /home/droid/.hermes/workspace/PID
+  repository-status:
+    description: Read-only repository branch and worktree status
+    cwd: /srv/example-app
     argv:
-      - python3
-      - scripts/local_lifecycle/runtime_status.py
-      - --repo
-      - /home/droid/.hermes/workspace/PID
+      - git
+      - status
+      - --short
+      - --branch
     timeout_seconds: 20
 ```
 

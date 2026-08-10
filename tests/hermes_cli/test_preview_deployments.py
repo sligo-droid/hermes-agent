@@ -13,6 +13,7 @@ HEAD_SHA = "a" * 40
 BRANCH = "discord/thread-1"
 DEPLOYMENT_URL = "https://pid-a1b2c3-sligo-labs.vercel.app"
 BRANCH_URL = "https://pid-git-discord-thread-1-sligo-labs.vercel.app"
+VERCEL_DEPLOYMENT_ID = "deployment-1"
 
 
 def _completed(args, payload, returncode=0):
@@ -62,8 +63,9 @@ def _vercel_comment(
     repository="PID",
     pr_number=17,
     updated_at="2026-08-09T12:00:02Z",
+    inspector_id=VERCEL_DEPLOYMENT_ID,
 ):
-    inspector_url = f"https://vercel.com/{team}/{project}/deployment-1"
+    inspector_url = f"https://vercel.com/{team}/{project}/{inspector_id}"
     payload = {
         "projects": [
             {
@@ -97,6 +99,18 @@ def _ready_run(comment):
 
     def run(args, **_kwargs):
         calls.append(args)
+        if args[:2] == ["vercel", "inspect"]:
+            return _completed(
+                args,
+                {
+                    "id": f"dpl_{VERCEL_DEPLOYMENT_ID}",
+                    "name": "pid",
+                    "url": "pid-a1b2c3-sligo-labs.vercel.app",
+                    "target": "preview",
+                    "readyState": "READY",
+                    "aliases": [BRANCH_URL.removeprefix("https://")],
+                },
+            )
         if "/deployments?" in args[2]:
             return _completed(args, [_deployment()])
         if "/statuses?" in args[2]:
@@ -129,7 +143,7 @@ def test_collect_vercel_preview_returns_branch_alias_after_exact_head_ready(tmp_
         "url": BRANCH_URL,
         "deployment_id": "42",
     }
-    assert len(calls) == 3
+    assert len(calls) == 4
 
 
 def test_collect_vercel_preview_rejects_wrong_head_and_non_preview_alias(tmp_path):
@@ -179,6 +193,7 @@ def test_collect_vercel_preview_waits_for_branch_alias_comment(tmp_path):
             branch_url="https://pid-git-unrelated-branch-sligo-labs.vercel.app"
         ),
         _vercel_comment(updated_at="2026-08-09T11:59:59Z"),
+        _vercel_comment(inspector_id="newer-deployment"),
     ],
 )
 def test_collect_vercel_preview_rejects_unbound_or_stale_vercel_comments(

@@ -271,11 +271,11 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
             value = True if expression == "document.readyState === 'complete'" else submitted
             return {"result": {"result": {"type": "boolean", "value": value}}}
         if method == "Runtime.callFunctionOn":
+            if "expectedOrigin" in params["functionDeclaration"]:
+                return {"result": {"result": {"type": "string", "value": "inserted"}}}
             if "requestSubmit" in params["functionDeclaration"]:
                 submitted = True
             return {"result": {"result": {"type": "boolean", "value": True}}}
-        if method == "Input.insertText":
-            return {"result": {}}
         raise AssertionError(method)
 
     supervisor._cdp = fake_cdp
@@ -307,9 +307,17 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
     ]
     assert all("hermes_qa" not in source for source in function_sources)
     assert all("top-secret-password" not in source for source in function_sources)
-    assert [
-        params["text"] for method, params in calls if method == "Input.insertText"
-    ] == ["hermes_qa", "top-secret-password"]
+    insert_arguments = [
+        params["arguments"]
+        for method, params in calls
+        if method == "Runtime.callFunctionOn"
+        and "expectedOrigin" in params["functionDeclaration"]
+    ]
+    assert [arguments[2]["value"] for arguments in insert_arguments] == [
+        "hermes_qa",
+        "top-secret-password",
+    ]
+    assert all(method != "Input.insertText" for method, _params in calls)
     assert "hermes_qa" not in json.dumps(result)
     assert "top-secret-password" not in json.dumps(result)
 
@@ -351,12 +359,12 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
                 value = False
             return {"result": {"result": {"value": value}}}
         if method == "Runtime.callFunctionOn":
+            if "expectedOrigin" in params["functionDeclaration"]:
+                return {"result": {"result": {"value": "inserted"}}}
             if "requestSubmit" in params["functionDeclaration"]:
                 submitted = True
                 time_origin = 2000.0
             return {"result": {"result": {"value": True}}}
-        if method == "Input.insertText":
-            return {"result": {}}
         raise AssertionError(method)
 
     supervisor._cdp = fake_cdp
@@ -387,7 +395,7 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
     assert "top-secret-password" not in json.dumps(result)
 
 
-def test_supervisor_rechecks_origin_before_inserting_credentials():
+def test_supervisor_checks_origin_and_inserts_credentials_atomically():
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
@@ -395,19 +403,14 @@ def test_supervisor_rechecks_origin_before_inserting_credentials():
     supervisor._loop = loop
     supervisor._active = True
     supervisor._page_session_id = "page-1"
-    inserted = []
+    calls = []
 
     async def fake_cdp(method, params=None, **kwargs):
+        calls.append((method, params))
         if method == "Runtime.evaluate" and params.get("expression") == "globalThis":
             return {"result": {"result": {"objectId": "global-1"}}}
         if method == "Runtime.evaluate":
             expression = params.get("expression", "")
-            if expression == "location.origin":
-                return {
-                    "result": {
-                        "result": {"value": "https://attacker.example"}
-                    }
-                }
             if expression == "document.readyState === 'complete'":
                 value = True
             elif expression == "performance.timeOrigin":
@@ -416,10 +419,12 @@ def test_supervisor_rechecks_origin_before_inserting_credentials():
                 value = False
             return {"result": {"result": {"value": value}}}
         if method == "Runtime.callFunctionOn":
+            if "expectedOrigin" in params["functionDeclaration"]:
+                arguments = params["arguments"]
+                assert arguments[1]["value"] == "https://pid.sligolabs.com"
+                assert arguments[2]["value"] == "hermes_qa"
+                return {"result": {"result": {"value": "origin_changed"}}}
             return {"result": {"result": {"value": True}}}
-        if method == "Input.insertText":
-            inserted.append(params["text"])
-            return {"result": {}}
         raise AssertionError(method)
 
     supervisor._cdp = fake_cdp
@@ -443,7 +448,11 @@ def test_supervisor_rechecks_origin_before_inserting_credentials():
         "ok": False,
         "error": "browser origin changed before protected credentials were inserted",
     }
-    assert inserted == []
+    assert all(method != "Input.insertText" for method, _params in calls)
+    assert not any(
+        method == "Runtime.evaluate" and params.get("expression") == "location.origin"
+        for method, params in calls
+    )
     assert "hermes_qa" not in json.dumps(result)
     assert "top-secret-password" not in json.dumps(result)
 

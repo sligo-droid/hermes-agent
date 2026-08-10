@@ -787,63 +787,70 @@ class CDPSupervisor:
             if not object_id:
                 return {"ok": False, "error": "browser login context is unavailable"}
 
-            async def _focus(selector: str) -> bool:
+            async def _insert_if_origin_matches(
+                selector: str,
+                value: str,
+            ) -> str:
                 response = await self._cdp(
                     "Runtime.callFunctionOn",
                     {
                         "objectId": object_id,
-                        "functionDeclaration": """function(selector) {
+                        "functionDeclaration": """function(selector, expectedOrigin, value) {
+                          if (location.origin !== expectedOrigin) return 'origin_changed';
                           const element = document.querySelector(selector);
-                          if (!element) return false;
+                          if (!element) return 'missing';
                           element.focus();
                           if (typeof element.select === 'function') element.select();
-                          return true;
+                          const prototype = Object.getPrototypeOf(element);
+                          const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+                          if (!descriptor || typeof descriptor.set !== 'function') return 'unsupported';
+                          descriptor.set.call(element, value);
+                          element.dispatchEvent(new InputEvent('input', {
+                            bubbles: true,
+                            composed: true,
+                            data: value,
+                            inputType: 'insertText'
+                          }));
+                          element.dispatchEvent(new Event('change', { bubbles: true }));
+                          return 'inserted';
                         }""",
-                        "arguments": [{"value": selector}],
+                        "arguments": [
+                            {"value": selector},
+                            {"value": approved_origin},
+                            {"value": value},
+                        ],
                         "returnByValue": True,
                         "userGesture": True,
                     },
                     session_id=session_id,
                     timeout=min(timeout, 10.0),
                 )
-                return response.get("result", {}).get("result", {}).get("value") is True
-
-            async def _origin_is_approved() -> bool:
-                response = await self._cdp(
-                    "Runtime.evaluate",
-                    {"expression": "location.origin", "returnByValue": True},
-                    session_id=session_id,
-                    timeout=min(timeout, 10.0),
+                return str(
+                    response.get("result", {}).get("result", {}).get("value") or ""
                 )
-                current_origin = response.get("result", {}).get("result", {}).get("value")
-                return current_origin == approved_origin
 
-            if not await _focus(username_selector):
-                return {"ok": False, "error": "browser login form was not available"}
-            if not await _origin_is_approved():
+            username_result = await _insert_if_origin_matches(
+                username_selector,
+                username,
+            )
+            if username_result == "origin_changed":
                 return {
                     "ok": False,
                     "error": "browser origin changed before protected credentials were inserted",
                 }
-            await self._cdp(
-                "Input.insertText",
-                {"text": username},
-                session_id=session_id,
-                timeout=min(timeout, 10.0),
-            )
-            if not await _focus(password_selector):
+            if username_result != "inserted":
                 return {"ok": False, "error": "browser login form was not available"}
-            if not await _origin_is_approved():
+            password_result = await _insert_if_origin_matches(
+                password_selector,
+                password,
+            )
+            if password_result == "origin_changed":
                 return {
                     "ok": False,
                     "error": "browser origin changed before protected credentials were inserted",
                 }
-            await self._cdp(
-                "Input.insertText",
-                {"text": password},
-                session_id=session_id,
-                timeout=min(timeout, 10.0),
-            )
+            if password_result != "inserted":
+                return {"ok": False, "error": "browser login form was not available"}
             response = await self._cdp(
                 "Runtime.callFunctionOn",
                 {

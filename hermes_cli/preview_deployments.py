@@ -121,6 +121,7 @@ def _vercel_branch_preview_url(
     pr_number: int,
     deployment_url: str,
     deployment_updated_at: Any,
+    vercel_deployment_id: str,
 ) -> str:
     if not isinstance(comments, list):
         return ""
@@ -186,6 +187,8 @@ def _vercel_branch_preview_url(
         if not inspector_url.startswith(
             f"https://vercel.com/{team_slug}/{project_slug}/"
         ):
+            continue
+        if urlsplit(inspector_url).path.rsplit("/", 1)[-1] != vercel_deployment_id:
             continue
         review_url = urlsplit(str(payload.get("requestReviewUrl") or ""))
         review_query = parse_qs(review_url.query)
@@ -316,6 +319,46 @@ def collect_vercel_preview(
         and _is_vercel_preview_url(deployment_url)
         and _is_vercel_bot(latest.get("creator"))
     ):
+        inspection_result = run(
+            ["vercel", "inspect", deployment_url, "--json"],
+            cwd=root,
+            timeout=30,
+        )
+        inspection = _json_payload(inspection_result, default={})
+        if not isinstance(inspection, Mapping):
+            return PreviewDeployment(
+                status="pending",
+                observed_sha=head_sha,
+                deployment_id=deployment_id,
+                diagnostic_code="preview_inspection_unavailable",
+            )
+        try:
+            owner, repository_name = repository.split("/", 1)
+        except ValueError:
+            owner = repository_name = ""
+        project_slug = _vercel_slug(repository_name)
+        expected_branch_url = (
+            f"https://{project_slug}-git-{_vercel_slug(branch)}-"
+            f"{_vercel_slug(owner)}.vercel.app"
+        )
+        inspected_url = str(inspection.get("url") or "").strip()
+        inspected_id = str(inspection.get("id") or "").strip()
+        aliases = inspection.get("aliases")
+        if not (
+            inspected_id.startswith("dpl_")
+            and inspected_url == str(urlsplit(deployment_url).hostname or "")
+            and str(inspection.get("name") or "").lower() == project_slug
+            and str(inspection.get("target") or "").lower() == "preview"
+            and str(inspection.get("readyState") or "").upper() == "READY"
+            and isinstance(aliases, list)
+            and str(urlsplit(expected_branch_url).hostname or "") in aliases
+        ):
+            return PreviewDeployment(
+                status="pending",
+                observed_sha=head_sha,
+                deployment_id=deployment_id,
+                diagnostic_code="preview_inspection_unavailable",
+            )
         comments_result = run(
             [
                 "gh",
@@ -332,6 +375,7 @@ def collect_vercel_preview(
             branch=branch,
             pr_number=int(pr_number),
             deployment_url=deployment_url,
+            vercel_deployment_id=inspected_id.removeprefix("dpl_"),
             deployment_updated_at=(
                 latest.get("updated_at")
                 or latest.get("created_at")

@@ -177,6 +177,20 @@ def _preview_run(
 
     def run(args, **_kwargs):
         calls.append(args)
+        if args[:2] == ["vercel", "inspect"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": "dpl_deployment-1",
+                        "name": "example",
+                        "url": "example-a1b2c3-acme.vercel.app",
+                        "target": "preview",
+                        "readyState": "READY",
+                        "aliases": ["example-git-feature-test-acme.vercel.app"],
+                    }
+                ),
+            )
         if args[:3] == ["gh", "auth", "status"]:
             return _completed(args)
         if args[:3] == ["gh", "pr", "view"]:
