@@ -10588,6 +10588,9 @@ class _GatewayRunnerCore(
     async def _on_trusted_closeout_terminal(self, item: Dict[str, Any]) -> None:
         """Deliver deterministic terminal closeout state through existing paths."""
 
+        work_id = str(item.get("id") or "")
+        if work_id and not self._ledger().preview_delivery_satisfied(work_id):
+            return
         if str(item.get("status") or "") in {
             "agent_done",
             "response_delivered",

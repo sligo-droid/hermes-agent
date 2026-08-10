@@ -699,11 +699,22 @@ async def test_ready_preview_is_notified_before_blocked_terminal_callback(monkey
         }
         return SimpleNamespace(state=updated)
 
+    def on_preview(stored):
+        callbacks.append("preview")
+        owner = "blocked-preview"
+        assert ledger.claim_preview_delivery(stored["id"], owner=owner) is not None
+        assert ledger.begin_preview_send_attempt(stored["id"], owner=owner) is True
+        assert ledger.complete_preview_delivery(
+            stored["id"],
+            owner=owner,
+            result_message_id="blocked-preview-message",
+        ) is True
+
     watcher = TrustedCloseoutWatcher(
         ledger,
         reconcile=reconcile,
         owner="watcher-1",
-        on_preview=lambda _stored: callbacks.append("preview"),
+        on_preview=on_preview,
         on_terminal=lambda _stored: callbacks.append("terminal"),
     )
 
@@ -751,17 +762,101 @@ async def test_ready_preview_is_notified_before_success_terminal_callback(monkey
         }
         return SimpleNamespace(state=updated)
 
+    def on_preview(stored):
+        callbacks.append("preview")
+        owner = "success-preview"
+        assert ledger.claim_preview_delivery(stored["id"], owner=owner) is not None
+        assert ledger.begin_preview_send_attempt(stored["id"], owner=owner) is True
+        assert ledger.complete_preview_delivery(
+            stored["id"],
+            owner=owner,
+            result_message_id="success-preview-message",
+        ) is True
+
     watcher = TrustedCloseoutWatcher(
         ledger,
         reconcile=reconcile,
         owner="watcher-1",
-        on_preview=lambda _stored: callbacks.append("preview"),
+        on_preview=on_preview,
         on_terminal=lambda _stored: callbacks.append("terminal"),
     )
 
     assert await watcher.run_once() == 1
     assert callbacks == ["preview", "terminal"]
     assert ledger.get(item["id"])["status"] == "agent_done"
+
+
+@pytest.mark.asyncio
+async def test_terminal_callback_waits_for_preview_retry_completion(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: now[0])
+    item, _state = _pending_item(ledger)
+    callbacks = []
+    head_sha = "9" * 40
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "pr_published"
+        updated["next_due_at"] = None
+        updated["policy"] = {
+            **updated["policy"],
+            "require_preview": True,
+            "require_local_verification": False,
+            "require_review": False,
+            "require_visual_qa": False,
+        }
+        updated["pr"] = {
+            **updated["pr"],
+            "url": "https://github.com/acme/example/pull/12",
+            "state": "OPEN",
+            "head_sha": head_sha,
+        }
+        updated["ci"] = {**updated["ci"], "head_sha": head_sha, "status": "passed"}
+        updated["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": "https://example-git-ordered.vercel.app",
+            "deployment_id": "47",
+        }
+        return SimpleNamespace(state=updated)
+
+    attempts = [0]
+
+    def on_preview(stored):
+        attempts[0] += 1
+        owner = f"ordered-preview-{attempts[0]}"
+        assert ledger.claim_preview_delivery(stored["id"], owner=owner) is not None
+        if attempts[0] == 1:
+            callbacks.append("preview_failed")
+            assert ledger.fail_preview_delivery(
+                stored["id"], owner=owner, uncertain=False
+            ) is True
+            return
+        callbacks.append("preview")
+        assert ledger.begin_preview_send_attempt(stored["id"], owner=owner) is True
+        assert ledger.complete_preview_delivery(
+            stored["id"],
+            owner=owner,
+            result_message_id="ordered-preview-message",
+        ) is True
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        on_preview=on_preview,
+        on_terminal=lambda _stored: callbacks.append("terminal"),
+    )
+
+    assert await watcher.run_once() == 1
+    assert callbacks == ["preview_failed"]
+    assert ledger.get(item["id"])["status"] == "agent_done"
+
+    now[0] = 102.0
+    assert await watcher.run_once() == 1
+    assert callbacks == ["preview_failed", "preview", "terminal"]
 
 
 @pytest.mark.asyncio
@@ -773,6 +868,7 @@ async def test_terminal_preview_retry_is_scanned_without_reopening_closeout(monk
     terminal = dict(state)
     terminal["status"] = "pr_published"
     terminal["next_due_at"] = None
+    terminal["policy"] = {**terminal["policy"], "require_preview": True}
     terminal["pr"] = {
         **terminal["pr"],
         "url": "https://github.com/acme/example/pull/10",

@@ -2308,7 +2308,8 @@ def test_preview_delivery_is_exact_head_durable_and_idempotent(tmp_path):
 
 
 def test_preview_delivery_retries_safe_failures_and_fences_uncertain_sends(tmp_path):
-    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now[0])
     event = _repo_discord_event(message_id="preview-retry")
     item = ledger.accept_event(
         event,
@@ -2349,7 +2350,9 @@ def test_preview_delivery_retries_safe_failures_and_fences_uncertain_sends(tmp_p
         item["id"], owner="sender-1", uncertain=False
     ) is True
     assert ledger.get(item["id"])["preview_delivery"]["status"] == "pending"
+    assert ledger.claim_preview_delivery(item["id"], owner="sender-early") is None
 
+    now[0] = 102.0
     assert ledger.claim_preview_delivery(item["id"], owner="sender-2") is not None
     assert ledger.begin_preview_send_attempt(item["id"], owner="sender-2") is True
     assert ledger.fail_preview_delivery(
@@ -2357,6 +2360,58 @@ def test_preview_delivery_retries_safe_failures_and_fences_uncertain_sends(tmp_p
     ) is True
     assert ledger.get(item["id"])["preview_delivery"]["status"] == "uncertain"
     assert ledger.claim_preview_delivery(item["id"], owner="sender-3") is None
+
+
+def test_preview_retry_backoff_does_not_starve_newer_threads(tmp_path):
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now[0])
+    work_ids = []
+    for index, head_char in enumerate(("a", "b", "c"), start=1):
+        event = _repo_discord_event(message_id=f"preview-fair-{index}")
+        item = ledger.accept_event(
+            event,
+            session_key=build_session_key(event.source),
+            freshness_seconds=60,
+        )
+        attached = ledger.attach_closeout_workspace(
+            item["id"],
+            workspace_path="/tmp/project-worktree",
+            repository="acme/project",
+            branch=f"feature/test-{index}",
+            mode="enforce",
+            policy={"require_preview": True},
+        )
+        head_sha = head_char * 40
+        state = deepcopy(attached)
+        state["pr"].update(
+            {
+                "url": f"https://github.com/acme/project/pull/{index}",
+                "state": "OPEN",
+                "head_sha": head_sha,
+            }
+        )
+        state["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": f"https://feature-{index}.vercel.app",
+        }
+        assert ledger.update_closeout(
+            item["id"],
+            state,
+            expected_revision=attached["revision"],
+        ) is not None
+        work_ids.append(item["id"])
+
+    for index, work_id in enumerate(work_ids[:2], start=1):
+        owner = f"failing-{index}"
+        assert ledger.claim_preview_delivery(work_id, owner=owner) is not None
+        assert ledger.fail_preview_delivery(work_id, owner=owner, uncertain=False) is True
+
+    pending = ledger.pending_preview_deliveries(limit=2)
+    assert [item["id"] for item in pending] == [work_ids[2]]
+    for work_id in work_ids[:2]:
+        assert ledger.get(work_id)["preview_delivery"]["next_attempt_at"] == 102.0
 
 
 def test_head_advance_cancels_unclaimed_old_preview_delivery(tmp_path):

@@ -253,6 +253,8 @@ def _sync_closeout_preview_delivery(
         "owner": "",
         "lease_until": None,
         "attempt_count": 0,
+        "retry_count": 0,
+        "next_attempt_at": now,
         "send_started_at": None,
         "send_confirmed_at": None,
         "result_message_id": None,
@@ -4523,6 +4525,8 @@ class GatewayWorkLedger:
             status = str(delivery.get("status") or "")
             if status in {"completed", "uncertain", "cancelled"}:
                 return None
+            if status == "pending" and float(delivery.get("next_attempt_at") or 0) > now:
+                return None
             if not _preview_delivery_matches_closeout(item, delivery):
                 item["preview_delivery"] = {
                     **delivery,
@@ -4627,6 +4631,7 @@ class GatewayWorkLedger:
                     "owner": "",
                     "lease_until": None,
                     "send_confirmed_at": now,
+                    "next_attempt_at": None,
                     "confirmed_message_ids": list(confirmed_ids),
                     "result_message_id": confirmed_ids[0] if confirmed_ids else None,
                 }
@@ -4667,6 +4672,14 @@ class GatewayWorkLedger:
             if uncertain:
                 next_delivery["uncertain_at"] = now
                 next_delivery["uncertain_reason"] = "send_attempt_outcome_unknown"
+                next_delivery["next_attempt_at"] = None
+            else:
+                retry_count = _positive_int(delivery.get("retry_count")) + 1
+                next_delivery["retry_count"] = retry_count
+                next_delivery["next_attempt_at"] = now + min(
+                    300.0,
+                    float(2 ** min(retry_count, 8)),
+                )
             item["preview_delivery"] = next_delivery
             item["updated_at"] = now
             self._write(data)
@@ -4912,6 +4925,22 @@ class GatewayWorkLedger:
             self._write(data)
             return True
 
+    def preview_delivery_satisfied(self, work_id: str) -> bool:
+        """Return whether the current exact-head preview obligation is complete."""
+
+        item = self.get(work_id)
+        if not isinstance(item, dict):
+            return False
+        closeout = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+        policy = closeout.get("policy") if isinstance(closeout.get("policy"), dict) else {}
+        if policy.get("require_preview") is not True:
+            return True
+        delivery = item.get("preview_delivery") if isinstance(item.get("preview_delivery"), dict) else {}
+        return (
+            str(delivery.get("status") or "") == "completed"
+            and _preview_delivery_matches_closeout(item, delivery)
+        )
+
     def pending_preview_deliveries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Return preview sends that need a first attempt or lease recovery."""
 
@@ -4924,13 +4953,17 @@ class GatewayWorkLedger:
             if _required_async_completion_state(item).get("attempt_cancelled") is True:
                 continue
             status = str(delivery.get("status") or "")
-            if status == "pending" or (
+            if (
+                status == "pending"
+                and float(delivery.get("next_attempt_at") or 0) <= now
+            ) or (
                 status in {"delivering", "sending"}
                 and float(delivery.get("lease_until") or 0) <= now
             ):
                 pending.append(dict(item))
         pending.sort(
             key=lambda item: (
+                float(item.get("preview_delivery", {}).get("next_attempt_at") or 0),
                 float(item.get("preview_delivery", {}).get("created_at") or 0),
                 str(item.get("id") or ""),
             )

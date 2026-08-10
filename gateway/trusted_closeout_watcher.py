@@ -124,6 +124,8 @@ class TrustedCloseoutWatcher:
         self._marker_path = closeout_dirty_marker_path()
 
     async def _notify_preview_ready(self, work_id: str) -> bool:
+        if self.ledger.preview_delivery_satisfied(work_id):
+            return True
         callback = self.on_preview
         if callback is None:
             return False
@@ -132,6 +134,27 @@ class TrustedCloseoutWatcher:
         if not isinstance(item, dict) or not isinstance(delivery, dict):
             return False
         if str(delivery.get("status") or "") not in {"pending", "delivering", "sending"}:
+            return False
+        callback_result = callback(item)
+        if asyncio.iscoroutine(callback_result):
+            await callback_result
+        return self.ledger.preview_delivery_satisfied(work_id)
+
+    async def _notify_terminal_ready(self, work_id: str) -> bool:
+        if not self.ledger.preview_delivery_satisfied(work_id):
+            return False
+        callback = self.on_terminal
+        if callback is None:
+            return False
+        item = self.ledger.get(work_id)
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("status") or "") not in {
+            "agent_done",
+            "response_delivered",
+            "summary_updated",
+            "blocked",
+        }:
             return False
         callback_result = callback(item)
         if asyncio.iscoroutine(callback_result):
@@ -380,11 +403,7 @@ class TrustedCloseoutWatcher:
                     if blocked is None:
                         return False
                     await self._notify_preview_ready(work_id)
-                    callback = self.on_terminal
-                    if callback is not None:
-                        callback_result = callback(blocked)
-                        if asyncio.iscoroutine(callback_result):
-                            await callback_result
+                    await self._notify_terminal_ready(work_id)
                     return True
 
                 await stop_heartbeat()
@@ -436,11 +455,7 @@ class TrustedCloseoutWatcher:
                     if finalized is None:
                         return False
                     await self._notify_preview_ready(work_id)
-                    callback = self.on_terminal
-                    if callback is not None:
-                        callback_result = callback(finalized)
-                        if asyncio.iscoroutine(callback_result):
-                            await callback_result
+                    await self._notify_terminal_ready(work_id)
                     return True
                 released = await asyncio.to_thread(
                     self.ledger.release_closeout,
@@ -468,10 +483,16 @@ class TrustedCloseoutWatcher:
             self.ledger.pending_preview_deliveries,
             limit=self.max_concurrency,
         )
+        preview_work_ids = [str(item.get("id") or "") for item in preview_items]
         preview_results = await asyncio.gather(
+            *(self._notify_preview_ready(work_id) for work_id in preview_work_ids),
+            return_exceptions=False,
+        )
+        await asyncio.gather(
             *(
-                self._notify_preview_ready(str(item.get("id") or ""))
-                for item in preview_items
+                self._notify_terminal_ready(work_id)
+                for work_id, delivered in zip(preview_work_ids, preview_results)
+                if delivered is True
             ),
             return_exceptions=False,
         )
