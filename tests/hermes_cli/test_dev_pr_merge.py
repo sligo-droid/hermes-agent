@@ -249,6 +249,18 @@ def test_uncertain_merge_reobserves_success(tmp_path):
     assert result.outcome == "merged"
 
 
+def test_uncertain_merge_rejects_merged_advanced_head(tmp_path):
+    run = FakeRun(
+        [_payload(), _payload(state="MERGED", head="c" * 40)],
+        uncertain_merge=True,
+    )
+
+    result = merge_published_pr(_closeout(tmp_path), run=run)
+
+    assert result.outcome == "blocked"
+    assert "does not match" in result.message
+
+
 def test_uncertain_merge_fails_closed_when_still_open(tmp_path):
     run = FakeRun([_payload(), _payload()], uncertain_merge=True)
 

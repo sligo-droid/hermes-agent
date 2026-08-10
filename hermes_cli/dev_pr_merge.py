@@ -306,7 +306,9 @@ def merge_published_pr(
     if payload is not None:
         merged = _merged_result(payload, pr_url, head_sha=head_sha)
         if merged is not None:
-            return DevMergeResult("merged", pr_url, merged.message)
+            if merged.outcome == "already_merged":
+                return DevMergeResult("merged", pr_url, merged.message)
+            return merged
     if merge_uncertain:
         return DevMergeResult(
             "uncertain",
