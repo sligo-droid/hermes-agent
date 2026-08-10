@@ -63,6 +63,12 @@ class TestGuidanceConstants:
         assert "client_knowledge_search" in text
         assert "mapped project key" in text
         assert "Cite" in text
+        assert "designing or brainstorming a new capability" in text
+        assert "even if the user did not ask for a historical lookup" in text
+        assert "read-only or action mode" in text
+        assert "before dispatching coding workers or drafting a plan for the user" in text
+        assert "narrow, fully specified implementation request" in text
+        assert "localized mechanical or UI change" in text
         assert "do not run an automatic query" in text
 
     def test_clarifying_question_guidance_is_balanced(self):

@@ -192,8 +192,17 @@ CLIENT_KNOWLEDGE_GUIDANCE = (
     "For a mapped client project's history, requirements, decisions, risks, or product/project "
     "decisions, use client_knowledge_search before answering, then open the exact relevant pages "
     "with client_knowledge_get when full context matters. Cite the returned gbrain:projects/... "
-    "references. Search only the mapped project key. If retrieval is empty or stale, say so and "
-    "do not guess. Retrieval is explicit and on demand; do not run an automatic query before every turn."
+    "references. Proactively search GBrain when designing or brainstorming a new capability, "
+    "proposing architecture or workflows, exploring product direction, resolving ambiguous "
+    "requirements, or making a consequential product decision, even if the user did not ask for "
+    "a historical lookup. Whether operating in read-only or action mode, pause before dispatching "
+    "coding workers or drafting a plan for the user and consider whether GBrain could materially "
+    "inform the work; if so, search before proceeding. Prior project knowledge should inform "
+    "invention and judgment. Skip "
+    "retrieval for a narrow, fully specified implementation request, including a localized "
+    "mechanical or UI change, when the existing context is sufficient and no product judgment is "
+    "needed. Search only the mapped project key. If retrieval is empty or stale, say so and do not "
+    "guess. Retrieval is explicit and on demand; do not run an automatic query before every turn."
 )
 
 
