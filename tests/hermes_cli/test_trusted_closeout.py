@@ -1370,6 +1370,160 @@ def test_uncertain_pr_ready_is_reobserved_before_retry(monkeypatch, tmp_path):
     assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
 
 
+def test_uncertain_pr_ready_on_new_head_restores_draft_before_gate_exit(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_ready",
+        "head_sha": HEAD_SHA,
+    }
+    calls = []
+    views = iter(
+        (
+            _pr_payload(head_sha=OLD_SHA, draft=False),
+            _pr_payload(head_sha=OLD_SHA, draft=True),
+        )
+    )
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(next(views)))
+        if args[:3] == ["gh", "pr", "ready"] and "--undo" in args:
+            return _completed(args)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "pr_pending"
+    assert transition.wake_immediately is True
+    assert transition.state["pr"]["head_sha"] == OLD_SHA
+    assert transition.state["pr"]["is_draft"] is True
+    assert transition.state["visual_qa"] == {"status": "stale"}
+    assert transition.state["mutation_uncertainty"] == {"status": "none"}
+    ready_calls = [args for args in calls if args[:3] == ["gh", "pr", "ready"]]
+    assert len(ready_calls) == 1
+    assert "--undo" in ready_calls[0]
+
+
+def test_pr_ready_refresh_failure_keeps_obligation_and_restores_new_head(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    first_view = [True]
+
+    def first_run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            if first_view[0]:
+                first_view[0] = False
+                return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
+            raise RuntimeError("readiness refresh unavailable")
+        if args[:3] == ["gh", "pr", "ready"]:
+            return _completed(args)
+        raise AssertionError(args)
+
+    first = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=first_run,
+    )
+
+    assert first.state["mutation_uncertainty"] == {
+        "status": "uncertain",
+        "operation": "github_pr_ready",
+        "at": 100,
+        "head_sha": HEAD_SHA,
+    }
+
+    calls = []
+    views = iter(
+        (
+            _pr_payload(head_sha=OLD_SHA, draft=False),
+            _pr_payload(head_sha=OLD_SHA, draft=True),
+        )
+    )
+
+    def second_run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(next(views)))
+        if args[:3] == ["gh", "pr", "ready"] and "--undo" in args:
+            return _completed(args)
+        raise AssertionError(args)
+
+    second = closeout.reconcile_trusted_closeout(
+        first.state,
+        now=101,
+        run=second_run,
+    )
+
+    assert second.outcome == "pr_pending"
+    assert second.state["pr"]["head_sha"] == OLD_SHA
+    assert second.state["pr"]["is_draft"] is True
+    assert second.state["mutation_uncertainty"] == {"status": "none"}
+    assert any(
+        args[:3] == ["gh", "pr", "ready"] and "--undo" in args
+        for args in calls
+    )
+
+
+def test_uncertain_pr_ready_undo_remains_fenced_until_draft_is_confirmed(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_ready",
+        "head_sha": HEAD_SHA,
+    }
+    views = iter(
+        (
+            _pr_payload(head_sha=OLD_SHA, draft=False),
+            _pr_payload(head_sha=OLD_SHA, draft=False),
+        )
+    )
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(next(views)))
+        if args[:3] == ["gh", "pr", "ready"] and "--undo" in args:
+            raise closeout.RemoteMutationUncertain(
+                "github_pr_ready_undo",
+                "command timeout",
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.terminal is False
+    assert transition.state["pr"]["head_sha"] == OLD_SHA
+    assert transition.state["pr"]["is_draft"] is False
+    assert transition.state["mutation_uncertainty"] == {
+        "status": "uncertain",
+        "operation": "github_pr_ready_undo",
+        "at": 100,
+        "head_sha": OLD_SHA,
+    }
+
+
 def test_pr_ready_head_race_restores_draft_before_reconciling_new_head(
     monkeypatch,
     tmp_path,

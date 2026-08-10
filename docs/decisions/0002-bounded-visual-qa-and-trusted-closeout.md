@@ -54,7 +54,8 @@ Adopt two related, bounded mechanisms.
 - A preview is publishable only when its deployment SHA equals the current PR head, its deployment ref matches the feature branch or exact head SHA, and the Vercel bot comment supplies the branch alias for that PR.
 - A preview delivery is keyed by preview URL, draft PR URL, and exact head SHA. A completed delivery is not sent again; an uncertain send requires operator repair instead of risking a duplicate.
 - A changed PR head invalidates the prior preview and creates a new delivery obligation only after Vercel reports the new exact-head URL.
-- A draft PR becomes ready only after a passing visual-QA receipt for its current exact head. Hermes re-reads GitHub after the mutation and does not publish terminal success until the same head is confirmed non-draft.
+- Hermes initiates draft-to-ready only after a passing visual-QA receipt for the current exact head. It durably records a confirm-or-restore obligation before the mutation, re-reads GitHub afterward, and does not publish terminal success until that same head is confirmed non-draft. If the mutation outcome or refreshed head is uncertain, Hermes confirms the fenced head or restores the observed PR to draft before it evaluates later gates.
+- GitHub does not provide an expected-head condition for draft-to-ready. The same-head confirmation is therefore a bounded publication check, not a permanent branch lock. A later external push invalidates every Hermes head-bound gate, and the Dev-reaction merge path still rejects the PR until the new exact head passes all checks; GitHub can retain its non-draft bit until a later reconciliation or operator action.
 - PR publication never depends on mergeability, canonical checkout sync, post-merge CI, production deployment, restart, or live-runtime pickup.
 
 ## Rollout and rollback

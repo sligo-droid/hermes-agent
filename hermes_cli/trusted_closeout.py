@@ -2052,6 +2052,28 @@ def _reconcile_trusted_closeout_impl(
         else:
             return restore_pr_draft()
 
+    if uncertain_operation() == "github_pr_ready":
+        uncertainty = _record(state.get("mutation_uncertainty"))
+        uncertain_head = str(uncertainty.get("head_sha") or "").strip().lower()
+        if not _SHA_RE.fullmatch(uncertain_head):
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_reobservation_head_invalid",
+                message="The uncertain PR-ready mutation has no valid fenced head",
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        if uncertain_head != new_head:
+            if not pr["is_draft"]:
+                return restore_pr_draft()
+            clear_uncertainty("github_pr_ready")
+        else:
+            if not pr["is_draft"]:
+                pr["ready_at"] = pr.get("ready_at") or current_time
+            clear_uncertainty("github_pr_ready")
+
     if pr["state"] not in {"OPEN", "UNKNOWN", ""}:
         return _blocked(original, state, code="pr_not_open", message=f"PR state is {pr['state'] or 'unknown'}", now=current_time)
 
@@ -2154,22 +2176,16 @@ def _reconcile_trusted_closeout_impl(
         required=True,
         head_sha=new_head,
     )
-    if uncertain_operation() == "github_pr_ready":
-        uncertainty = _record(state.get("mutation_uncertainty"))
-        uncertain_head = str(uncertainty.get("head_sha") or "").strip().lower()
-        if uncertain_head != new_head:
-            return _blocked(
-                original,
-                state,
-                code="pr_ready_reobservation_head_mismatch",
-                message="The uncertain PR-ready mutation does not target the current PR head",
-                now=current_time,
-            )
-        clear_uncertainty("github_pr_ready")
     if state["mode"] == "enforce" and visual_qa_passed and not pr["is_draft"]:
         pr["ready_at"] = pr.get("ready_at") or current_time
 
     if state["mode"] == "enforce" and pr["is_draft"] and visual_qa_passed:
+        state["mutation_uncertainty"] = {
+            "status": "uncertain",
+            "operation": "github_pr_ready",
+            "at": current_time,
+            "head_sha": new_head,
+        }
         try:
             ready = execute(
                 ["gh", "pr", "ready", pr_ref, "--repo", repo],
@@ -2294,6 +2310,7 @@ def _reconcile_trusted_closeout_impl(
             )
         pr["is_draft"] = False
         pr["ready_at"] = current_time
+        clear_uncertainty("github_pr_ready")
         if ready_payload.get("url"):
             pr["url"] = str(ready_payload.get("url"))[:1200]
         if ready_payload.get("number") is not None:
