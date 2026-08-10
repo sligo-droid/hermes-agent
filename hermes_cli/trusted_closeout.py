@@ -1992,6 +1992,137 @@ def _reconcile_trusted_closeout_impl(
         outcome = "waiting_for_gates" if ci_status == "passed" else "waiting_for_ci"
         return _transition(original, state, outcome=outcome, next_due_at=current_time + poll, terminal=False)
 
+    visual_qa_passed = _gate_passed(
+        state["visual_qa"],
+        required=True,
+        head_sha=new_head,
+    )
+    if uncertain_operation() == "github_pr_ready":
+        uncertainty = _record(state.get("mutation_uncertainty"))
+        uncertain_head = str(uncertainty.get("head_sha") or "").strip().lower()
+        if uncertain_head != new_head:
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_reobservation_head_mismatch",
+                message="The uncertain PR-ready mutation does not target the current PR head",
+                now=current_time,
+            )
+        clear_uncertainty("github_pr_ready")
+    if state["mode"] == "enforce" and visual_qa_passed and not pr["is_draft"]:
+        pr["ready_at"] = pr.get("ready_at") or current_time
+
+    if state["mode"] == "enforce" and pr["is_draft"] and visual_qa_passed:
+        try:
+            ready = execute(
+                ["gh", "pr", "ready", pr_ref, "--repo", repo],
+                cwd=root,
+                timeout=60,
+                github=True,
+            )
+        except RemoteMutationUncertain as exc:
+            return remote_mutation_uncertain(exc)
+        except Exception as exc:
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_error",
+                message=exc,
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+
+        try:
+            ready_view = execute(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_ref,
+                    "--repo",
+                    repo,
+                    "--json",
+                    "number,url,state,headRefOid,isDraft",
+                ],
+                cwd=root,
+                timeout=60,
+                github=True,
+            )
+        except Exception as exc:
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_refresh_error",
+                message=exc,
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        if ready_view.returncode != 0:
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_refresh_failed",
+                message=_detail(ready_view, "PR readiness refresh failed"),
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        try:
+            ready_payload = json.loads(ready_view.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_refresh_invalid_json",
+                message=exc,
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        observed_head = (
+            str(ready_payload.get("headRefOid") or "").strip().lower()
+            if isinstance(ready_payload, Mapping)
+            else ""
+        )
+        if observed_head != new_head:
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_head_changed",
+                message="The PR head changed while GitHub marked it ready",
+                now=current_time,
+            )
+        if not isinstance(ready_payload, Mapping) or ready_payload.get("isDraft") is True:
+            return _blocked(
+                original,
+                state,
+                code=(
+                    "pr_ready_failed"
+                    if ready.returncode != 0
+                    else "pr_ready_unconfirmed"
+                ),
+                message=_detail(ready, "GitHub did not confirm the PR as ready"),
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        if str(ready_payload.get("state") or "").strip().upper() != "OPEN":
+            return _blocked(
+                original,
+                state,
+                code="pr_not_open",
+                message="The PR stopped being open while GitHub marked it ready",
+                now=current_time,
+            )
+        pr["is_draft"] = False
+        pr["ready_at"] = current_time
+        if ready_payload.get("url"):
+            pr["url"] = str(ready_payload.get("url"))[:1200]
+        if ready_payload.get("number") is not None:
+            pr["number"] = _bounded_text(ready_payload.get("number"), limit=32)
+
     return _transition(
         original,
         state,

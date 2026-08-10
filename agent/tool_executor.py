@@ -1078,16 +1078,12 @@ def _record_turn_verification_evidence(
         )
         if evidence:
             trusted: dict[str, Any] = {}
-            if function_name == "terminal" and not is_error:
+            if function_name in {"terminal", "read_only_verify"} and not is_error:
                 try:
                     result_data = result if isinstance(result, dict) else json.loads(str(result))
                 except (TypeError, ValueError, json.JSONDecodeError):
                     result_data = {}
-                candidate = (
-                    result_data.get("verification_evidence")
-                    if isinstance(result_data, dict)
-                    else None
-                )
+                candidate = result_data.get("verification_evidence") if isinstance(result_data, dict) else None
                 if isinstance(candidate, dict) and str(candidate.get("status") or "") == "passed":
                     repository_root = str(candidate.get("repository_root") or "").strip()
                     canonical_command = str(candidate.get("canonical_command") or "").strip()

@@ -226,6 +226,56 @@ def test_successful_terminal_evidence_binds_host_snapshot_to_mutation_boundary()
     assert evidence["verified_head_sha"] == head_sha
 
 
+def test_read_only_verification_evidence_binds_host_snapshot_to_mutation_boundary():
+    head_sha = "b" * 40
+    agent = SimpleNamespace(
+        _turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0),
+        _turn_mutation_generation=4,
+        _turn_mutation_boundary=9,
+    )
+    result = json.dumps(
+        {
+            "success": True,
+            "command": ["scripts/run_tests.sh", "tests/gateway/test_work_ledger.py"],
+            "exit_code": 0,
+            "output": "passed",
+            "error": None,
+            "verification_evidence": {
+                "status": "passed",
+                "scope": "targeted",
+                "canonical_command": "scripts/run_tests.sh",
+                "repository_root": "/repo/worktree",
+                "verified_head_sha": head_sha,
+            },
+        }
+    )
+
+    tool_executor._record_turn_tool_runtime(
+        agent,
+        "read_only_verify",
+        1.0,
+        result,
+        False,
+    )
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "read_only_verify",
+        {"command": "scripts/run_tests.sh tests/gateway/test_work_ledger.py"},
+        result,
+        False,
+    )
+
+    evidence = latest_evidence_by_surface(
+        agent._turn_runtime_stats["verification_evidence"]
+    )["verification"]
+    assert evidence["repository_root"] == "/repo/worktree"
+    assert evidence["canonical_command"] == "scripts/run_tests.sh"
+    assert evidence["scope"] == "targeted"
+    assert evidence["mutation_generation"] == 4
+    assert evidence["mutation_boundary"] == 9
+    assert evidence["verified_head_sha"] == head_sha
+
+
 def test_verification_command_allows_narrow_activation_but_rejects_mutation(
     tmp_path,
     monkeypatch,

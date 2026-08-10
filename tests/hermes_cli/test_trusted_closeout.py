@@ -154,6 +154,7 @@ def _preview_run(
     preview_state="success",
     preview_url="https://example-a1b2c3-acme.vercel.app",
 ):
+    draft = [True]
     branch_url = "https://example-git-feature-test-acme.vercel.app"
     inspector_url = "https://vercel.com/acme/example/deployment-1"
     comment_payload = base64.b64encode(
@@ -194,7 +195,10 @@ def _preview_run(
         if args[:3] == ["gh", "auth", "status"]:
             return _completed(args)
         if args[:3] == ["gh", "pr", "view"]:
-            return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=draft[0])))
+        if args[:3] == ["gh", "pr", "ready"]:
+            draft[0] = False
+            return _completed(args)
         if args[:2] == ["gh", "api"] and "/deployments?" in args[2]:
             return _completed(
                 args,
@@ -288,7 +292,10 @@ def test_preview_is_published_before_visual_qa_completes(monkeypatch, tmp_path):
 
     assert final.outcome == "pr_published"
     assert closeout.closeout_terminal_eligible(final.state) is True
-    assert not any(args[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for args in calls)
+    assert final.state["pr"]["is_draft"] is False
+    assert final.state["pr"]["ready_at"] == 130
+    assert sum(args[:3] == ["gh", "pr", "ready"] for args in calls) == 1
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
 
 
 def test_failed_vercel_preview_requires_repair(monkeypatch, tmp_path):
@@ -1280,10 +1287,44 @@ def test_shadow_never_readies_or_merges(monkeypatch, tmp_path):
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
 
 
-def test_draft_remains_draft_after_current_head_gates(monkeypatch, tmp_path):
+def test_visual_qa_success_marks_draft_ready_after_current_head_gates(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
     _patch_identity_passthrough(monkeypatch)
     calls = []
+
+    draft = [True]
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=draft[0])))
+        if args[:3] == ["gh", "pr", "ready"]:
+            draft[0] = False
+            return _completed(args)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == "pr_published"
+    assert transition.terminal is True
+    assert transition.state["pr"]["is_draft"] is False
+    assert transition.state["pr"]["ready_at"] == 100
+    assert sum(args[:3] == ["gh", "pr", "ready"] for args in calls) == 1
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_draft_stays_draft_when_visual_qa_is_not_required_or_proven(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["policy"]["require_visual_qa"] = False
+    state["visual_qa"] = {"status": "not_required"}
 
     def run(args, **_kwargs):
         calls.append(args)
@@ -1293,14 +1334,40 @@ def test_draft_remains_draft_after_current_head_gates(monkeypatch, tmp_path):
             return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
         raise AssertionError(args)
 
-    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
 
     assert transition.outcome == "pr_published"
-    assert transition.terminal is True
     assert transition.state["pr"]["is_draft"] is True
     assert transition.state["pr"]["ready_at"] is None
     assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
-    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_uncertain_pr_ready_is_reobserved_before_retry(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_ready",
+        "head_sha": HEAD_SHA,
+    }
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=False)))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "pr_published"
+    assert transition.state["mutation_uncertainty"] == {"status": "none"}
+    assert transition.state["pr"]["is_draft"] is False
+    assert transition.state["pr"]["ready_at"] == 100
+    assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
 
 
 def test_external_repo_without_hermes_workflows_does_not_wait_for_impossible_checks(
@@ -1315,12 +1382,20 @@ def test_external_repo_without_hermes_workflows_does_not_wait_for_impossible_che
     (workflows / "scrape.yml").write_text("name: Scrape\n", encoding="utf-8")
     calls = []
 
+    draft = [True]
+
     def run(args, **_kwargs):
         calls.append(args)
         if args[:3] == ["gh", "auth", "status"]:
             return _completed(args)
         if args[:3] == ["gh", "pr", "view"]:
-            return _completed(args, stdout=json.dumps(_pr_payload(draft=True, checks=[])))
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(draft=draft[0], checks=[])),
+            )
+        if args[:3] == ["gh", "pr", "ready"]:
+            draft[0] = False
+            return _completed(args)
         raise AssertionError(args)
 
     transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
@@ -1334,8 +1409,9 @@ def test_external_repo_without_hermes_workflows_does_not_wait_for_impossible_che
         "wait_state": "not_required",
         "required": [],
     }
-    assert transition.state["pr"]["is_draft"] is True
-    assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
+    assert transition.state["pr"]["is_draft"] is False
+    assert transition.state["pr"]["ready_at"] == 100
+    assert sum(args[:3] == ["gh", "pr", "ready"] for args in calls) == 1
 
 
 @pytest.mark.parametrize("visual_status", ["pending", "stale", "failed"])

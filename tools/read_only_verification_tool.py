@@ -1009,6 +1009,23 @@ def read_only_verify(
     if root_result.returncode != 0:
         return tool_error("read_only_verify requires a Git working tree")
     source_root = Path(root_result.stdout.decode(errors="replace").strip()).resolve()
+    initial_head = _git(source_root, "rev-parse", "HEAD", timeout=10)
+    initial_status = _git(
+        source_root,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        timeout=10,
+    )
+    clean_initial_head = (
+        initial_head.stdout.decode(errors="replace").strip().lower()
+        if initial_head.returncode == 0
+        and initial_status.returncode == 0
+        and not initial_status.stdout.strip()
+        else ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{40}", clean_initial_head):
+        clean_initial_head = ""
     try:
         relative_cwd = source_cwd.relative_to(source_root)
     except ValueError:
@@ -1190,29 +1207,62 @@ def read_only_verify(
                     "node_modules:"
                     + dependencies["node_modules_relative"].as_posix()
                 )
-            return json.dumps(
-                {
-                    "success": return_code == 0,
-                    "command": argv,
-                    "exit_code": return_code,
-                    "output": _bounded_output(stdout),
-                    "error": _bounded_output(stderr) or None,
-                    "output_truncated": output_truncated,
-                    "neutralized_symlinks": neutralized_symlinks[:100],
-                    "dependencies": sorted(dependency_labels),
-                    "sandbox": (
-                        "temporary snapshot; only system runtime and prepared dependencies "
-                        "mounted read-only, with disposable writable node_modules/.vite and "
-                        ".vite-temp caches when JavaScript dependencies are present; host "
-                        "home and non-dependency workspace paths plus network, PID, IPC, and "
-                        "runtime sockets isolated; cgroup v2 aggregate limits: "
-                        f"memory={_MEMORY_LIMIT_BYTES} bytes, swap={_MEMORY_SWAP_LIMIT_BYTES} "
-                        f"bytes, tasks={_TASK_LIMIT}"
-                    ),
-                    "artifacts_cleaned": True,
-                },
-                ensure_ascii=False,
-            )
+            payload = {
+                "success": return_code == 0,
+                "command": argv,
+                "exit_code": return_code,
+                "output": _bounded_output(stdout),
+                "error": _bounded_output(stderr) or None,
+                "output_truncated": output_truncated,
+                "neutralized_symlinks": neutralized_symlinks[:100],
+                "dependencies": sorted(dependency_labels),
+                "sandbox": (
+                    "temporary snapshot; only system runtime and prepared dependencies "
+                    "mounted read-only, with disposable writable node_modules/.vite and "
+                    ".vite-temp caches when JavaScript dependencies are present; host "
+                    "home and non-dependency workspace paths plus network, PID, IPC, and "
+                    "runtime sockets isolated; cgroup v2 aggregate limits: "
+                    f"memory={_MEMORY_LIMIT_BYTES} bytes, swap={_MEMORY_SWAP_LIMIT_BYTES} "
+                    f"bytes, tasks={_TASK_LIMIT}"
+                ),
+                "artifacts_cleaned": True,
+            }
+            if return_code == 0 and clean_initial_head:
+                final_head = _git(source_root, "rev-parse", "HEAD", timeout=10)
+                final_status = _git(
+                    source_root,
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    timeout=10,
+                )
+                observed_head = final_head.stdout.decode(errors="replace").strip().lower()
+                if (
+                    final_head.returncode == 0
+                    and final_status.returncode == 0
+                    and not final_status.stdout.strip()
+                    and observed_head == clean_initial_head
+                ):
+                    try:
+                        from agent.verification_evidence import classify_verification_command
+
+                        evidence = classify_verification_command(
+                            command,
+                            cwd=source_cwd,
+                            exit_code=return_code,
+                            output=(stdout + b"\n" + stderr).decode(errors="replace"),
+                        )
+                    except Exception:
+                        evidence = None
+                    if evidence is not None and evidence.status == "passed":
+                        payload["verification_evidence"] = {
+                            "status": "passed",
+                            "canonical_command": evidence.canonical_command,
+                            "scope": evidence.scope,
+                            "repository_root": str(source_root),
+                            "verified_head_sha": observed_head,
+                        }
+            return json.dumps(payload, ensure_ascii=False)
     except subprocess.TimeoutExpired:
         return tool_error(f"Verification exceeded the {timeout_value}s timeout; temporary files were cleaned")
     except Exception as exc:

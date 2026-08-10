@@ -692,6 +692,13 @@ def test_read_only_verify_runs_repository_test_wrapper(tmp_path):
 
     assert payload["success"] is True, payload
     assert "1 passed" in payload["output"]
+    assert payload["verification_evidence"] == {
+        "status": "passed",
+        "canonical_command": "scripts/run_tests.sh",
+        "scope": "targeted",
+        "repository_root": str(repo),
+        "verified_head_sha": _git(repo, "rev-parse", "HEAD").stdout.strip(),
+    }
 
 
 def test_read_only_verify_mounts_nested_dependencies_and_writable_vite_caches(tmp_path):
