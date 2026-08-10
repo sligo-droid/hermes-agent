@@ -82,9 +82,18 @@ def _closeout(tmp_path):
 
 
 class FakeRun:
-    def __init__(self, payloads, *, uncertain_merge=False):
+    def __init__(
+        self,
+        payloads,
+        *,
+        uncertain_merge=False,
+        merge_returncode=0,
+        merge_stderr="",
+    ):
         self.payloads = list(payloads)
         self.uncertain_merge = uncertain_merge
+        self.merge_returncode = merge_returncode
+        self.merge_stderr = merge_stderr
         self.calls = []
 
     def __call__(self, args, **_kwargs):
@@ -94,6 +103,13 @@ class FakeRun:
             return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
         if args[:3] == ["gh", "pr", "merge"] and self.uncertain_merge:
             raise RemoteMutationUncertain("github_pr_merge", "timeout")
+        if args[:3] == ["gh", "pr", "merge"]:
+            return subprocess.CompletedProcess(
+                args,
+                self.merge_returncode,
+                stdout="",
+                stderr=self.merge_stderr,
+            )
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
 
@@ -112,7 +128,8 @@ def test_merges_exact_published_head(tmp_path):
 
     assert result.outcome == "merged"
     assert result.message == f"Merged: {PR_URL}"
-    assert any(call[:3] == ["gh", "pr", "merge"] for call in run.calls)
+    merge_call = next(call for call in run.calls if call[:3] == ["gh", "pr", "merge"])
+    assert merge_call[-2:] == ["--match-head-commit", HEAD]
     assert not any(call[:2] == ["git", "checkout"] for call in run.calls)
 
 
@@ -156,6 +173,21 @@ def test_blocks_when_head_advanced(tmp_path):
     assert not any(call[:3] == ["gh", "pr", "merge"] for call in run.calls)
 
 
+def test_match_head_fence_blocks_advance_between_view_and_merge(tmp_path):
+    run = FakeRun(
+        [_payload(), _payload(head="c" * 40)],
+        merge_returncode=1,
+        merge_stderr="head branch changed",
+    )
+
+    result = merge_published_pr(_closeout(tmp_path), run=run)
+
+    merge_call = next(call for call in run.calls if call[:3] == ["gh", "pr", "merge"])
+    assert merge_call[-2:] == ["--match-head-commit", HEAD]
+    assert result.outcome == "blocked"
+    assert result.message == "head branch changed"
+
+
 def test_blocks_when_persisted_visual_qa_is_not_green(tmp_path):
     state = _closeout(tmp_path)
     state["visual_qa"] = {"status": "failed", "head_sha": HEAD}
@@ -187,6 +219,26 @@ def test_already_merged_is_idempotent(tmp_path):
     assert result.outcome == "already_merged"
     assert result.message == f"Merged: {PR_URL}"
     assert not any(call[:3] == ["gh", "pr", "merge"] for call in run.calls)
+
+
+def test_already_merged_mismatched_head_is_rejected(tmp_path):
+    run = FakeRun([_payload(state="MERGED", head="c" * 40)])
+
+    result = merge_published_pr(_closeout(tmp_path), run=run)
+
+    assert result.outcome == "blocked"
+    assert "does not match" in result.message
+
+
+def test_rejects_pr_url_from_different_repository(tmp_path):
+    state = _closeout(tmp_path)
+    state["pr"]["url"] = "https://github.com/other/repository/pull/7"
+    run = FakeRun([])
+
+    result = merge_published_pr(state, run=run)
+
+    assert result.outcome == "blocked"
+    assert run.calls == []
 
 
 def test_uncertain_merge_reobserves_success(tmp_path):

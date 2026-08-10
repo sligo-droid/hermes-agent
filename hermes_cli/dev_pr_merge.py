@@ -47,7 +47,7 @@ def _run(
     return runner(args, cwd=root, timeout=timeout, github=True)
 
 
-def _valid_pr_url(value: Any) -> str:
+def _valid_pr_url(value: Any, *, repository: str) -> str:
     url = str(value or "").strip()
     parsed = urlsplit(url)
     if (
@@ -60,7 +60,12 @@ def _valid_pr_url(value: Any) -> str:
     ):
         return ""
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) != 4 or parts[2] != "pull" or not parts[3].isdigit():
+    if (
+        len(parts) != 4
+        or parts[2] != "pull"
+        or not parts[3].isdigit()
+        or "/".join(parts[:2]).lower() != str(repository or "").strip().lower()
+    ):
         return ""
     return url
 
@@ -180,9 +185,20 @@ def _live_gate_blocker(
     return ""
 
 
-def _merged_result(payload: Mapping[str, Any], pr_url: str) -> DevMergeResult | None:
+def _merged_result(
+    payload: Mapping[str, Any],
+    pr_url: str,
+    *,
+    head_sha: str,
+) -> DevMergeResult | None:
     if str(payload.get("state") or "").strip().upper() != "MERGED":
         return None
+    if str(payload.get("headRefOid") or "").strip().lower() != head_sha:
+        return DevMergeResult(
+            "blocked",
+            pr_url,
+            "The merged PR head does not match the reviewed and approved head.",
+        )
     return DevMergeResult("already_merged", pr_url, f"Merged: {pr_url}")
 
 
@@ -196,8 +212,8 @@ def merge_published_pr(
     state = normalize_closeout_state(closeout)
     workspace = state["workspace"]
     pr = state["pr"]
-    pr_url = _valid_pr_url(pr.get("url"))
     repository = str(workspace.get("repository") or "").strip()
+    pr_url = _valid_pr_url(pr.get("url"), repository=repository)
     root_text = str(workspace.get("path") or "").strip()
     head_sha = str(pr.get("head_sha") or "").strip().lower()
     if not pr_url or not repository or not root_text or not head_sha:
@@ -217,7 +233,7 @@ def merge_published_pr(
     payload, error = _read_pr(run, root=root, repository=repository, pr_url=pr_url)
     if payload is None:
         return DevMergeResult("blocked", pr_url, error)
-    merged = _merged_result(payload, pr_url)
+    merged = _merged_result(payload, pr_url, head_sha=head_sha)
     if merged is not None:
         return merged
 
@@ -240,7 +256,7 @@ def merge_published_pr(
         payload, error = _read_pr(run, root=root, repository=repository, pr_url=pr_url)
         if payload is None:
             return DevMergeResult("uncertain", pr_url, error)
-        merged = _merged_result(payload, pr_url)
+        merged = _merged_result(payload, pr_url, head_sha=head_sha)
         if merged is not None:
             return merged
         if payload.get("isDraft") is True:
@@ -276,6 +292,8 @@ def merge_published_pr(
                 repository,
                 "--squash",
                 "--delete-branch",
+                "--match-head-commit",
+                head_sha,
             ],
             root=root,
             timeout=120,
@@ -286,7 +304,7 @@ def merge_published_pr(
 
     payload, error = _read_pr(run, root=root, repository=repository, pr_url=pr_url)
     if payload is not None:
-        merged = _merged_result(payload, pr_url)
+        merged = _merged_result(payload, pr_url, head_sha=head_sha)
         if merged is not None:
             return DevMergeResult("merged", pr_url, merged.message)
     if merge_uncertain:
