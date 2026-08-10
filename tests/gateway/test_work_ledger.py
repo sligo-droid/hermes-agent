@@ -1754,11 +1754,113 @@ def test_ledger_skips_completed_and_expires_stale_items(tmp_path):
     assert ledger.incomplete_items() == []
     assert ledger.get(item["id"])["status"] == "expired"
 
-    fresh = ledger.accept_event(_discord_event(message_id="m2"), session_key=session_key, freshness_seconds=60)
+    fresh = ledger.accept_event(
+        _discord_event(message_id="m2"),
+        session_key=session_key,
+        freshness_seconds=60,
+    )
     assert fresh is not None
     ledger.mark_completed(fresh["id"], result_message_id="result-1")
     assert ledger.incomplete_items() == []
     assert ledger.get(fresh["id"])["result_message_id"] == "result-1"
+
+
+def _seed_dev_merge_item(path, *, closeout_status="pr_published"):
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "items": {
+                    "work-merge": {
+                        "id": "work-merge",
+                        "platform": "discord",
+                        "source": {"chat_id": "thread-1", "chat_type": "thread"},
+                        "status": "completed",
+                        "created_at": 1.0,
+                        "updated_at": 2.0,
+                        "result_message_id": "final-1",
+                        "confirmed_message_ids": ["final-1", "final-2"],
+                        "preview_delivery": {"result_message_id": "preview-1"},
+                        "closeout": {
+                            "status": closeout_status,
+                            "pr": {"url": "https://github.com/acme/example/pull/7"},
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_dev_merge_claim_requires_delivered_final_response(tmp_path):
+    path = tmp_path / "ledger.json"
+    _seed_dev_merge_item(path)
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+
+    assert ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="preview-1",
+        actor_id="dev-1",
+    ) is None
+    assert ledger.claim_dev_merge_for_message(
+        chat_id="different-thread",
+        message_id="final-1",
+        actor_id="dev-1",
+    ) is None
+
+    claim = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-2",
+        actor_id="dev-1",
+    )
+
+    assert claim["_dev_merge_claim"] == "claimed"
+    assert claim["dev_merge"]["message_id"] == "final-2"
+
+
+def test_dev_merge_claim_requires_published_closeout(tmp_path):
+    path = tmp_path / "ledger.json"
+    _seed_dev_merge_item(path, closeout_status="waiting_for_ci")
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+
+    assert ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    ) is None
+
+
+def test_dev_merge_claim_is_leased_and_merged_result_is_idempotent(tmp_path):
+    path = tmp_path / "ledger.json"
+    _seed_dev_merge_item(path)
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+    first = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+
+    second = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+
+    assert second["_dev_merge_claim"] == "in_progress"
+    assert ledger.finish_dev_merge(
+        "work-merge",
+        attempt_id=first["_dev_merge_attempt_id"],
+        outcome="merged",
+        message="Merged: https://github.com/acme/example/pull/7",
+        pr_url="https://github.com/acme/example/pull/7",
+    )
+    third = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+    assert third["_dev_merge_claim"] == "already_merged"
 
 
 def test_ledger_expires_old_discord_message_ids(tmp_path):

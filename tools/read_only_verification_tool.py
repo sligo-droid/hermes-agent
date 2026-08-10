@@ -28,6 +28,7 @@ _SAFE_SCRIPT_NAMES = re.compile(
 )
 _OUTPUT_LIMIT = 100_000
 _CAPTURE_LIMIT = 1_000_000
+_FILE_WRITE_LIMIT = 64 * 1024 * 1024
 _MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 _MEMORY_SWAP_LIMIT_BYTES = 512 * 1024 * 1024
 _TASK_LIMIT = 256
@@ -945,7 +946,10 @@ def _node_modules_sandbox_args(
 def _resource_limits(timeout_value: int):
     def apply() -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (_CAPTURE_LIMIT, _CAPTURE_LIMIT))
+        resource.setrlimit(
+            resource.RLIMIT_FSIZE,
+            (_FILE_WRITE_LIMIT, _FILE_WRITE_LIMIT),
+        )
         resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
         cpu = max(2, min(timeout_value + 5, 605))
         resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))

@@ -2545,6 +2545,15 @@ def _bot_message(adapter, channel, *, content="Done."):
     )
 
 
+def _dev_member(*, user_id=42, role_name="Dev"):
+    return SimpleNamespace(
+        id=user_id,
+        name="jezza",
+        display_name="Jezza",
+        roles=[SimpleNamespace(id=7, name=role_name)],
+    )
+
+
 def _guild_channel(adapter, *, author=None):
     guild = SimpleNamespace(id=10, name="Test Guild")
     channel = SimpleNamespace(id=123, name="features", guild=guild, parent_id=None)
@@ -2561,9 +2570,9 @@ def _guild_channel(adapter, *, author=None):
 
 
 @pytest.mark.asyncio
-async def test_thumbsup_on_hermes_message_dispatches_ship_it(adapter):
+async def test_thumbsup_from_dev_on_hermes_message_dispatches_merge_approval(adapter):
     channel, _message = _guild_channel(adapter)
-    user = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    user = _dev_member()
     payload = _ship_payload()
     payload.member = user
     adapter.handle_message = AsyncMock()
@@ -2572,7 +2581,7 @@ async def test_thumbsup_on_hermes_message_dispatches_ship_it(adapter):
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert event.text == "ship it"
+    assert event.text == "approve PR merge"
     assert event.message_type is MessageType.TEXT
     assert event.raw_message is payload
     assert event.message_id == "999"
@@ -2585,24 +2594,25 @@ async def test_thumbsup_on_hermes_message_dispatches_ship_it(adapter):
     assert event.source.user_name == "Jezza"
     assert event.source.guild_id == "10"
     assert event.discord_runtime_mode == "action"
-    assert event.participates_in_work_lifecycle is True
+    assert event.discord_runtime_reason == "dev_merge_reaction"
+    assert event.participates_in_work_lifecycle is False
 
 
 @pytest.mark.asyncio
 async def test_custom_thumbsup_name_dispatches_ship_it(adapter):
     _channel, _message = _guild_channel(adapter)
     payload = _ship_payload(emoji=SimpleNamespace(name="thumbsup"))
-    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    payload.member = _dev_member()
     adapter.handle_message = AsyncMock()
 
     await adapter._handle_raw_reaction_add(payload)
 
     adapter.handle_message.assert_awaited_once()
-    assert adapter.handle_message.await_args.args[0].text == "ship it"
+    assert adapter.handle_message.await_args.args[0].text == "approve PR merge"
 
 
 @pytest.mark.asyncio
-async def test_ship_reaction_routes_thread_session(adapter, monkeypatch):
+async def test_dev_merge_reaction_routes_thread_session(adapter, monkeypatch):
     class FakeThread:
         pass
 
@@ -2618,7 +2628,7 @@ async def test_ship_reaction_routes_thread_session(adapter, monkeypatch):
     thread.fetch_message = AsyncMock(return_value=_bot_message(adapter, thread))
     adapter._client.get_channel = lambda _id: thread
     payload = _ship_payload(channel_id=777)
-    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    payload.member = _dev_member()
     adapter.handle_message = AsyncMock()
     project_context = {
         "project_channel_id": "55",
@@ -2637,7 +2647,7 @@ async def test_ship_reaction_routes_thread_session(adapter, monkeypatch):
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert event.text == "ship it"
+    assert event.text == "approve PR merge"
     assert event.source.chat_id == "777"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "777"
@@ -2647,10 +2657,10 @@ async def test_ship_reaction_routes_thread_session(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ship_reaction_ignores_non_thumbsup(adapter):
+async def test_dev_merge_reaction_ignores_non_thumbsup(adapter):
     _channel, _message = _guild_channel(adapter)
     payload = _ship_payload(emoji="✅")
-    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    payload.member = _dev_member()
     adapter.handle_message = AsyncMock()
 
     await adapter._handle_raw_reaction_add(payload)
@@ -2659,11 +2669,11 @@ async def test_ship_reaction_ignores_non_thumbsup(adapter):
 
 
 @pytest.mark.asyncio
-async def test_ship_reaction_ignores_non_hermes_message(adapter):
+async def test_dev_merge_reaction_ignores_non_hermes_message(adapter):
     other_author = SimpleNamespace(id=111, name="other", display_name="Other")
     _channel, _message = _guild_channel(adapter, author=other_author)
     payload = _ship_payload()
-    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    payload.member = _dev_member()
     adapter.handle_message = AsyncMock()
 
     await adapter._handle_raw_reaction_add(payload)
@@ -2672,7 +2682,7 @@ async def test_ship_reaction_ignores_non_hermes_message(adapter):
 
 
 @pytest.mark.asyncio
-async def test_ship_reaction_ignores_bot_self_reaction(adapter):
+async def test_dev_merge_reaction_ignores_bot_self_reaction(adapter):
     _channel, _message = _guild_channel(adapter)
     payload = _ship_payload(user_id=adapter._client.user.id)
     adapter.handle_message = AsyncMock()
@@ -2683,11 +2693,11 @@ async def test_ship_reaction_ignores_bot_self_reaction(adapter):
 
 
 @pytest.mark.asyncio
-async def test_ship_reaction_enforces_authorization(adapter):
+async def test_dev_merge_reaction_enforces_authorization(adapter):
     _channel, _message = _guild_channel(adapter)
     adapter._allowed_user_ids = {"999"}
     payload = _ship_payload()
-    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    payload.member = _dev_member()
     adapter.handle_message = AsyncMock()
 
     await adapter._handle_raw_reaction_add(payload)
@@ -2696,23 +2706,22 @@ async def test_ship_reaction_enforces_authorization(adapter):
 
 
 @pytest.mark.asyncio
-async def test_ship_reaction_deduplicates_by_message(adapter):
+async def test_dev_merge_reaction_ignores_non_dev_member(adapter):
     _channel, _message = _guild_channel(adapter)
     payload = _ship_payload()
-    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    payload.member = _dev_member(role_name="Developer")
     adapter.handle_message = AsyncMock()
 
     await adapter._handle_raw_reaction_add(payload)
-    await adapter._handle_raw_reaction_add(payload)
 
-    adapter.handle_message.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_ship_reaction_event_does_not_get_lifecycle_reactions(adapter):
+async def test_dev_merge_reaction_event_does_not_get_lifecycle_reactions(adapter):
     _channel, _message = _guild_channel(adapter)
     payload = _ship_payload()
-    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    payload.member = _dev_member()
     adapter.handle_message = AsyncMock()
 
     await adapter._handle_raw_reaction_add(payload)
@@ -2725,3 +2734,19 @@ async def test_ship_reaction_event_does_not_get_lifecycle_reactions(adapter):
 
     adapter._add_reaction.assert_not_awaited()
     adapter._remove_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dev_merge_reaction_dispatches_inline_without_typing(adapter):
+    event = _make_event("999", SimpleNamespace())
+    event.discord_runtime_reason = "dev_merge_reaction"
+    event.participates_in_work_lifecycle = False
+    adapter.set_message_handler(AsyncMock(return_value="Merged: PR"))
+    adapter._dispatch_command_without_typing = AsyncMock()
+
+    await adapter.handle_message(event)
+
+    adapter._dispatch_command_without_typing.assert_awaited_once_with(
+        event,
+        "dev-merge",
+    )

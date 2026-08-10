@@ -114,8 +114,8 @@ _DISCORD_AUDIO_CONTENT_TYPES = {
     ".webm": "audio/webm",
 }
 _DISCORD_VOICE_MESSAGE_FLAG = 1 << 13
-_DISCORD_SHIP_REACTION_NAMES = frozenset({"+1", "thumbsup"})
-_DISCORD_SHIP_REACTION_EMOJIS = frozenset({
+_DISCORD_DEV_MERGE_REACTION_NAMES = frozenset({"+1", "thumbsup"})
+_DISCORD_DEV_MERGE_REACTION_EMOJIS = frozenset({
     "👍",
     "👍🏻",
     "👍🏼",
@@ -1260,7 +1260,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
-        self._reaction_dedup = MessageDeduplicator()
         # Reaction state is authoritative only for mutations performed by this
         # adapter instance. A missing key means unknown (typically restart-era
         # state); a present None means Hermes knows no status reaction exists.
@@ -10841,11 +10840,14 @@ class DiscordAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _is_ship_reaction_emoji(emoji: Any) -> bool:
-        """Return True for Discord thumbs-up reactions that mean "ship it"."""
+    def _is_dev_merge_reaction_emoji(emoji: Any) -> bool:
+        """Return True for Discord thumbs-up merge approvals."""
         text = str(emoji or "").strip()
         name = str(getattr(emoji, "name", "") or text).strip().lower()
-        return text in _DISCORD_SHIP_REACTION_EMOJIS or name in _DISCORD_SHIP_REACTION_NAMES
+        return (
+            text in _DISCORD_DEV_MERGE_REACTION_EMOJIS
+            or name in _DISCORD_DEV_MERGE_REACTION_NAMES
+        )
 
     async def _fetch_discord_channel(self, channel_id: Any) -> Any:
         if not self._client:
@@ -10900,7 +10902,47 @@ class DiscordAdapter(BasePlatformAdapter):
                     return user
         return SimpleNamespace(id=user_id, name=str(user_id or ""), display_name=str(user_id or "user"))
 
-    def _build_ship_reaction_event(self, payload: Any, channel: Any, message: Any, user: Any) -> MessageEvent:
+    @staticmethod
+    def _has_dev_role(user: Any) -> bool:
+        return any(
+            str(getattr(role, "name", "") or "") == "Dev"
+            for role in (getattr(user, "roles", None) or [])
+        )
+
+    async def _resolve_reaction_member(self, payload: Any, guild: Any, user: Any) -> Any:
+        if hasattr(user, "roles"):
+            return user
+        if guild is None:
+            return user
+        try:
+            user_id = int(getattr(payload, "user_id", ""))
+        except (TypeError, ValueError):
+            return user
+        get_member = getattr(guild, "get_member", None)
+        if callable(get_member):
+            try:
+                member = get_member(user_id)
+            except Exception:
+                member = None
+            if member is not None:
+                return member
+        fetch_member = getattr(guild, "fetch_member", None)
+        if callable(fetch_member):
+            try:
+                member = await fetch_member(user_id)
+            except Exception:
+                member = None
+            if member is not None:
+                return member
+        return user
+
+    def _build_dev_merge_reaction_event(
+        self,
+        payload: Any,
+        channel: Any,
+        message: Any,
+        user: Any,
+    ) -> MessageEvent:
         is_dm = isinstance(channel, discord.DMChannel)
         is_thread = isinstance(channel, discord.Thread)
         thread_id = str(getattr(channel, "id", "")) if is_thread else None
@@ -10946,7 +10988,7 @@ class DiscordAdapter(BasePlatformAdapter):
             **self._project_context_source_kwargs(project_context),
         )
         return MessageEvent(
-            text="ship it",
+            text="approve PR merge",
             message_type=MessageType.TEXT,
             source=source,
             raw_message=payload,
@@ -10958,14 +11000,14 @@ class DiscordAdapter(BasePlatformAdapter):
             discord_runtime_mode=RuntimeMode.ACTION.value,
             discord_action_request_intent=None,
             discord_action_escalation_allowed=False,
-            discord_runtime_reason="ship_it_reaction",
+            discord_runtime_reason="dev_merge_reaction",
             discord_explicit_no_action_denial=False,
-            participates_in_work_lifecycle=True,
+            participates_in_work_lifecycle=False,
         )
 
     async def _handle_raw_reaction_add(self, payload: Any) -> None:
-        """Treat 👍 on a Hermes-authored Discord message as an exact "ship it" turn."""
-        if not self._is_ship_reaction_emoji(getattr(payload, "emoji", None)):
+        """Route a Dev-role 👍 as deterministic approval for a terminal PR."""
+        if not self._is_dev_merge_reaction_emoji(getattr(payload, "emoji", None)):
             return
         if self._client is None or getattr(self._client, "user", None) is None:
             return
@@ -11005,6 +11047,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     guild = get_guild(int(getattr(payload, "guild_id")))
                 except (TypeError, ValueError):
                     guild = None
+        user = await self._resolve_reaction_member(payload, guild, user)
+        if not self._has_dev_role(user):
+            return
+
         auth_interaction = SimpleNamespace(
             channel=channel,
             channel_id=getattr(channel, "id", getattr(payload, "channel_id", None)),
@@ -11023,15 +11069,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return
 
-        dedup = getattr(self, "_reaction_dedup", None)
-        if dedup is None:
-            dedup = MessageDeduplicator()
-            self._reaction_dedup = dedup
-        dedup_key = f"ship-reaction:{getattr(payload, 'channel_id', '')}:{getattr(payload, 'message_id', '')}"
-        if dedup.is_duplicate(dedup_key):
-            return
-
-        event = self._build_ship_reaction_event(payload, channel, message, user)
+        event = self._build_dev_merge_reaction_event(payload, channel, message, user)
         if event.source.thread_id:
             self._threads.mark(event.source.thread_id)
         await self.handle_message(event)

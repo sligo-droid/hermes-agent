@@ -20,7 +20,7 @@ def _profile_config(env_file):
         "browser": {
             "auth_profiles": {
                 "pid_hermes_qa": {
-                    "origins": ["https://pid.sligolabs.com"],
+                    "origins": ["https://protected.example.com"],
                     "env_file": str(env_file),
                     "username_env": "PID_QA_USERNAME",
                     "password_env": "PID_QA_PASSWORD",
@@ -50,14 +50,14 @@ def test_supervisor_prefers_navigated_page_over_initial_blank_target():
         {
             "targetId": "pid",
             "type": "page",
-            "url": "https://pid.sligolabs.com/login",
+            "url": "https://protected.example.com/login",
         },
     ]
 
     assert _preferred_page_target(targets)["targetId"] == "pid"
     assert _preferred_page_target(
         targets,
-        expected_url="https://pid.sligolabs.com/",
+        expected_url="https://protected.example.com/",
     )["targetId"] == "pid"
 
 
@@ -76,7 +76,7 @@ def test_profile_loads_private_hermes_secret_without_exposing_values(
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     profile = select_browser_auth_profile(
-        "https://pid.sligolabs.com",
+        "https://protected.example.com",
         config=_profile_config(env_file),
     )
     username, password = load_browser_auth_credentials(profile)
@@ -102,12 +102,12 @@ def test_matching_profiles_returns_only_valid_exact_origin_profiles(
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     config = _profile_config(env_file)
     config["browser"]["auth_profiles"]["invalid"] = {
-        "origins": ["https://pid.sligolabs.com"],
+        "origins": ["https://protected.example.com"],
         "env_file": str(tmp_path / "missing.env"),
     }
 
     assert matching_browser_auth_profile_names(
-        "https://pid.sligolabs.com", config=config
+        "https://protected.example.com", config=config
     ) == ("pid_hermes_qa",)
     assert matching_browser_auth_profile_names(
         "https://example.com", config=config
@@ -187,11 +187,11 @@ def test_navigation_auth_hint_is_limited_to_matching_sign_in_pages(monkeypatch):
     monkeypatch.setattr(
         browser_auth_profiles,
         "matching_browser_auth_profile_names",
-        lambda origin: ("pid_hermes_qa",) if origin == "https://pid.sligolabs.com" else (),
+        lambda origin: ("pid_hermes_qa",) if origin == "https://protected.example.com" else (),
     )
 
     hint = browser_tool._protected_authentication_hint(
-        "https://pid.sligolabs.com/briefing",
+        "https://protected.example.com/briefing",
         "Sign In to Briefing Studio",
         '- textbox "Password" [required]',
     )
@@ -206,7 +206,7 @@ def test_navigation_auth_hint_is_limited_to_matching_sign_in_pages(monkeypatch):
     }
     assert (
         browser_tool._protected_authentication_hint(
-            "https://pid.sligolabs.com/briefing",
+            "https://protected.example.com/briefing",
             "Briefing Studio",
             "Authenticated content",
         )
@@ -225,7 +225,7 @@ def test_profile_rejects_non_private_or_outside_secret_files(tmp_path, monkeypat
 
     with pytest.raises(BrowserAuthProfileError, match="secrets directory"):
         select_browser_auth_profile(
-            "https://pid.sligolabs.com",
+            "https://protected.example.com",
             requested_name="pid_hermes_qa",
             config=_profile_config(outside),
         )
@@ -235,7 +235,7 @@ def test_profile_rejects_non_private_or_outside_secret_files(tmp_path, monkeypat
     inside.chmod(0o644)
     with pytest.raises(BrowserAuthProfileError, match="private regular file"):
         select_browser_auth_profile(
-            "https://pid.sligolabs.com",
+            "https://protected.example.com",
             requested_name="pid_hermes_qa",
             config=_profile_config(inside),
         )
@@ -264,7 +264,7 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
                     "result": {
                         "result": {
                             "type": "string",
-                            "value": "https://pid.sligolabs.com",
+                            "value": "https://protected.example.com",
                         }
                     }
                 }
@@ -287,7 +287,7 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
             password_selector="#login-pass",
             submit_selector="button[type=submit]",
             success_selector="#header",
-            expected_origin="https://pid.sligolabs.com",
+            expected_origin="https://protected.example.com",
             timeout=2,
         )
     finally:
@@ -343,7 +343,7 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
                 return {
                     "result": {
                         "result": {
-                            "value": "https://pid.sligolabs.com",
+                            "value": "https://protected.example.com",
                         }
                     }
                 }
@@ -376,7 +376,7 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
             password_selector="#login-pass",
             submit_selector="button[type=submit]",
             success_selector="#header",
-            expected_origin="https://pid.sligolabs.com",
+            expected_origin="https://protected.example.com",
             timeout=2,
         )
     finally:
@@ -421,7 +421,7 @@ def test_supervisor_checks_origin_and_inserts_credentials_atomically():
         if method == "Runtime.callFunctionOn":
             if "expectedOrigin" in params["functionDeclaration"]:
                 arguments = params["arguments"]
-                assert arguments[1]["value"] == "https://pid.sligolabs.com"
+                assert arguments[1]["value"] == "https://protected.example.com"
                 assert arguments[2]["value"] == "hermes_qa"
                 return {"result": {"result": {"value": "origin_changed"}}}
             return {"result": {"result": {"value": True}}}
@@ -436,7 +436,7 @@ def test_supervisor_checks_origin_and_inserts_credentials_atomically():
             password_selector="#login-pass",
             submit_selector="button[type=submit]",
             success_selector="#header",
-            expected_origin="https://pid.sligolabs.com",
+            expected_origin="https://protected.example.com",
             timeout=2,
         )
     finally:
@@ -463,7 +463,7 @@ def test_browser_authenticate_returns_only_profile_metadata(monkeypatch):
             return True
 
         def current_origin(self):
-            return {"ok": True, "origin": "https://pid.sligolabs.com"}
+            return {"ok": True, "origin": "https://protected.example.com"}
 
         def authenticate_form(self, **kwargs):
             assert kwargs["username"] == "hermes_qa"
@@ -527,7 +527,7 @@ def test_browser_authenticate_retargets_supervisor_to_navigated_page(monkeypatch
 
         def select_page(self, url):
             self.selected_urls.append(url)
-            self.current = "https://pid.sligolabs.com"
+            self.current = "https://protected.example.com"
             return True
 
         def current_origin(self):
@@ -559,7 +559,7 @@ def test_browser_authenticate_retargets_supervisor_to_navigated_page(monkeypatch
         "_run_browser_command",
         lambda *args, **kwargs: {
             "success": True,
-            "data": {"result": '"https://pid.sligolabs.com/"'},
+            "data": {"result": '"https://protected.example.com/"'},
         },
     )
     monkeypatch.setattr(
@@ -572,7 +572,7 @@ def test_browser_authenticate_retargets_supervisor_to_navigated_page(monkeypatch
         "select_browser_auth_profile",
         lambda origin, requested_name="": (
             profile
-            if origin == "https://pid.sligolabs.com"
+            if origin == "https://protected.example.com"
             else (_ for _ in ()).throw(BrowserAuthProfileError("invalid origin"))
         ),
     )
@@ -585,7 +585,7 @@ def test_browser_authenticate_retargets_supervisor_to_navigated_page(monkeypatch
     result = json.loads(browser_tool.browser_authenticate(task_id="visual-turn"))
 
     assert result["success"] is True
-    assert supervisor.selected_urls == ["https://pid.sligolabs.com/"]
+    assert supervisor.selected_urls == ["https://protected.example.com/"]
 
 
 def test_browser_authenticate_schema_exposes_only_an_opaque_profile_name():

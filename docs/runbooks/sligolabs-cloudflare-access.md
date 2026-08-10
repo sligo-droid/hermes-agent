@@ -23,7 +23,7 @@ The operator-managed local tunnel configuration is `/home/droid/.cloudflared/sli
 4. `claw.sligolabs.com` to loopback port `8720`.
 5. A terminal `http_status:404` rule.
 
-PID is deployed through Vercel feature branches and is outside this Cloudflare tunnel contract. A `pid.sligolabs.com` Access application or tunnel ingress is retired state and should be removed by the Cloudflare operator.
+PID is deployed through Vercel feature branches and is outside this Cloudflare tunnel contract. Any retired PID Access application or tunnel ingress should be removed by the Cloudflare operator.
 
 `hermes.sligolabs.com` reaches the dashboard through a separately managed remote tunnel. Do not pretend that route is present in the local YAML. Verify it manually or provide the validator a sanitized route-only export.
 
@@ -111,7 +111,7 @@ Before sharing output, confirm it contains no IDs, identities, raw rules, creden
 2. Verify direct-loopback `/api/status` still has operator detail and a simulated forwarded/Cloudflare request has only the safe liveness shape.
 3. Verify dashboard roots do not emit an origin Basic challenge, while sensitive APIs still require Hermes session/application authentication and `/api/status` and `/api/cron/fire` retain their narrow public-path behavior.
 4. Verify invalid webhook HMAC and invalid cron JWT requests are rejected at the origin.
-5. Remove any retired `pid.sligolabs.com` Access application and tunnel ingress through the operator-owned Cloudflare configuration.
+5. Remove any retired PID Access application and tunnel ingress through the operator-owned Cloudflare configuration.
 6. Create the Sligo webhook Bypass, every configured status Bypass, every configured cron Bypass, and the Sligo trace human application.
 7. Confirm trace Access policy matches Claw and the trace resolver rejects requests missing Cloudflare identity headers without emitting `WWW-Authenticate: Basic`.
 8. Confirm the exact Claw application is unchanged.

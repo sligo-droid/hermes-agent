@@ -917,7 +917,9 @@ async def test_terminal_preview_retry_is_scanned_without_reopening_closeout(monk
 
 
 @pytest.mark.asyncio
-async def test_preview_send_names_exact_head_when_branch_advances_in_flight(monkeypatch, tmp_path):
+async def test_preview_send_links_pr_without_hash_when_branch_advances_in_flight(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
     item, state = _pending_item(ledger)
@@ -979,8 +981,14 @@ async def test_preview_send_names_exact_head_when_branch_advances_in_flight(monk
 
     await runner._on_trusted_closeout_preview(ledger.get(item["id"]))
 
-    assert f"exact commit `{old_head}`" in sent[0]
-    assert "newer commit will get a separate preview message" in sent[0]
+    assert old_head not in sent[0]
+    assert (
+        "Feature preview is ready for https://github.com/acme/example/pull/11"
+        in sent[0]
+    )
+    assert "https://example-git-old.vercel.app" in sent[0]
+    assert "Draft PR" not in sent[0]
+    assert "its newer preview will get a separate message" in sent[0]
     delivery = ledger.get(item["id"])["preview_delivery"]
     assert delivery["status"] == "cancelled"
     assert delivery["cancelled_reason"] == "pr_head_advanced"

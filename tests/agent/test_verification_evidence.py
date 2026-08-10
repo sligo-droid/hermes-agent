@@ -1123,10 +1123,10 @@ def test_browser_auth_and_error_pages_are_not_successful_verification_evidence()
             {"browser"},
         ),
         (
-            "https://pid.sligolabs.com/races",
+            "https://pid-git-evidence-sligo-labs.vercel.app/races",
             '<untrusted_tool_result source="browser_navigate"> '
-            '{"success":true,"url":"https://pid.sligolabs.com/races",'
-            '"title":"Cloudflare Tunnel error | pid.sligolabs.com | Cloudflare",'
+            '{"success":true,"url":"https://pid-git-evidence-sligo-labs.vercel.app/races",'
+            '"title":"Cloudflare Tunnel error | pid-git-evidence-sligo-labs.vercel.app | Cloudflare",'
             '"snapshot":"Error 1033"}',
             {"browser", "production", "production_browser"},
         ),
@@ -1177,7 +1177,7 @@ def test_authenticated_qa_success_supersedes_expected_login_boundary():
     login_result = json.dumps(
         {
             "success": True,
-            "url": "https://pid.sligolabs.com/",
+            "url": "https://pid-git-evidence-sligo-labs.vercel.app/",
             "title": "Sign In to Home | Agora",
             "snapshot": "Username Password Sign In",
         }
@@ -1185,7 +1185,7 @@ def test_authenticated_qa_success_supersedes_expected_login_boundary():
     qa_output = """> pid-dashboard qa:auth
 {
   "ok": true,
-  "baseUrl": "https://pid.sligolabs.com",
+  "baseUrl": "https://pid-git-evidence-sligo-labs.vercel.app",
   "paths": ["/"],
   "routeCount": 1,
   "routes": [{"path": "/", "finalPath": "/", "screenshotPath": "artifacts/home.png"}],
@@ -1200,7 +1200,7 @@ def test_authenticated_qa_success_supersedes_expected_login_boundary():
     tool_executor._record_turn_verification_evidence(
         agent,
         "browser_navigate",
-        {"url": "https://pid.sligolabs.com/"},
+        {"url": "https://pid-git-evidence-sligo-labs.vercel.app/"},
         login_result,
         False,
     )
@@ -1222,7 +1222,7 @@ def test_authenticated_qa_success_supersedes_expected_login_boundary():
     assert latest["production"]["status"] == "success"
     assert latest["production_browser"]["status"] == "success"
     assert latest["production_browser"]["check_name"] == (
-        "qa:auth https://pid.sligolabs.com"
+        "qa:auth https://pid-git-evidence-sligo-labs.vercel.app"
     )
     assert claim_constraints_for_text(
         "Authenticated production QA passed with no console or page errors.",
@@ -1234,7 +1234,7 @@ def test_authenticated_browser_snapshot_supersedes_login_boundary_on_production_
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     login_result = (
         '<untrusted_tool_result source="browser_navigate">\n'
-        '{"success":true,"url":"https://pid.sligolabs.com/races/202",'
+        '{"success":true,"url":"https://pid-git-evidence-sligo-labs.vercel.app/races/202",'
         '"title":"Sign In to Races | Agora","snapshot":"Username Password Sign In"}\n'
         "</untrusted_tool_result>"
     )
@@ -1247,8 +1247,8 @@ def test_authenticated_browser_snapshot_supersedes_login_boundary_on_production_
                 "snapshot": large_snapshot,
                 "frame_tree": {
                     "top": {
-                        "url": "https://pid.sligolabs.com/races/202",
-                        "origin": "https://pid.sligolabs.com",
+                        "url": "https://pid-git-evidence-sligo-labs.vercel.app/races/202",
+                        "origin": "https://pid-git-evidence-sligo-labs.vercel.app",
                     }
                 },
             }
@@ -1259,7 +1259,7 @@ def test_authenticated_browser_snapshot_supersedes_login_boundary_on_production_
     tool_executor._record_turn_verification_evidence(
         agent,
         "browser_navigate",
-        {"url": "https://pid.sligolabs.com/races/202"},
+        {"url": "https://pid-git-evidence-sligo-labs.vercel.app/races/202"},
         login_result,
         False,
     )

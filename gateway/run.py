@@ -140,16 +140,11 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "implementation and verification. For straightforward code/deploy asks, "
     "avoid lengthy planning/status narration, make the smallest correct change, "
     "run focused checks, and report the result concisely with PR/deploy evidence "
-    "when available. Route UI work by required visual judgment, not diff size. "
-    "Deterministic UI edits whose desired result is fully specified — such as exact "
-    "copy, link-target, visibility, tab removal, or navigation reordering requests — "
-    "use the default coding route and still require rendered browser or visual QA. "
-    "UI work that requires subjective layout, hierarchy, styling, responsive, or "
-    "interaction decisions must use delegate_coding_task with ui_visual_specialist; "
-    "the standard visual advisor tier uses Sonnet. Set visual_advisor_tier=advanced "
-    "only for novel, ambiguous, or high-impact design decisions that justify Opus. "
-    "When uncertain whether meaningful visual judgment is required, choose the visual "
-    "specialist route. For a small non-visual frontend-only "
+    "when available. Route UI work by visual judgment: exact copy, link, visibility, "
+    "or navigation edits use default coding plus rendered QA; subjective layout, style, "
+    "responsive, or interaction work uses ui_visual_specialist. Use its advanced tier "
+    "only for novel or high-impact design, and use the specialist when uncertain. For "
+    "a small non-visual frontend-only "
     "edit such as renaming page copy or changing a route and it appears limited to "
     "roughly two files, do it inline in the current agent turn; "
     "do not update changelogs, durable project docs, memories, or skills unless "
@@ -161,9 +156,12 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "work in a git worktree is complete and checks pass, do not treat 'ready for "
     "PR' or 'next step: commit/push/open PR' as a terminal handoff; continue "
     "through commit, feature-branch push, and draft PR publication when permitted "
-    "by the active instructions. Persist durable trusted closeout so the exact-head "
-    "Vercel preview is posted immediately while CI and visual QA continue outside "
-    "the agent turn. Never mark the PR ready, merge it, or synchronize the protected "
+    "by the active instructions. Persist durable trusted closeout. Do not announce a "
+    "draft PR alone; its first lifecycle update must come from trusted closeout, include "
+    "the preview and PR URLs, and omit commit hashes while QA continues. For sandbox "
+    "EFBIG or resource-limit failures, rerun the same package script in the mutable "
+    "worktree before reporting a repository failure. Never mark the PR ready, merge "
+    "it, or synchronize the protected "
     "canonical checkout. Run temporary worktree "
     "cleanup from the mutable action worktree, not from the protected canonical "
     "checkout. "
@@ -10541,14 +10539,11 @@ class _GatewayRunnerCore(
         )
         if not began:
             return
-        exact_head = str(delivery.get("head_sha") or "")
         content = (
-            f"Preview ready for exact commit `{exact_head}`.\n\n"
-            f"- Preview: {delivery.get('preview_url')}\n"
-            f"- Draft PR: {delivery.get('pr_url')}\n"
-            "- Main: untouched\n"
-            "- Visual QA: running for this commit in the background; I’ll post the result here.\n"
-            "- If the branch advances, the newer commit will get a separate preview message."
+            f"Feature preview is ready for {delivery.get('pr_url')}:\n\n"
+            f"{delivery.get('preview_url')}\n\n"
+            "Visual QA is running in the background; I’ll post the result here. "
+            "If the PR changes, its newer preview will get a separate message."
         )
         try:
             from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
@@ -16749,6 +16744,63 @@ class _GatewayRunnerCore(
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _handle_dev_merge_reaction(self, event: MessageEvent) -> Optional[str]:
+        """Merge the PR attached to one delivered terminal Discord response."""
+
+        source = event.source
+        claim = await asyncio.to_thread(
+            self._ledger().claim_dev_merge_for_message,
+            chat_id=str(source.chat_id or ""),
+            message_id=str(event.message_id or source.message_id or ""),
+            actor_id=str(source.user_id or ""),
+        )
+        if not isinstance(claim, dict):
+            return None
+        closeout = claim.get("closeout") if isinstance(claim.get("closeout"), dict) else {}
+        pr = closeout.get("pr") if isinstance(closeout.get("pr"), dict) else {}
+        pr_url = str(pr.get("url") or "").strip()
+        claim_state = str(claim.get("_dev_merge_claim") or "")
+        if claim_state == "already_merged":
+            return f"Merged: {pr_url}" if pr_url else "This PR is already merged."
+        if claim_state == "in_progress":
+            return f"Merge is already in progress: {pr_url}" if pr_url else "Merge is already in progress."
+        if claim_state != "claimed":
+            return None
+
+        from hermes_cli.dev_pr_merge import DevMergeResult, merge_published_pr
+
+        try:
+            result = await asyncio.to_thread(merge_published_pr, closeout)
+        except Exception:
+            logger.exception(
+                "Discord Dev merge execution failed for work item %s",
+                claim.get("id"),
+            )
+            result = DevMergeResult(
+                outcome="blocked",
+                pr_url=pr_url,
+                message=(
+                    f"GitHub did not confirm the merge. Check the PR before retrying: {pr_url}"
+                    if pr_url
+                    else "GitHub did not confirm the merge. Check the PR before retrying."
+                ),
+            )
+        attempt_id = str(claim.get("_dev_merge_attempt_id") or "")
+        persisted = await asyncio.to_thread(
+            self._ledger().finish_dev_merge,
+            str(claim.get("id") or ""),
+            attempt_id=attempt_id,
+            outcome=result.outcome,
+            message=result.message,
+            pr_url=result.pr_url,
+        )
+        if not persisted:
+            logger.error(
+                "Discord Dev merge result could not be persisted for work item %s",
+                claim.get("id"),
+            )
+        return result.message
+
     async def _dispatch_plugin_command(
         self, event: MessageEvent, command: str
     ) -> tuple[bool, Optional[str]]:
@@ -16892,6 +16944,9 @@ class _GatewayRunnerCore(
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        if getattr(event, "discord_runtime_reason", None) == "dev_merge_reaction":
+            return await self._handle_dev_merge_reaction(event)
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
