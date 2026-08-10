@@ -301,6 +301,7 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
     head_sha = str(pr.get("head_sha") or "").strip().lower()
     merge_sha = str(pr.get("merge_sha") or "").strip().lower()
     merge_attempted_head_sha = str(pr.get("merge_attempted_head_sha") or "").strip().lower()
+    pending_push_head_sha = str(pr.get("pending_push_head_sha") or "").strip().lower()
     ci_head_sha = str(ci.get("head_sha") or "").strip().lower()
 
     normalized: dict[str, Any] = {
@@ -349,6 +350,9 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
             "ready_at": _safe_float(pr.get("ready_at")),
             "merge_attempted_head_sha": (
                 merge_attempted_head_sha if _SHA_RE.fullmatch(merge_attempted_head_sha) else ""
+            ),
+            "pending_push_head_sha": (
+                pending_push_head_sha if _SHA_RE.fullmatch(pending_push_head_sha) else ""
             ),
         },
         "ci": {
@@ -1714,16 +1718,7 @@ def _reconcile_trusted_closeout_impl(
             "--body",
             state["pr"]["body"] or "Trusted Hermes closeout.",
         ]
-        visual_publication_pending = (
-            policy["require_visual_qa"]
-            and not _gate_passed(
-                state["visual_qa"],
-                required=True,
-                head_sha=local_head,
-            )
-        )
-        if policy["early_draft_pr"] or visual_publication_pending:
-            create_args.append("--draft")
+        create_args.append("--draft")
         try:
             created = execute(create_args, cwd=root, timeout=120, github=True)
         except RemoteMutationUncertain as exc:
@@ -1801,6 +1796,81 @@ def _reconcile_trusted_closeout_impl(
             poll_seconds=poll,
         )
 
+    pending_push_head = str(state["pr"].get("pending_push_head_sha") or "")
+    if state["mode"] == "enforce" and pending_push_head:
+        observed_pr_head = str(payload.get("headRefOid") or "").strip().lower()
+        if not _SHA_RE.fullmatch(observed_pr_head):
+            return _blocked(
+                original,
+                state,
+                code="invalid_pr_head",
+                message="PR head is not an exact Git SHA",
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        if observed_pr_head != pending_push_head:
+            if uncertain_operation() == "git_push":
+                uncertainty = _record(state.get("mutation_uncertainty"))
+                if str(uncertainty.get("head_sha") or "").strip().lower() != pending_push_head:
+                    return _blocked(
+                        original,
+                        state,
+                        code="push_reobservation_head_mismatch",
+                        message="The uncertain push does not target the pending verified head",
+                        now=current_time,
+                    )
+                return _blocked(
+                    original,
+                    state,
+                    code="push_reobservation_pending",
+                    message="Remote PR head has not reached the fenced push head",
+                    now=current_time,
+                    retry=True,
+                    poll_seconds=poll,
+                )
+            try:
+                pushed = execute(
+                    [
+                        "git",
+                        "push",
+                        "-u",
+                        "origin",
+                        f"{pending_push_head}:refs/heads/{branch}",
+                    ],
+                    cwd=root,
+                    timeout=300,
+                    github=True,
+                )
+            except RemoteMutationUncertain as exc:
+                return remote_mutation_uncertain(exc)
+            except Exception as exc:
+                return _blocked(
+                    original,
+                    state,
+                    code="push_error",
+                    message=exc,
+                    now=current_time,
+                )
+            if pushed.returncode != 0:
+                return _blocked(
+                    original,
+                    state,
+                    code="push_failed",
+                    message=_detail(pushed, "git push failed"),
+                    now=current_time,
+                )
+            return _transition(
+                original,
+                state,
+                outcome="pr_pending",
+                next_due_at=current_time,
+                terminal=False,
+                wake_immediately=True,
+            )
+        state["pr"]["pending_push_head_sha"] = ""
+        clear_uncertainty("git_push")
+
     pr = state["pr"]
     try:
         new_head = _apply_pr_payload(
@@ -1859,6 +1929,23 @@ def _reconcile_trusted_closeout_impl(
                 terminal=state["mode"] == "enforce",
             )
 
+    preview_ready = (
+        not policy["require_preview"]
+        or (
+            state["preview"].get("status") == "ready"
+            and state["preview"].get("observed_sha") == new_head
+            and bool(state["preview"].get("url"))
+        )
+    )
+    if not preview_ready:
+        return _transition(
+            original,
+            state,
+            outcome="waiting_for_preview",
+            next_due_at=current_time + poll,
+            terminal=False,
+        )
+
     if pr["review_decision"] == "CHANGES_REQUESTED":
         return _blocked(original, state, code="changes_requested", message="PR has requested review changes", now=current_time)
 
@@ -1897,23 +1984,6 @@ def _reconcile_trusted_closeout_impl(
             )
         outcome = "waiting_for_gates" if ci_status == "passed" else "waiting_for_ci"
         return _transition(original, state, outcome=outcome, next_due_at=current_time + poll, terminal=False)
-
-    preview_ready = (
-        not policy["require_preview"]
-        or (
-            state["preview"].get("status") == "ready"
-            and state["preview"].get("observed_sha") == new_head
-            and bool(state["preview"].get("url"))
-        )
-    )
-    if not preview_ready:
-        return _transition(
-            original,
-            state,
-            outcome="waiting_for_preview",
-            next_due_at=current_time + poll,
-            terminal=False,
-        )
 
     return _transition(
         original,

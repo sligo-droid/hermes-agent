@@ -134,7 +134,7 @@ FORK_DEFAULT_ADDITIONS = {
     "closeout": {
         "mode": "shadow",
         "surfaces": {"kanban": False, "direct": True},
-        "early_draft_pr": False,
+        "early_draft_pr": True,
         "poll_seconds": 30,
         "lease_seconds": 120,
         "max_concurrency": 2,

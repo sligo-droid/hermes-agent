@@ -673,6 +673,46 @@ async def test_preview_ready_callback_runs_before_terminal_closeout(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_ready_preview_is_notified_before_blocked_terminal_callback(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    callbacks = []
+    head_sha = "b" * 40
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "repair_required"
+        updated["next_due_at"] = None
+        updated["policy"] = {**updated["policy"], "require_preview": True}
+        updated["pr"] = {
+            **updated["pr"],
+            "url": "https://github.com/acme/example/pull/8",
+            "head_sha": head_sha,
+        }
+        updated["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": "https://example-git-blocked.vercel.app",
+            "deployment_id": "43",
+        }
+        return SimpleNamespace(state=updated)
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        on_preview=lambda _stored: callbacks.append("preview"),
+        on_terminal=lambda _stored: callbacks.append("terminal"),
+    )
+
+    assert await watcher.run_once() == 1
+    assert callbacks == ["preview", "terminal"]
+    assert ledger.get(item["id"])["status"] == "blocked"
+
+
+@pytest.mark.asyncio
 async def test_terminal_closeout_never_overwrites_live_agent(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)

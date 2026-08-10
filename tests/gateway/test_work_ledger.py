@@ -2359,6 +2359,66 @@ def test_preview_delivery_retries_safe_failures_and_fences_uncertain_sends(tmp_p
     assert ledger.claim_preview_delivery(item["id"], owner="sender-3") is None
 
 
+def test_head_advance_cancels_unclaimed_old_preview_delivery(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _repo_discord_event(message_id="preview-head-advance")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+        policy={"require_preview": True},
+    )
+    old_head = "c" * 40
+    ready = deepcopy(attached)
+    ready["pr"].update(
+        {
+            "url": "https://github.com/acme/project/pull/9",
+            "state": "OPEN",
+            "head_sha": old_head,
+        }
+    )
+    ready["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": old_head,
+        "url": "https://feature-old.vercel.app",
+    }
+    persisted = ledger.update_closeout(
+        item["id"],
+        ready,
+        expected_revision=attached["revision"],
+    )
+    assert persisted is not None
+    assert ledger.get(item["id"])["preview_delivery"]["status"] == "pending"
+
+    new_head = "d" * 40
+    advanced = deepcopy(persisted)
+    advanced["pr"]["head_sha"] = new_head
+    advanced["preview"] = {
+        "provider": "vercel",
+        "status": "pending",
+        "observed_sha": new_head,
+        "url": "",
+    }
+    assert ledger.update_closeout(
+        item["id"],
+        advanced,
+        expected_revision=persisted["revision"],
+    ) is not None
+
+    delivery = ledger.get(item["id"])["preview_delivery"]
+    assert delivery["status"] == "cancelled"
+    assert delivery["cancelled_reason"] == "pr_head_advanced"
+    assert ledger.claim_preview_delivery(item["id"], owner="sender-old") is None
+
+
 def test_optional_canonical_sync_does_not_hide_private_runtime_lag(tmp_path):
     item = {
         "platform": "discord",
@@ -3992,6 +4052,7 @@ def test_verified_h2_publication_invalidates_h_gates_and_active_lease(
     assert published["ci"]["status"] == "not_checked"
     assert published["pr"]["merge_sha"] == ""
     assert published["pr"]["ready_at"] is None
+    assert published["pr"]["pending_push_head_sha"] == head_sha_2
     assert published["post_merge"]["target_sha"] == ""
     assert published["mutation_uncertainty"] == {}
     assert ledger.publish_closeout_verified_head(

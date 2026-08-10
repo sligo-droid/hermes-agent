@@ -216,6 +216,21 @@ def _sync_closeout_preview_delivery(
 
     preview = closeout.get("preview") if isinstance(closeout.get("preview"), Mapping) else {}
     pr = closeout.get("pr") if isinstance(closeout.get("pr"), Mapping) else {}
+    current_head = str(pr.get("head_sha") or "")[:64]
+    current = item.get("preview_delivery") if isinstance(item.get("preview_delivery"), dict) else {}
+    if (
+        current
+        and str(current.get("head_sha") or "") != current_head
+        and str(current.get("status") or "") not in {"completed", "cancelled"}
+    ):
+        item["preview_delivery"] = {
+            **current,
+            "status": "cancelled",
+            "owner": "",
+            "lease_until": None,
+            "cancelled_at": now,
+            "cancelled_reason": "pr_head_advanced",
+        }
     if (
         str(preview.get("status") or "") != "ready"
         or not str(preview.get("url") or "").startswith("https://")
@@ -244,6 +259,22 @@ def _sync_closeout_preview_delivery(
         "confirmed_message_ids": [],
         "created_at": now,
     }
+
+
+def _preview_delivery_matches_closeout(
+    item: Mapping[str, Any],
+    delivery: Mapping[str, Any],
+) -> bool:
+    closeout = item.get("closeout") if isinstance(item.get("closeout"), Mapping) else {}
+    preview = closeout.get("preview") if isinstance(closeout.get("preview"), Mapping) else {}
+    pr = closeout.get("pr") if isinstance(closeout.get("pr"), Mapping) else {}
+    return (
+        str(delivery.get("head_sha") or "") == str(pr.get("head_sha") or "")
+        and str(delivery.get("head_sha") or "") == str(preview.get("observed_sha") or "")
+        and str(delivery.get("preview_url") or "") == str(preview.get("url") or "")
+        and str(delivery.get("pr_url") or "") == str(pr.get("url") or "")
+        and str(preview.get("status") or "") == "ready"
+    )
 
 
 def _discord_thread_key(item: Any) -> tuple[str, str, str, str] | None:
@@ -3842,6 +3873,7 @@ class GatewayWorkLedger:
                     "review_decision": "UNKNOWN",
                     "ready_at": None,
                     "merge_attempted_head_sha": "",
+                    "pending_push_head_sha": verified_head,
                 }
             )
             state["canonical_sync"] = {"status": "not_started"}
@@ -4276,6 +4308,7 @@ class GatewayWorkLedger:
             state["lease"] = {"owner": "", "until": None}
             state["revision"] = int(expected_revision) + 1
             response = str(final_response or "")
+            _sync_closeout_preview_delivery(item, state, now=now)
             item.pop("closeout_mutation_uncertainty", None)
             item.pop("closeout_mutation_fence", None)
             item.update(
@@ -4488,7 +4521,19 @@ class GatewayWorkLedger:
                 return None
             now = self._now()
             status = str(delivery.get("status") or "")
-            if status in {"completed", "uncertain"}:
+            if status in {"completed", "uncertain", "cancelled"}:
+                return None
+            if not _preview_delivery_matches_closeout(item, delivery):
+                item["preview_delivery"] = {
+                    **delivery,
+                    "status": "cancelled",
+                    "owner": "",
+                    "lease_until": None,
+                    "cancelled_at": now,
+                    "cancelled_reason": "preview_identity_stale",
+                }
+                item["updated_at"] = now
+                self._write(data)
                 return None
             if status in {"delivering", "sending"} and float(delivery.get("lease_until") or 0) > now:
                 return None
@@ -4533,6 +4578,7 @@ class GatewayWorkLedger:
                 or str(delivery.get("status") or "") != "delivering"
                 or str(delivery.get("owner") or "") != str(owner or "")
                 or float(delivery.get("lease_until") or 0) <= now
+                or not _preview_delivery_matches_closeout(item, delivery)
             ):
                 return False
             next_delivery = dict(delivery)

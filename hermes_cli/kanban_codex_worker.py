@@ -3096,7 +3096,7 @@ def _legacy_worker_closeout_state(
         {
             "merge": _merge_policy(worker),
             "pr_open": _pr_open_policy(worker),
-            "early_draft_pr": config.get("early_draft_pr") is True,
+            "early_draft_pr": True,
             "require_preview": require_preview,
             "require_local_verification": True,
             "require_review": True,
@@ -3534,6 +3534,8 @@ def _ensure_pr(board: Optional[str], workspace: str) -> PRFinalizationOutcome:
                         branch=branch,
                         base=base,
                         board=board,
+                        draft=True,
+                        allow_draft=True,
                     )
                     if opened:
                         worker["pr_merge_skipped"] = True

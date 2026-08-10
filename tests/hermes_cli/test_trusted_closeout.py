@@ -54,6 +54,7 @@ def test_closeout_normalization_accepts_only_exact_sha_lengths(tmp_path):
             head_sha=invalid,
             merge_sha=invalid,
             merge_attempted_head_sha=invalid,
+            pending_push_head_sha=invalid,
         )
         state["ci"] = {"head_sha": invalid}
         state["post_merge"] = {"target_sha": invalid}
@@ -61,6 +62,7 @@ def test_closeout_normalization_accepts_only_exact_sha_lengths(tmp_path):
         assert normalized["pr"]["head_sha"] == ""
         assert normalized["pr"]["merge_sha"] == ""
         assert normalized["pr"]["merge_attempted_head_sha"] == ""
+        assert normalized["pr"]["pending_push_head_sha"] == ""
         assert normalized["ci"]["head_sha"] == ""
         assert normalized["post_merge"]["target_sha"] == ""
 
@@ -69,6 +71,7 @@ def test_closeout_normalization_accepts_only_exact_sha_lengths(tmp_path):
         head_sha="a" * 64,
         merge_sha="b" * 64,
         merge_attempted_head_sha="c" * 64,
+        pending_push_head_sha="f" * 64,
     )
     exact["ci"] = {"head_sha": "d" * 64}
     exact["post_merge"] = {"target_sha": "e" * 64}
@@ -76,6 +79,7 @@ def test_closeout_normalization_accepts_only_exact_sha_lengths(tmp_path):
     assert normalized["pr"]["head_sha"] == "a" * 64
     assert normalized["pr"]["merge_sha"] == "b" * 64
     assert normalized["pr"]["merge_attempted_head_sha"] == "c" * 64
+    assert normalized["pr"]["pending_push_head_sha"] == "f" * 64
     assert normalized["ci"]["head_sha"] == "d" * 64
     assert normalized["post_merge"]["target_sha"] == "e" * 64
 
@@ -228,6 +232,55 @@ def test_failed_vercel_preview_requires_repair(monkeypatch, tmp_path):
 
     assert transition.outcome == "repair_required"
     assert transition.state["preview"]["status"] == "failed"
+
+
+def test_failed_ci_waits_for_required_preview_before_terminal_repair(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["policy"]["require_preview"] = True
+    failed_checks = [
+        _check("Basic Tests", "basic", conclusion="FAILURE"),
+        _check("PR Body Format", "pr body"),
+    ]
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(draft=True, checks=failed_checks)),
+            )
+        if args[:2] == ["gh", "api"] and "/deployments?" in args[2]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": 44,
+                            "sha": HEAD_SHA,
+                            "ref": "feature/test",
+                            "environment": "Preview",
+                            "creator": {"login": "vercel[bot]"},
+                        }
+                    ]
+                ),
+            )
+        if args[:2] == ["gh", "api"] and "/deployments/44/statuses?" in args[2]:
+            return _completed(args, stdout=json.dumps([{"state": "pending"}]))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "waiting_for_preview"
+    assert transition.terminal is False
+    assert transition.next_due_at == 130
+    assert transition.state["ci"]["status"] == "failed"
+    assert not any(
+        error["code"] == "required_checks_failed"
+        for error in transition.state["errors"]
+    )
 
 
 def _raw_required_check(
@@ -959,6 +1012,70 @@ def test_head_change_atomically_invalidates_head_bound_receipts(monkeypatch, tmp
         assert transition.state[key] == {"status": "stale"}
     assert transition.state["pr"]["ready_at"] is None
     assert transition.state["pr"]["merge_attempted_head_sha"] == ""
+
+
+def test_existing_pr_pushes_only_explicit_pending_verified_head(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    pending_head = "4" * 40
+    state["pr"]["head_sha"] = pending_head
+    state["pr"]["pending_push_head_sha"] = pending_head
+    state["local_verification"] = {"status": "passed", "head_sha": pending_head}
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(head_sha=HEAD_SHA)))
+        if args[:2] == ["git", "push"]:
+            return _completed(args)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "pr_pending"
+    assert [args for args in calls if args[:2] == ["git", "push"]] == [
+        [
+            "git",
+            "push",
+            "-u",
+            "origin",
+            f"{pending_head}:refs/heads/feature/test",
+        ]
+    ]
+    assert not any(args[:2] == ["git", "rev-parse"] for args in calls)
+
+
+def test_existing_pr_clears_pending_push_after_exact_head_observation(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["pr"]["pending_push_head_sha"] = HEAD_SHA
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "git_push",
+        "at": 99.0,
+        "head_sha": HEAD_SHA,
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload()))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "pr_published"
+    assert transition.state["pr"]["pending_push_head_sha"] == ""
+    assert transition.state["mutation_uncertainty"] == {"status": "none"}
+    assert not any(args[:2] in (["git", "push"], ["git", "rev-parse"]) for args in calls)
 
 
 def test_failed_current_head_ci_requires_repair_without_polling(monkeypatch, tmp_path):

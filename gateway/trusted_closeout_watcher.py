@@ -378,6 +378,7 @@ class TrustedCloseoutWatcher:
                     )
                     if blocked is None:
                         return False
+                    await self._notify_preview_ready(work_id)
                     callback = self.on_terminal
                     if callback is not None:
                         callback_result = callback(blocked)
