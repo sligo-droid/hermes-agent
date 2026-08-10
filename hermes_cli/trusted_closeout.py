@@ -1900,6 +1900,7 @@ def _reconcile_trusted_closeout_impl(
                 repository=repo,
                 head_sha=new_head,
                 branch=branch,
+                pr_number=int(pr.get("number") or 0),
                 root=root,
                 run=execute,
             )

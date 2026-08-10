@@ -42,7 +42,7 @@ Adopt two related, bounded mechanisms.
 - Let the gateway watcher own durable scheduling. It wakes from same-process signals, an identifier-only cross-process dirty marker, or a bounded periodic fallback; claims work with revision-checked leases; runs a bounded concurrent batch off the event loop; and persists the next state with compare-and-swap semantics.
 - Do not replay a model turn merely to continue closeout. Do not synthesize terminal delivery over a live model/worker turn; persist terminal state and let the existing owner finish delivery first.
 - Push the exact feature-branch head and create or refresh a draft pull request. Hermes never marks the pull request ready and never merges it.
-- Discover the Vercel preview through GitHub Deployments for the exact PR head, `Preview` environment, feature branch, and a Vercel creator identity. Accept only HTTPS `*.vercel.app` environment URLs.
+- Prove readiness through GitHub Deployments for the exact PR head, `Preview` environment, feature branch, and a Vercel creator identity. Then publish the HTTPS `*-git-*.vercel.app` branch alias from the Vercel bot's PR comment, not the immutable deployment hostname.
 - As soon as the exact-head preview is ready, persist one durable Discord delivery obligation and post the preview URL with the draft PR URL in the originating thread. State that `main` is untouched and visual QA continues in the background.
 - Continue current-head CI and visual QA asynchronously. Post a separate terminal result in the same thread after those gates pass or require repair.
 - Treat legacy persisted `auto` and `manual` merge policy values as `never`. An upgrade cannot merge an in-flight PR.
@@ -51,7 +51,7 @@ Adopt two related, bounded mechanisms.
 
 - A PR head is accepted only as a full valid SHA. Local verification, review, visual-QA, and CI receipts are bound to that head.
 - When GitHub reports a different head, all head-bound evidence is invalidated and required checks are recomputed only from the current head.
-- A preview is publishable only when its deployment SHA equals the current PR head and its deployment ref matches the feature branch or exact head SHA.
+- A preview is publishable only when its deployment SHA equals the current PR head, its deployment ref matches the feature branch or exact head SHA, and the Vercel bot comment supplies the branch alias for that PR.
 - A preview delivery is keyed by preview URL, draft PR URL, and exact head SHA. A completed delivery is not sent again; an uncertain send requires operator repair instead of risking a duplicate.
 - A changed PR head invalidates the prior preview and creates a new delivery obligation only after Vercel reports the new exact-head URL.
 - PR publication never depends on mergeability, canonical checkout sync, post-merge CI, production deployment, restart, or live-runtime pickup.

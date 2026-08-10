@@ -176,6 +176,18 @@ def _preview_run(calls, *, preview_state="success", preview_url="https://example
                     [{"state": preview_state, "environment_url": preview_url}]
                 ),
             )
+        if args[:2] == ["gh", "api"] and "/comments?" in args[2]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "user": {"login": "vercel[bot]"},
+                            "body": f"[Preview]({preview_url})",
+                        }
+                    ]
+                ),
+            )
         raise AssertionError(args)
 
     return run

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -71,11 +72,34 @@ def _deployment_sort_key(value: Mapping[str, Any]) -> tuple[str, int]:
     return created_at, deployment_id
 
 
+def _vercel_branch_preview_url(comments: Any) -> str:
+    if not isinstance(comments, list):
+        return ""
+    for comment in reversed(comments[-100:]):
+        if not isinstance(comment, Mapping):
+            continue
+        author = comment.get("user")
+        login = (
+            str(author.get("login") or "").lower()
+            if isinstance(author, Mapping)
+            else ""
+        )
+        if "vercel" not in login:
+            continue
+        body = str(comment.get("body") or "")
+        for candidate in re.findall(r"https://[a-z0-9.-]+\.vercel\.app", body):
+            hostname = str(urlsplit(candidate).hostname or "").lower()
+            if "-git-" in hostname and _is_vercel_preview_url(candidate):
+                return candidate
+    return ""
+
+
 def collect_vercel_preview(
     *,
     repository: str,
     head_sha: str,
     branch: str,
+    pr_number: int,
     root: Path,
     run: CommandRunner,
 ) -> PreviewDeployment:
@@ -84,7 +108,7 @@ def collect_vercel_preview(
     repository = str(repository or "").strip()
     head_sha = str(head_sha or "").strip().lower()
     branch = str(branch or "").strip()
-    if not repository or not head_sha or not branch:
+    if not repository or not head_sha or not branch or int(pr_number or 0) < 1:
         return PreviewDeployment(
             status="blocked",
             observed_sha=head_sha,
@@ -175,12 +199,32 @@ def collect_vercel_preview(
         )
 
     state = str(latest.get("state") or "").strip().lower()
-    url = str(latest.get("environment_url") or "").strip()
-    if state == "success" and _is_vercel_preview_url(url):
+    deployment_url = str(latest.get("environment_url") or "").strip()
+    if state == "success" and _is_vercel_preview_url(deployment_url):
+        comments_result = run(
+            [
+                "gh",
+                "api",
+                f"repos/{repository}/issues/{int(pr_number)}/comments?per_page=100",
+            ],
+            cwd=root,
+            timeout=30,
+            github=True,
+        )
+        branch_url = _vercel_branch_preview_url(
+            _json_payload(comments_result, default=[])
+        )
+        if not branch_url:
+            return PreviewDeployment(
+                status="pending",
+                observed_sha=head_sha,
+                deployment_id=deployment_id,
+                diagnostic_code="preview_branch_url_missing",
+            )
         return PreviewDeployment(
             status="ready",
             observed_sha=head_sha,
-            url=url[:1200],
+            url=branch_url[:1200],
             deployment_id=deployment_id,
         )
     if state == "success":

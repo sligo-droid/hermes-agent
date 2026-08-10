@@ -18,7 +18,7 @@ def _completed(args, payload, returncode=0):
     )
 
 
-def test_collect_vercel_preview_returns_exact_head_environment_url(tmp_path):
+def test_collect_vercel_preview_returns_branch_alias_after_exact_head_ready(tmp_path):
     calls = []
 
     def run(args, **_kwargs):
@@ -37,12 +37,25 @@ def test_collect_vercel_preview_returns_exact_head_environment_url(tmp_path):
                     }
                 ],
             )
+        if "/statuses?" in args[2]:
+            return _completed(
+                args,
+                [
+                    {
+                        "state": "success",
+                        "environment_url": "https://pid-a1b2c3-sligo-labs.vercel.app",
+                    }
+                ],
+            )
         return _completed(
             args,
             [
                 {
-                    "state": "success",
-                    "environment_url": "https://pid-git-discord-thread-1.vercel.app",
+                    "user": {"login": "vercel[bot]"},
+                    "body": (
+                        "[Preview](https://pid-git-discord-thread-1-"
+                        "sligo-labs.vercel.app)"
+                    ),
                 }
             ],
         )
@@ -51,6 +64,7 @@ def test_collect_vercel_preview_returns_exact_head_environment_url(tmp_path):
         repository="sligo-labs/PID",
         head_sha=HEAD_SHA,
         branch="discord/thread-1",
+        pr_number=17,
         root=tmp_path,
         run=run,
     )
@@ -59,10 +73,10 @@ def test_collect_vercel_preview_returns_exact_head_environment_url(tmp_path):
         "provider": "vercel",
         "status": "ready",
         "observed_sha": HEAD_SHA,
-        "url": "https://pid-git-discord-thread-1.vercel.app",
+        "url": "https://pid-git-discord-thread-1-sligo-labs.vercel.app",
         "deployment_id": "42",
     }
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_collect_vercel_preview_rejects_wrong_head_and_non_preview_alias(tmp_path):
@@ -84,6 +98,7 @@ def test_collect_vercel_preview_rejects_wrong_head_and_non_preview_alias(tmp_pat
         repository="sligo-labs/PID",
         head_sha=HEAD_SHA,
         branch="discord/thread-1",
+        pr_number=17,
         root=tmp_path,
         run=lambda args, **_kwargs: _completed(args, next(responses)),
     )
@@ -116,9 +131,51 @@ def test_collect_vercel_preview_requires_vercel_app_url(tmp_path):
         repository="sligo-labs/PID",
         head_sha=HEAD_SHA,
         branch="discord/thread-1",
+        pr_number=17,
         root=tmp_path,
         run=run,
     )
 
     assert result.status == "pending"
     assert result.diagnostic_code == "preview_url_missing"
+
+
+def test_collect_vercel_preview_waits_for_branch_alias_comment(tmp_path):
+    def run(args, **_kwargs):
+        if "/deployments?" in args[2]:
+            return _completed(
+                args,
+                [
+                    {
+                        "id": 42,
+                        "sha": HEAD_SHA,
+                        "ref": "discord/thread-1",
+                        "environment": "Preview",
+                        "creator": {"login": "vercel[bot]"},
+                    }
+                ],
+            )
+        if "/statuses?" in args[2]:
+            return _completed(
+                args,
+                [
+                    {
+                        "state": "success",
+                        "environment_url": "https://pid-a1b2c3-sligo-labs.vercel.app",
+                    }
+                ],
+            )
+        return _completed(args, [])
+
+    result = collect_vercel_preview(
+        repository="sligo-labs/PID",
+        head_sha=HEAD_SHA,
+        branch="discord/thread-1",
+        pr_number=17,
+        root=tmp_path,
+        run=run,
+    )
+
+    assert result.status == "pending"
+    assert result.url == ""
+    assert result.diagnostic_code == "preview_branch_url_missing"
