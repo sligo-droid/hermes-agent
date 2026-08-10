@@ -555,6 +555,92 @@ def test_action_worktree_branch_and_path_advance_together_on_collision(
     assert _run(Path(cwd), "branch", "--show-current").stdout.strip() == f"{base_branch}-2"
 
 
+def test_next_pr_generation_uses_distinct_worktree_from_refreshed_remote_main(
+    tmp_path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    remote = tmp_path / "pid-origin.git"
+    updater = tmp_path / "updater"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _run(tmp_path, "init", "--bare", str(remote))
+    _run(canonical, "remote", "add", "origin", str(remote))
+    _run(canonical, "push", "-u", "origin", "main")
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+    source = _source(canonical)
+    session_key = "agent:main:discord:thread:thread-123"
+
+    first_cwd, first_error, _first_worktree = gateway_run._resolve_gateway_turn_cwd(
+        source,
+        _feature_summary(),
+        _config(canonical),
+        session_key,
+        "action",
+        1,
+    )
+    assert first_error is None
+
+    _run(tmp_path, "clone", str(remote), str(updater))
+    _run(updater, "config", "user.email", "tests@example.invalid")
+    _run(updater, "config", "user.name", "Hermes Tests")
+    _run(updater, "checkout", "main")
+    (updater / "merged-pr-1.txt").write_text("merged\n", encoding="utf-8")
+    _run(updater, "add", "merged-pr-1.txt")
+    _run(updater, "commit", "-m", "merge first PR")
+    _run(updater, "push", "origin", "main")
+    remote_main = _run(updater, "rev-parse", "HEAD").stdout.strip()
+
+    second_cwd, second_error, _second_worktree = gateway_run._resolve_gateway_turn_cwd(
+        source,
+        _feature_summary(),
+        _config(canonical),
+        session_key,
+        "action",
+        2,
+    )
+
+    assert second_error is None
+    assert second_cwd != first_cwd
+    assert Path(second_cwd).name.endswith("-pr2")
+    assert (Path(second_cwd) / "merged-pr-1.txt").read_text(encoding="utf-8") == "merged\n"
+    assert _run(Path(second_cwd), "rev-parse", "HEAD").stdout.strip() == remote_main
+    assert _run(Path(second_cwd), "branch", "--show-current").stdout.strip().endswith(
+        "-pr2"
+    )
+
+
+def test_rollover_fetch_failure_does_not_reuse_merged_worktree(
+    tmp_path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _run(canonical, "remote", "add", "origin", str(tmp_path / "missing-origin.git"))
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+    source = _source(canonical)
+
+    cwd, error, worktree_cwd = gateway_run._resolve_gateway_turn_cwd(
+        source,
+        _feature_summary(),
+        _config(canonical),
+        "agent:main:discord:thread:thread-123",
+        "action",
+        2,
+    )
+
+    assert cwd == str(canonical)
+    assert worktree_cwd is None
+    assert error is not None
+    assert "could not refresh the merged base" in error.lower()
+    assert not workspaces.exists() or not any(workspaces.iterdir())
+
+
 def test_action_worktree_failure_is_explicit_and_keeps_canonical_guarded(
     tmp_path,
     monkeypatch,

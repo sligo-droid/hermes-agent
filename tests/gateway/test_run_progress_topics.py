@@ -745,6 +745,9 @@ class QueuedDiscordEscalationProbeAgent:
 
     calls = 0
     escalation_result = None
+    observed_runtime_mode = None
+    runner = None
+    session_key = ""
 
     def __init__(self, **kwargs):
         self.tools = []
@@ -756,6 +759,11 @@ class QueuedDiscordEscalationProbeAgent:
 
             from tools.action_escalation_tool import escalate_to_action
 
+            type(self).observed_runtime_mode = (
+                type(self).runner._running_discord_runtime_modes.get(
+                    type(self).session_key
+                )
+            )
             type(self).escalation_result = json.loads(
                 escalate_to_action(reason="queued follow-up needs action")
             )
@@ -849,6 +857,10 @@ async def _run_with_agent(
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
+    if hasattr(agent_cls, "runner"):
+        agent_cls.runner = runner
+    if hasattr(agent_cls, "session_key"):
+        agent_cls.session_key = session_key
     if pending_text is not None:
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
@@ -1251,6 +1263,7 @@ async def test_queued_discord_read_only_followup_can_escalate_after_action_turn(
 
     QueuedDiscordEscalationProbeAgent.calls = 0
     QueuedDiscordEscalationProbeAgent.escalation_result = None
+    QueuedDiscordEscalationProbeAgent.observed_runtime_mode = None
     tokens = set_session_vars(
         platform="discord",
         discord_action_escalation_allowed="",
@@ -1273,6 +1286,7 @@ async def test_queued_discord_read_only_followup_can_escalate_after_action_turn(
         clear_session_vars(tokens)
 
     assert result["final_response"] == "done-2"
+    assert QueuedDiscordEscalationProbeAgent.observed_runtime_mode == "read_only"
     assert QueuedDiscordEscalationProbeAgent.escalation_result == {
         "success": True,
         "action_escalation_requested": True,

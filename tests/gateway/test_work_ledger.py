@@ -1766,6 +1766,8 @@ def test_ledger_skips_completed_and_expires_stale_items(tmp_path):
 
 
 def _seed_dev_merge_item(path, *, closeout_status="pr_published"):
+    event = _discord_event(message_id="seed-merge")
+    session_key = build_session_key(event.source)
     path.write_text(
         json.dumps(
             {
@@ -1774,7 +1776,11 @@ def _seed_dev_merge_item(path, *, closeout_status="pr_published"):
                     "work-merge": {
                         "id": "work-merge",
                         "platform": "discord",
-                        "source": {"chat_id": "thread-1", "chat_type": "thread"},
+                        "source": event.source.to_dict(),
+                        "session_key": session_key,
+                        "discord_runtime_mode": "action",
+                        "participates_in_work_lifecycle": True,
+                        "discord_pr_generation": 1,
                         "status": "completed",
                         "created_at": 1.0,
                         "updated_at": 2.0,
@@ -1831,6 +1837,76 @@ def test_dev_merge_claim_requires_published_closeout(tmp_path):
     ) is None
 
 
+def test_dev_merge_claim_selects_exact_final_message_across_pr_generations(tmp_path):
+    path = tmp_path / "ledger.json"
+    event = _discord_event(message_id="seed")
+    session_key = build_session_key(event.source)
+    source = event.source.to_dict()
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "discord_pr_lifecycles": {
+                    session_key: {
+                        "generation": 2,
+                        "status": "active",
+                        "updated_at": 4.0,
+                    }
+                },
+                "items": {
+                    "pr-1": {
+                        "id": "pr-1",
+                        "platform": "discord",
+                        "source": source,
+                        "session_key": session_key,
+                        "discord_pr_generation": 1,
+                        "status": "completed",
+                        "updated_at": 2.0,
+                        "result_message_id": "final-1",
+                        "closeout": {
+                            "status": "pr_published",
+                            "pr": {"url": "https://github.com/acme/example/pull/1"},
+                        },
+                        "dev_merge": {"status": "merged", "revision": 1},
+                    },
+                    "pr-2": {
+                        "id": "pr-2",
+                        "platform": "discord",
+                        "source": source,
+                        "session_key": session_key,
+                        "discord_pr_generation": 2,
+                        "status": "completed",
+                        "updated_at": 4.0,
+                        "result_message_id": "final-2",
+                        "closeout": {
+                            "status": "pr_published",
+                            "pr": {"url": "https://github.com/acme/example/pull/2"},
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+
+    old = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+    current = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-2",
+        actor_id="dev-1",
+    )
+
+    assert old["_dev_merge_claim"] == "already_merged"
+    assert old["closeout"]["pr"]["url"].endswith("/1")
+    assert current["_dev_merge_claim"] == "claimed"
+    assert current["closeout"]["pr"]["url"].endswith("/2")
+
+
 def test_dev_merge_claim_is_leased_and_merged_result_is_idempotent(tmp_path):
     path = tmp_path / "ledger.json"
     _seed_dev_merge_item(path)
@@ -1861,6 +1937,236 @@ def test_dev_merge_claim_is_leased_and_merged_result_is_idempotent(tmp_path):
         actor_id="dev-1",
     )
     assert third["_dev_merge_claim"] == "already_merged"
+
+
+def test_merged_dev_pr_rolls_same_thread_into_next_pr_generation(tmp_path):
+    path = tmp_path / "ledger.json"
+    _seed_dev_merge_item(path)
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+    session_key = build_session_key(_discord_event().source)
+    claim = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+    assert ledger.finish_dev_merge(
+        "work-merge",
+        attempt_id=claim["_dev_merge_attempt_id"],
+        outcome="merged",
+        message="Merged: https://github.com/acme/example/pull/7",
+        pr_url="https://github.com/acme/example/pull/7",
+    )
+
+    first_followup = ledger.accept_event(
+        _discord_event(message_id="followup-1"),
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    second_followup = ledger.accept_event(
+        _discord_event(message_id="followup-2"),
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+
+    assert first_followup["discord_pr_generation"] == 2
+    assert first_followup["discord_pr_rollover"] is True
+    assert second_followup["discord_pr_generation"] == 2
+    assert second_followup["discord_pr_rollover"] is False
+    assert ledger.discord_pr_generation(session_key) == 2
+    replay = ledger.event_from_item(first_followup)
+    assert replay.discord_pr_generation == 2
+    assert replay.discord_pr_rollover is True
+
+
+def test_read_only_followup_does_not_advance_merged_pr_generation(tmp_path):
+    path = tmp_path / "ledger.json"
+    _seed_dev_merge_item(path)
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+    session_key = build_session_key(_discord_event().source)
+    claim = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+    assert ledger.finish_dev_merge(
+        "work-merge",
+        attempt_id=claim["_dev_merge_attempt_id"],
+        outcome="merged",
+        message="Merged: https://github.com/acme/example/pull/7",
+        pr_url="https://github.com/acme/example/pull/7",
+    )
+    question = _discord_event(message_id="question", text="what did that change?")
+    question.discord_runtime_mode = "read_only"
+    question.participates_in_work_lifecycle = False
+
+    read_only = ledger.accept_event(
+        question,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    action = ledger.accept_event(
+        _discord_event(message_id="next-action"),
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+
+    assert read_only["discord_pr_generation"] == 1
+    assert read_only["discord_pr_rollover"] is False
+    assert action["discord_pr_generation"] == 2
+    assert action["discord_pr_rollover"] is True
+
+
+def test_blocked_dev_merge_keeps_followups_in_current_pr_generation(tmp_path):
+    path = tmp_path / "ledger.json"
+    _seed_dev_merge_item(path)
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+    session_key = build_session_key(_discord_event().source)
+    claim = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+    assert ledger.finish_dev_merge(
+        "work-merge",
+        attempt_id=claim["_dev_merge_attempt_id"],
+        outcome="blocked",
+        message="Checks changed.",
+        pr_url="https://github.com/acme/example/pull/7",
+    )
+
+    followup = ledger.accept_event(
+        _discord_event(message_id="followup-blocked"),
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+
+    assert followup["discord_pr_generation"] == 1
+    assert followup["discord_pr_rollover"] is False
+
+
+def test_merged_pr_generation_survives_terminal_item_compaction(tmp_path):
+    path = tmp_path / "ledger.json"
+    _seed_dev_merge_item(path)
+    now = [100.0]
+    ledger = GatewayWorkLedger(path, now_fn=lambda: now[0])
+    session_key = build_session_key(_discord_event().source)
+    claim = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+    assert ledger.finish_dev_merge(
+        "work-merge",
+        attempt_id=claim["_dev_merge_attempt_id"],
+        outcome="merged",
+        message="Merged: https://github.com/acme/example/pull/7",
+        pr_url="https://github.com/acme/example/pull/7",
+    )
+
+    now[0] += 8 * 24 * 60 * 60
+    other = _discord_event(message_id="other-thread")
+    other.source.chat_id = "thread-2"
+    other.source.thread_id = "thread-2"
+    ledger.accept_event(
+        other,
+        session_key=build_session_key(other.source),
+        freshness_seconds=60,
+    )
+    assert ledger.get("work-merge")["tombstone"] is True
+
+    followup = ledger.accept_event(
+        _discord_event(message_id="late-followup"),
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+
+    assert followup["discord_pr_generation"] == 2
+    assert followup["discord_pr_rollover"] is True
+
+
+def test_legacy_merged_pr_materializes_lifecycle_before_compaction(tmp_path):
+    path = tmp_path / "ledger.json"
+    _seed_dev_merge_item(path)
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+    session_key = build_session_key(_discord_event().source)
+    claim = ledger.claim_dev_merge_for_message(
+        chat_id="thread-1",
+        message_id="final-1",
+        actor_id="dev-1",
+    )
+    assert ledger.finish_dev_merge(
+        "work-merge",
+        attempt_id=claim["_dev_merge_attempt_id"],
+        outcome="merged",
+        message="Merged",
+        pr_url="https://github.com/acme/example/pull/7",
+    )
+    legacy = json.loads(path.read_text(encoding="utf-8"))
+    legacy.pop("discord_pr_lifecycles", None)
+    legacy["items"]["work-merge"]["updated_at"] = 100.0
+    legacy.pop("last_compacted_at", None)
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    now = 100.0 + (8 * 24 * 60 * 60)
+    compacting_ledger = GatewayWorkLedger(path, now_fn=lambda: now)
+    other = _discord_event(message_id="other-thread")
+    other.source.chat_id = "thread-2"
+    other.source.thread_id = "thread-2"
+    compacting_ledger.accept_event(
+        other,
+        session_key=build_session_key(other.source),
+        freshness_seconds=60,
+    )
+
+    assert compacting_ledger.get("work-merge")["tombstone"] is True
+    followup = compacting_ledger.accept_event(
+        _discord_event(message_id="legacy-late-followup"),
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    assert followup["discord_pr_generation"] == 2
+    assert followup["discord_pr_rollover"] is True
+
+
+def test_lifecycle_compaction_keeps_irreplaceable_merged_state(tmp_path, monkeypatch):
+    import gateway.work_ledger as work_ledger_module
+
+    monkeypatch.setattr(work_ledger_module, "_MAX_DISCORD_PR_LIFECYCLES", 1)
+    path = tmp_path / "ledger.json"
+    old_session = build_session_key(_discord_event().source)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "items": {},
+                "discord_pr_lifecycles": {
+                    old_session: {
+                        "generation": 1,
+                        "status": "merged",
+                        "updated_at": 1.0,
+                    },
+                    "discord:newer": {
+                        "generation": 1,
+                        "status": "active",
+                        "updated_at": 2.0,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = GatewayWorkLedger(path, now_fn=lambda: 100.0)
+    ledger._write(ledger._read())
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["discord_pr_lifecycles"][old_session]["status"] == "merged"
+    followup = ledger.accept_event(
+        _discord_event(message_id="after-lifecycle-compaction"),
+        session_key=old_session,
+        freshness_seconds=60,
+    )
+    assert followup["discord_pr_generation"] == 2
+    assert followup["discord_pr_rollover"] is True
 
 
 def test_ledger_expires_old_discord_message_ids(tmp_path):

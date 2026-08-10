@@ -46,6 +46,8 @@ Adopt two related, bounded mechanisms.
 - As soon as the exact-head preview is ready, persist one durable Discord delivery obligation and post the preview URL with the draft PR URL in the originating thread. State that `main` is untouched and visual QA continues in the background.
 - Continue current-head CI and visual QA asynchronously. Post a separate terminal result in the same thread after those gates pass or require repair.
 - Treat legacy persisted `auto` and `manual` merge policy values as `never`. An upgrade cannot merge an in-flight PR.
+- After a Dev reaction confirms a merge, retain the Discord thread but close that PR generation. Read-only follow-ups remain conversational. The first later action request advances a durable thread generation and receives a distinct branch, worktree, PR, preview, QA lifecycle, final response, and merge target.
+- Start every later PR generation from a freshly fetched remote base branch. If Hermes cannot refresh that merged base, fail the new action request instead of reusing the merged worktree or branching from stale local `main`.
 
 ## Exact-head invariants
 
@@ -56,6 +58,7 @@ Adopt two related, bounded mechanisms.
 - A changed PR head invalidates the prior preview and creates a new delivery obligation only after Vercel reports the new exact-head URL.
 - Hermes initiates draft-to-ready only after a passing visual-QA receipt for the current exact head. It durably records a confirm-or-restore obligation before the mutation, re-reads GitHub afterward, and does not publish terminal success until that same head is confirmed non-draft. If the mutation outcome or refreshed head is uncertain, Hermes confirms the fenced head or restores the observed PR to draft before it evaluates later gates.
 - GitHub does not provide an expected-head condition for draft-to-ready. The same-head confirmation is therefore a bounded publication check, not a permanent branch lock. A later external push invalidates every Hermes head-bound gate, and the Dev-reaction merge path still rejects the PR until the new exact head passes all checks; GitHub can retain its non-draft bit until a later reconciliation or operator action.
+- PR generation is durable per Discord thread session. A confirmed merge advances only the next action request; questions do not allocate a branch or PR. Final-response reactions remain bound to the exact work item and PR generation that produced that message.
 - PR publication never depends on mergeability, canonical checkout sync, post-merge CI, production deployment, restart, or live-runtime pickup.
 
 ## Rollout and rollback

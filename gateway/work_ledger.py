@@ -80,6 +80,7 @@ _MAX_REQUIRED_ASYNC_RECOVERY_FILES = 32
 _FULL_RECORD_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _TOMBSTONE_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _COMPACTION_INTERVAL_SECONDS = 60 * 60
+_MAX_DISCORD_PR_LIFECYCLES = 4096
 _QUIESCENT_CLOSEOUT_STATUSES = frozenset(
     {
         "completed",
@@ -2098,7 +2099,7 @@ class GatewayWorkLedger:
         self._now = now_fn
 
     def _empty(self) -> dict[str, Any]:
-        return {"version": 2, "items": {}}
+        return {"version": 2, "items": {}, "discord_pr_lifecycles": {}}
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -2114,6 +2115,8 @@ class GatewayWorkLedger:
         items = data.get("items")
         if not isinstance(items, dict):
             data["items"] = {}
+        if not isinstance(data.get("discord_pr_lifecycles"), dict):
+            data["discord_pr_lifecycles"] = {}
         # v2 adds explicit Discord runtime/lifecycle metadata. Rows are
         # migrated lazily: missing fields retain the legacy ACTION contract in
         # event_from_item(), while the next mutation writes version 2.
@@ -2129,11 +2132,213 @@ class GatewayWorkLedger:
             force_budget = self.path.stat().st_size > DEFAULT_LEDGER_HARD_BYTES
         except OSError:
             force_budget = False
+        # Legacy rows predate the explicit per-thread lifecycle map. Preserve
+        # their generation and merged state before terminal compaction replaces
+        # the full records with tombstones.
+        self._materialize_discord_pr_lifecycles(data)
         self._compact_if_due(data, force_budget=force_budget)
+        self._compact_discord_pr_lifecycles(data)
         # The ledger is a hot recovery path, not an operator-edited config.
         # Keep the existing atomic/fsync write guarantees while avoiding the
         # whitespace and key-sorting cost on every full-file rewrite.
         atomic_json_write(self.path, data, indent=None, separators=(",", ":"))
+
+    @staticmethod
+    def _discord_pr_generation(value: Any) -> int:
+        try:
+            generation = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 1
+        return max(1, min(2_147_483_647, generation))
+
+    @staticmethod
+    def _discord_pr_updated_at(value: Any) -> float:
+        try:
+            return max(0.0, float(value or 0.0))
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
+    @classmethod
+    def _discord_pr_item_merged(cls, item: Mapping[str, Any]) -> bool:
+        if item.get("discord_pr_merged") is True:
+            return True
+        dev_merge = item.get("dev_merge")
+        if isinstance(dev_merge, Mapping) and str(dev_merge.get("status") or "") == "merged":
+            return True
+        closeout = item.get("closeout")
+        if not isinstance(closeout, Mapping):
+            return False
+        pr = closeout.get("pr") if isinstance(closeout.get("pr"), Mapping) else {}
+        return (
+            str(pr.get("state") or "").strip().upper() == "MERGED"
+            or bool(str(pr.get("merge_sha") or "").strip())
+        )
+
+    @classmethod
+    def _derive_discord_pr_lifecycle(
+        cls,
+        items: Mapping[str, Any],
+        session_key: str,
+    ) -> dict[str, Any]:
+        candidates = [
+            item
+            for item in items.values()
+            if isinstance(item, Mapping)
+            and str(item.get("platform") or "") == "discord"
+            and str(item.get("session_key") or "") == session_key
+            and str(item.get("discord_runtime_mode") or "action") == "action"
+            and item.get("participates_in_work_lifecycle", True) is not False
+        ]
+        if not candidates:
+            return {"generation": 1, "status": "active"}
+        generation = max(
+            cls._discord_pr_generation(item.get("discord_pr_generation"))
+            for item in candidates
+        )
+        generation_items = [
+            item
+            for item in candidates
+            if cls._discord_pr_generation(item.get("discord_pr_generation")) == generation
+        ]
+        status = (
+            "merged"
+            if any(cls._discord_pr_item_merged(item) for item in generation_items)
+            else "active"
+        )
+        updated_at = max(
+            cls._discord_pr_updated_at(item.get("updated_at"))
+            for item in generation_items
+        )
+        return {
+            "generation": generation,
+            "status": status,
+            "updated_at": updated_at,
+        }
+
+    @classmethod
+    def _materialize_discord_pr_lifecycles(cls, data: dict[str, Any]) -> None:
+        """Persist reconstructible thread state before item compaction."""
+
+        items = data.get("items")
+        if not isinstance(items, Mapping):
+            return
+        lifecycles = data.setdefault("discord_pr_lifecycles", {})
+        if not isinstance(lifecycles, dict):
+            lifecycles = {}
+            data["discord_pr_lifecycles"] = lifecycles
+        session_keys = {
+            str(item.get("session_key") or "").strip()[:800]
+            for item in items.values()
+            if isinstance(item, Mapping)
+            and str(item.get("platform") or "") == "discord"
+            and str(item.get("discord_runtime_mode") or "action") == "action"
+            and item.get("participates_in_work_lifecycle", True) is not False
+            and str(item.get("session_key") or "").strip()
+        }
+        for session_key in session_keys:
+            derived = cls._derive_discord_pr_lifecycle(items, session_key)
+            current = cls._discord_pr_lifecycle(data, session_key)
+            derived_generation = cls._discord_pr_generation(derived.get("generation"))
+            current_generation = cls._discord_pr_generation(current.get("generation"))
+            if session_key not in lifecycles or derived_generation > current_generation:
+                lifecycles[session_key] = derived
+            elif (
+                derived_generation == current_generation
+                and derived.get("status") == "merged"
+                and current.get("status") != "merged"
+            ):
+                lifecycles[session_key] = {
+                    **current,
+                    "status": "merged",
+                    "updated_at": max(
+                        cls._discord_pr_updated_at(current.get("updated_at")),
+                        cls._discord_pr_updated_at(derived.get("updated_at")),
+                    ),
+                }
+
+    @classmethod
+    def _discord_pr_lifecycle(
+        cls,
+        data: Mapping[str, Any],
+        session_key: str,
+    ) -> dict[str, Any]:
+        lifecycles = data.get("discord_pr_lifecycles")
+        raw = lifecycles.get(session_key) if isinstance(lifecycles, Mapping) else None
+        if isinstance(raw, Mapping):
+            status = str(raw.get("status") or "active").strip().lower()
+            if status not in {"active", "merged"}:
+                status = "active"
+            return {
+                "generation": cls._discord_pr_generation(raw.get("generation")),
+                "status": status,
+                "updated_at": cls._discord_pr_updated_at(raw.get("updated_at")),
+                "pr_url": str(raw.get("pr_url") or "")[:1200],
+            }
+        items = data.get("items") if isinstance(data.get("items"), Mapping) else {}
+        return cls._derive_discord_pr_lifecycle(items, session_key)
+
+    @classmethod
+    def _compact_discord_pr_lifecycles(cls, data: dict[str, Any]) -> None:
+        raw = data.get("discord_pr_lifecycles")
+        if not isinstance(raw, dict):
+            data["discord_pr_lifecycles"] = {}
+            return
+        normalized: dict[str, dict[str, Any]] = {}
+        for key, value in raw.items():
+            session_key = str(key or "").strip()[:800]
+            if not session_key or not isinstance(value, Mapping):
+                continue
+            status = str(value.get("status") or "active").strip().lower()
+            if status not in {"active", "merged"}:
+                status = "active"
+            normalized[session_key] = {
+                "generation": cls._discord_pr_generation(value.get("generation")),
+                "status": status,
+                "updated_at": cls._discord_pr_updated_at(value.get("updated_at")),
+                "pr_url": str(value.get("pr_url") or "")[:1200],
+            }
+        if len(normalized) > _MAX_DISCORD_PR_LIFECYCLES:
+            items = data.get("items") if isinstance(data.get("items"), Mapping) else {}
+            reconstructible_sessions = {
+                str(item.get("session_key") or "").strip()[:800]
+                for item in items.values()
+                if isinstance(item, Mapping)
+                and str(item.get("platform") or "") == "discord"
+                and str(item.get("discord_runtime_mode") or "action") == "action"
+                and item.get("participates_in_work_lifecycle", True) is not False
+                and str(item.get("session_key") or "").strip()
+            }
+            ordered = sorted(
+                normalized.items(),
+                key=lambda item: item[1]["updated_at"],
+                reverse=True,
+            )
+            retained = dict(ordered[:_MAX_DISCORD_PR_LIFECYCLES])
+            # An entry without retained item history is the only durable proof
+            # that a thread already merged. Never evict that proof merely to
+            # satisfy the soft lifecycle-count bound.
+            for session_key, lifecycle in ordered[_MAX_DISCORD_PR_LIFECYCLES:]:
+                if session_key not in reconstructible_sessions and (
+                    lifecycle["status"] == "merged"
+                    or cls._discord_pr_generation(lifecycle["generation"]) > 1
+                ):
+                    retained[session_key] = lifecycle
+            normalized = retained
+        data["discord_pr_lifecycles"] = normalized
+
+    def discord_pr_generation(self, session_key: str) -> int:
+        """Return the active PR generation for one Discord thread session."""
+
+        key = str(session_key or "").strip()[:800]
+        if not key:
+            return 1
+        return self._discord_pr_generation(
+            self._discord_pr_lifecycle(self._read(), key).get("generation")
+        )
+
+    @classmethod
+    def normalize_discord_pr_generation(cls, value: Any) -> int:
+        return cls._discord_pr_generation(value)
 
     @staticmethod
     def _terminal_delivery_is_pending(item: Mapping[str, Any]) -> bool:
@@ -2191,15 +2396,42 @@ class GatewayWorkLedger:
             and str(delivery_attempt.get("status") or "") in {"sending", "uncertain"}
         )
 
-    @staticmethod
-    def _tombstone_for(item: Mapping[str, Any], *, now: float) -> dict[str, Any]:
-        return {
+    @classmethod
+    def _tombstone_for(
+        cls,
+        item: Mapping[str, Any],
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        tombstone = {
             "id": str(item.get("id") or ""),
             "status": str(item.get("status") or "expired"),
             "tombstone": True,
             "tombstoned_at": now,
             "tombstone_expires_at": now + _TOMBSTONE_RETENTION_SECONDS,
         }
+        if (
+            str(item.get("platform") or "") == "discord"
+            and str(item.get("session_key") or "").strip()
+            and str(item.get("discord_runtime_mode") or "action") == "action"
+            and item.get("participates_in_work_lifecycle", True) is not False
+        ):
+            tombstone.update(
+                {
+                    "platform": "discord",
+                    "session_key": str(item.get("session_key") or "")[:800],
+                    "discord_runtime_mode": "action",
+                    "participates_in_work_lifecycle": True,
+                    "discord_pr_generation": cls._discord_pr_generation(
+                        item.get("discord_pr_generation")
+                    ),
+                    "discord_pr_merged": cls._discord_pr_item_merged(item),
+                    "updated_at": cls._discord_pr_updated_at(
+                        item.get("updated_at")
+                    ),
+                }
+            )
+        return tombstone
 
     def _compact_if_due(
         self,
@@ -2305,6 +2537,27 @@ class GatewayWorkLedger:
             return copy
 
         message_type = getattr(getattr(event, "message_type", None), "value", None)
+        runtime_mode = str(
+            getattr(event, "discord_runtime_mode", None) or "action"
+        ).strip().lower()
+        participates_in_lifecycle = bool(
+            getattr(event, "participates_in_work_lifecycle", True)
+        )
+        pr_generation = 1
+        pr_rollover = False
+        lifecycle_key = str(session_key or "").strip()[:800]
+        if runtime_mode == "action" and participates_in_lifecycle and lifecycle_key:
+            lifecycle = self._discord_pr_lifecycle(data, lifecycle_key)
+            pr_generation = self._discord_pr_generation(lifecycle.get("generation"))
+            if lifecycle.get("status") == "merged":
+                pr_generation = min(2_147_483_647, pr_generation + 1)
+                pr_rollover = True
+            data.setdefault("discord_pr_lifecycles", {})[lifecycle_key] = {
+                "generation": pr_generation,
+                "status": "active",
+                "updated_at": now,
+                "pr_url": "",
+            }
         normalized_visual_config = normalize_visual_qa_config(visual_qa_config)
         visual_requirement = _visual_qa_requirement_for_event(event)
         channel_prompt = getattr(event, "channel_prompt", None)
@@ -2335,9 +2588,7 @@ class GatewayWorkLedger:
             "discord_action_request_base_channel_prompt": base_channel_prompt,
             "channel_context": getattr(event, "channel_context", None),
             "goal_thread_context": getattr(event, "goal_thread_context", None),
-            "discord_runtime_mode": str(
-                getattr(event, "discord_runtime_mode", None) or "action"
-            ),
+            "discord_runtime_mode": runtime_mode,
             "discord_runtime_reason": getattr(event, "discord_runtime_reason", None),
             "discord_action_escalation_allowed": bool(
                 getattr(event, "discord_action_escalation_allowed", False)
@@ -2345,9 +2596,9 @@ class GatewayWorkLedger:
             "discord_explicit_no_action_denial": bool(
                 getattr(event, "discord_explicit_no_action_denial", False)
             ),
-            "participates_in_work_lifecycle": bool(
-                getattr(event, "participates_in_work_lifecycle", True)
-            ),
+            "participates_in_work_lifecycle": participates_in_lifecycle,
+            "discord_pr_generation": pr_generation,
+            "discord_pr_rollover": pr_rollover,
             "drain_recovery": bool(drain_recovery),
             "feature_summary": _durable_metadata(getattr(event, "feature_summary", None)),
             "project_summary": _durable_metadata(getattr(event, "project_summary", None)),
@@ -2474,6 +2725,20 @@ class GatewayWorkLedger:
             "finished_at": now,
             "lease_until": None,
         }
+        if safe_outcome in {"merged", "already_merged"}:
+            session_key = str(item.get("session_key") or "").strip()[:800]
+            if session_key:
+                generation = self._discord_pr_generation(
+                    item.get("discord_pr_generation")
+                )
+                lifecycle = self._discord_pr_lifecycle(data, session_key)
+                if self._discord_pr_generation(lifecycle.get("generation")) <= generation:
+                    data.setdefault("discord_pr_lifecycles", {})[session_key] = {
+                        "generation": generation,
+                        "status": "merged",
+                        "updated_at": now,
+                        "pr_url": str(pr_url or "")[:1200],
+                    }
         item["updated_at"] = now
         self._write(data)
         return True
@@ -5995,6 +6260,10 @@ class GatewayWorkLedger:
         )
         event.work_item_id = item.get("id")
         event.work_replay = True
+        event.discord_pr_generation = GatewayWorkLedger.normalize_discord_pr_generation(
+            item.get("discord_pr_generation")
+        )
+        event.discord_pr_rollover = bool(item.get("discord_pr_rollover", False))
         event.discord_drain_recovery = bool(item.get("drain_recovery", False))
         event.visual_qa_requirement = normalize_visual_requirement(item.get("visual_qa_requirement"))
         event.visual_qa_config = normalize_visual_qa_config(item.get("visual_qa_config"))

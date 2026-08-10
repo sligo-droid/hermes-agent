@@ -5,6 +5,7 @@ import threading
 import types
 from collections import OrderedDict
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -19,8 +20,8 @@ _ONE_BY_ONE_PNG = base64.b64decode(
 
 
 class CaptureAdapter(BasePlatformAdapter):
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(PlatformConfig(enabled=True, token="***"), platform)
         self.sent = []
         self.typing = []
 
@@ -219,6 +220,105 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+
+
+@pytest.mark.asyncio
+async def test_queued_next_pr_resolves_fresh_worktree_before_recursive_turn(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway.work_ledger import GatewayWorkLedger
+
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    resolved = []
+
+    def resolve_fresh_worktree(
+        source,
+        feature_summary,
+        config,
+        session_key,
+        runtime_mode,
+        pr_generation,
+    ):
+        resolved.append((source.project_path, session_key, runtime_mode, pr_generation))
+        return str(tmp_path / "fresh-pr2"), None, str(tmp_path / "fresh-pr2")
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_gateway_turn_cwd",
+        resolve_fresh_worktree,
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_gateway_repository_for_source",
+        lambda *_args, **_kwargs: "acme/pid",
+    )
+
+    adapter = CaptureAdapter(Platform.DISCORD)
+    runner = _make_runner(adapter)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work-ledger.json")
+    runner._persist_action_closeout_workspace = MagicMock()
+    runner._cache_session_source = MagicMock()
+    session_key = "agent:main:discord:thread:thread-1:thread-1"
+    runner._running_discord_pr_generations = {session_key: 1}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+        project_path=str(tmp_path / "canonical"),
+    )
+    pending = MessageEvent(
+        text="start the second PR",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-pr2",
+    )
+    pending.feature_summary = {"initial_request": "start the second PR"}
+    pending.discord_runtime_mode = "action"
+    pending.discord_pr_generation = 2
+    pending.participates_in_work_lifecycle = True
+    adapter._pending_messages[session_key] = pending
+
+    result = await runner._run_agent(
+        message="finish the first PR",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-pr-rollover",
+        session_key=session_key,
+        feature_summary={"initial_request": "finish the first PR"},
+        discord_runtime_mode="action",
+        session_cwd_override=str(tmp_path / "old-pr1"),
+    )
+
+    assert result["final_response"] == "done-2"
+    assert resolved == [
+        (
+            str(tmp_path / "canonical"),
+            session_key,
+            gateway_run.RuntimeMode.ACTION,
+            2,
+        )
+    ]
+    assert session_key not in runner._running_discord_pr_generations
+    runner._persist_action_closeout_workspace.assert_called_once()
+    assert pending.source.project_path == str(tmp_path / "fresh-pr2")
 
 
 @pytest.mark.asyncio
