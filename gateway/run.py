@@ -4437,6 +4437,7 @@ class _GatewayRunnerCore(
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
+    _running_discord_pr_generations: Dict[str, int] = {}
     _busy_input_mode: str = "steer"
     _busy_text_mode: str = "steer"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -4528,6 +4529,7 @@ class _GatewayRunnerCore(
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        self._running_discord_pr_generations: Dict[str, int] = {}
         self._active_session_leases: Dict[str, Any] = {}
         self._turn_leases = SessionTurnLeaseRegistry()
         self._turn_lease_tokens: Dict[tuple, Any] = {}
@@ -6584,6 +6586,37 @@ class _GatewayRunnerCore(
             by_generation = pending.setdefault(session_key, {})
             by_generation[run_generation] = []
 
+    def _discord_action_pr_generation(self, event: MessageEvent) -> Optional[int]:
+        """Return an action event's durable PR generation, if applicable."""
+
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return None
+        if _discord_runtime_mode_for(event) is not RuntimeMode.ACTION:
+            return None
+        if getattr(event, "participates_in_work_lifecycle", True) is False:
+            return None
+        return self._ledger().normalize_discord_pr_generation(
+            getattr(event, "discord_pr_generation", 1)
+        )
+
+    def _crosses_running_discord_pr_generation(
+        self,
+        session_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        """Return whether an action belongs to a different PR than the live turn."""
+
+        event_generation = self._discord_action_pr_generation(event)
+        active_generation = (
+            self.__dict__.get("_running_discord_pr_generations", {}) or {}
+        ).get(session_key)
+        return (
+            event_generation is not None
+            and active_generation is not None
+            and event_generation != active_generation
+        )
+
     def _stage_start_user_followup(
         self,
         session_key: str,
@@ -6599,6 +6632,7 @@ class _GatewayRunnerCore(
             not session_key
             or event.message_type != MessageType.TEXT
             or bool(getattr(event, "media_urls", None))
+            or self._crosses_running_discord_pr_generation(session_key, event)
         ):
             return False
         text = (event.text or "").strip()
@@ -7157,6 +7191,9 @@ class _GatewayRunnerCore(
         if running_agent is None:
             running_agent = self._running_agents.get(session_key)
         text = (event.text or "").strip()
+        if self._crosses_running_discord_pr_generation(session_key, event):
+            self._queue_or_replace_pending_event(session_key, event)
+            return "unsupported"
         if running_agent is _AGENT_PENDING_SENTINEL:
             if self._stage_start_user_followup(session_key, event):
                 return "accepted"
@@ -7387,6 +7424,14 @@ class _GatewayRunnerCore(
             return False  # let default path handle it
 
         running_agent = self._running_agents.get(session_key)
+
+        if self._crosses_running_discord_pr_generation(session_key, event):
+            self._queue_or_replace_pending_event(session_key, event)
+            logger.info(
+                "Queued Discord PR-generation rollover for session %s until the active PR turn finishes",
+                session_key,
+            )
+            return True
 
         effective_mode = self._busy_input_mode
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
@@ -17604,6 +17649,14 @@ class _GatewayRunnerCore(
                 if handled:
                     return response
 
+            if self._crosses_running_discord_pr_generation(_quick_key, event):
+                self._queue_or_replace_pending_event(_quick_key, event)
+                logger.info(
+                    "Queued Discord PR-generation rollover for session %s until the active PR turn finishes",
+                    _quick_key,
+                )
+                return "⏳ Queued for the next PR in this thread after the current turn finishes."
+
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
@@ -18371,6 +18424,11 @@ class _GatewayRunnerCore(
         self._running_agents_ts[_quick_key] = time.time()
         self._refresh_active_agent_runtime_status()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _discord_pr_generation = self._discord_action_pr_generation(event)
+        if _discord_pr_generation is not None:
+            self.__dict__.setdefault("_running_discord_pr_generations", {})[
+                _quick_key
+            ] = _discord_pr_generation
         self._open_start_user_followups(_quick_key, _run_generation)
         _work_item_id = str(getattr(event, "work_item_id", "") or "")
         if _work_item_id and getattr(source, "platform", None) == Platform.DISCORD:
@@ -29441,6 +29499,11 @@ class _GatewayRunnerCore(
         had_running_agent = session_key in self._running_agents
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
+        running_pr_generations = self.__dict__.get(
+            "_running_discord_pr_generations"
+        )
+        if isinstance(running_pr_generations, dict):
+            running_pr_generations.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
         if had_running_agent:
@@ -33811,6 +33874,7 @@ class _GatewayRunnerCore(
                 next_project_summary = project_summary
                 next_origin_work_item_id = str(origin_work_item_id or "")
                 next_session_key = session_key
+                next_session_cwd = session_cwd
                 next_runtime_mode = turn_runtime_mode
                 next_legacy_action_intent = None
                 next_action_escalation_allowed = bool(
@@ -33872,6 +33936,82 @@ class _GatewayRunnerCore(
                     next_origin_work_item_id = str(
                         self._discord_work_item_id_for_event(pending_event, session_key) or ""
                     )
+                    if self._crosses_running_discord_pr_generation(
+                        next_session_key,
+                        pending_event,
+                    ):
+                        (
+                            next_session_cwd,
+                            next_cwd_error,
+                            next_action_worktree_cwd,
+                        ) = await asyncio.to_thread(
+                            _resolve_gateway_turn_cwd,
+                            next_source,
+                            next_feature_summary,
+                            user_config,
+                            next_session_key,
+                            next_runtime_mode,
+                            getattr(pending_event, "discord_pr_generation", 1),
+                        )
+                        if next_cwd_error:
+                            blocked_followup = {
+                                "final_response": (
+                                    "⚠️ I could not start the next PR safely in a fresh "
+                                    f"Git worktree. {next_cwd_error}"
+                                ),
+                                "messages": updated_history,
+                                "api_calls": 0,
+                                "completed": False,
+                            }
+                            return _preserve_queued_followup_history_offset(
+                                result,
+                                blocked_followup,
+                            )
+                        if next_action_worktree_cwd:
+                            repository = _gateway_repository_for_source(
+                                next_source,
+                                workspace_path=next_action_worktree_cwd,
+                            )
+                            closeout_mode, closeout_policy = (
+                                _gateway_action_closeout_contract(
+                                    user_config,
+                                    repository=repository,
+                                    request=_gateway_action_request_text(pending_event),
+                                    source="direct",
+                                    visual_requirement=getattr(
+                                        pending_event,
+                                        "visual_qa_requirement",
+                                        None,
+                                    ),
+                                    visual_config=getattr(
+                                        pending_event,
+                                        "visual_qa_config",
+                                        None,
+                                    ),
+                                )
+                            )
+                            self._persist_action_closeout_workspace(
+                                pending_event,
+                                mutable_path=next_action_worktree_cwd,
+                                canonical_path=str(next_source.project_path or ""),
+                                config=user_config,
+                                source="direct",
+                                mode=closeout_mode,
+                                policy=closeout_policy,
+                            )
+                            next_source = dataclasses.replace(
+                                next_source,
+                                project_path=next_action_worktree_cwd,
+                            )
+                            pending_event.source = next_source
+                            self._cache_session_source(next_session_key, next_source)
+                        next_pr_generation = self._discord_action_pr_generation(
+                            pending_event
+                        )
+                        if next_pr_generation is not None:
+                            self.__dict__.setdefault(
+                                "_running_discord_pr_generations", {}
+                            )[next_session_key] = next_pr_generation
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -33911,7 +34051,17 @@ class _GatewayRunnerCore(
                     discord_action_request_intent=next_legacy_action_intent,
                     discord_action_escalation_allowed=next_action_escalation_allowed,
                     fable_reasoning_config=fable_reasoning_config,
-                    session_cwd_override=session_cwd,
+                    session_cwd_override=next_session_cwd,
+                    visual_qa_requirement=(
+                        getattr(pending_event, "visual_qa_requirement", None)
+                        if pending_event is not None
+                        else visual_qa_requirement
+                    ),
+                    visual_qa_config=(
+                        getattr(pending_event, "visual_qa_config", None)
+                        if pending_event is not None
+                        else visual_qa_config
+                    ),
                     origin_work_item_id=next_origin_work_item_id,
                     suppress_user_output=bool(
                         getattr(pending_event, "suppress_user_output", False)

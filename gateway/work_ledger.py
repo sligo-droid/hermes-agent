@@ -2132,6 +2132,10 @@ class GatewayWorkLedger:
             force_budget = self.path.stat().st_size > DEFAULT_LEDGER_HARD_BYTES
         except OSError:
             force_budget = False
+        # Legacy rows predate the explicit per-thread lifecycle map. Preserve
+        # their generation and merged state before terminal compaction replaces
+        # the full records with tombstones.
+        self._materialize_discord_pr_lifecycles(data)
         self._compact_if_due(data, force_budget=force_budget)
         self._compact_discord_pr_lifecycles(data)
         # The ledger is a hot recovery path, not an operator-edited config.
@@ -2156,6 +2160,8 @@ class GatewayWorkLedger:
 
     @classmethod
     def _discord_pr_item_merged(cls, item: Mapping[str, Any]) -> bool:
+        if item.get("discord_pr_merged") is True:
+            return True
         dev_merge = item.get("dev_merge")
         if isinstance(dev_merge, Mapping) and str(dev_merge.get("status") or "") == "merged":
             return True
@@ -2210,6 +2216,47 @@ class GatewayWorkLedger:
         }
 
     @classmethod
+    def _materialize_discord_pr_lifecycles(cls, data: dict[str, Any]) -> None:
+        """Persist reconstructible thread state before item compaction."""
+
+        items = data.get("items")
+        if not isinstance(items, Mapping):
+            return
+        lifecycles = data.setdefault("discord_pr_lifecycles", {})
+        if not isinstance(lifecycles, dict):
+            lifecycles = {}
+            data["discord_pr_lifecycles"] = lifecycles
+        session_keys = {
+            str(item.get("session_key") or "").strip()[:800]
+            for item in items.values()
+            if isinstance(item, Mapping)
+            and str(item.get("platform") or "") == "discord"
+            and str(item.get("discord_runtime_mode") or "action") == "action"
+            and item.get("participates_in_work_lifecycle", True) is not False
+            and str(item.get("session_key") or "").strip()
+        }
+        for session_key in session_keys:
+            derived = cls._derive_discord_pr_lifecycle(items, session_key)
+            current = cls._discord_pr_lifecycle(data, session_key)
+            derived_generation = cls._discord_pr_generation(derived.get("generation"))
+            current_generation = cls._discord_pr_generation(current.get("generation"))
+            if session_key not in lifecycles or derived_generation > current_generation:
+                lifecycles[session_key] = derived
+            elif (
+                derived_generation == current_generation
+                and derived.get("status") == "merged"
+                and current.get("status") != "merged"
+            ):
+                lifecycles[session_key] = {
+                    **current,
+                    "status": "merged",
+                    "updated_at": max(
+                        cls._discord_pr_updated_at(current.get("updated_at")),
+                        cls._discord_pr_updated_at(derived.get("updated_at")),
+                    ),
+                }
+
+    @classmethod
     def _discord_pr_lifecycle(
         cls,
         data: Mapping[str, Any],
@@ -2251,13 +2298,32 @@ class GatewayWorkLedger:
                 "pr_url": str(value.get("pr_url") or "")[:1200],
             }
         if len(normalized) > _MAX_DISCORD_PR_LIFECYCLES:
-            normalized = dict(
-                sorted(
-                    normalized.items(),
-                    key=lambda item: item[1]["updated_at"],
-                    reverse=True,
-                )[:_MAX_DISCORD_PR_LIFECYCLES]
+            items = data.get("items") if isinstance(data.get("items"), Mapping) else {}
+            reconstructible_sessions = {
+                str(item.get("session_key") or "").strip()[:800]
+                for item in items.values()
+                if isinstance(item, Mapping)
+                and str(item.get("platform") or "") == "discord"
+                and str(item.get("discord_runtime_mode") or "action") == "action"
+                and item.get("participates_in_work_lifecycle", True) is not False
+                and str(item.get("session_key") or "").strip()
+            }
+            ordered = sorted(
+                normalized.items(),
+                key=lambda item: item[1]["updated_at"],
+                reverse=True,
             )
+            retained = dict(ordered[:_MAX_DISCORD_PR_LIFECYCLES])
+            # An entry without retained item history is the only durable proof
+            # that a thread already merged. Never evict that proof merely to
+            # satisfy the soft lifecycle-count bound.
+            for session_key, lifecycle in ordered[_MAX_DISCORD_PR_LIFECYCLES:]:
+                if session_key not in reconstructible_sessions and (
+                    lifecycle["status"] == "merged"
+                    or cls._discord_pr_generation(lifecycle["generation"]) > 1
+                ):
+                    retained[session_key] = lifecycle
+            normalized = retained
         data["discord_pr_lifecycles"] = normalized
 
     def discord_pr_generation(self, session_key: str) -> int:
@@ -2330,15 +2396,42 @@ class GatewayWorkLedger:
             and str(delivery_attempt.get("status") or "") in {"sending", "uncertain"}
         )
 
-    @staticmethod
-    def _tombstone_for(item: Mapping[str, Any], *, now: float) -> dict[str, Any]:
-        return {
+    @classmethod
+    def _tombstone_for(
+        cls,
+        item: Mapping[str, Any],
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        tombstone = {
             "id": str(item.get("id") or ""),
             "status": str(item.get("status") or "expired"),
             "tombstone": True,
             "tombstoned_at": now,
             "tombstone_expires_at": now + _TOMBSTONE_RETENTION_SECONDS,
         }
+        if (
+            str(item.get("platform") or "") == "discord"
+            and str(item.get("session_key") or "").strip()
+            and str(item.get("discord_runtime_mode") or "action") == "action"
+            and item.get("participates_in_work_lifecycle", True) is not False
+        ):
+            tombstone.update(
+                {
+                    "platform": "discord",
+                    "session_key": str(item.get("session_key") or "")[:800],
+                    "discord_runtime_mode": "action",
+                    "participates_in_work_lifecycle": True,
+                    "discord_pr_generation": cls._discord_pr_generation(
+                        item.get("discord_pr_generation")
+                    ),
+                    "discord_pr_merged": cls._discord_pr_item_merged(item),
+                    "updated_at": cls._discord_pr_updated_at(
+                        item.get("updated_at")
+                    ),
+                }
+            )
+        return tombstone
 
     def _compact_if_due(
         self,

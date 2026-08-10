@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.runtime_capabilities import RuntimeMode
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, MetadataReply
 from gateway.session import SessionEntry, SessionSource, build_session_key
@@ -180,11 +181,22 @@ async def test_opus_implementation_preprovisions_worktree_for_worker_prompt(monk
     runner._cache_session_source = MagicMock()
     event = _make_event()
     event.source.project_path = "/canonical/PID"
+    event.discord_pr_generation = 2
+    runner._accept_discord_work_item = MagicMock(return_value={"id": "opus-pr2"})
 
-    def fake_worktree(source, feature_summary, config, session_key):
+    def fake_worktree(
+        source,
+        feature_summary,
+        config,
+        session_key,
+        runtime_mode,
+        pr_generation,
+    ):
         assert source.project_path == "/canonical/PID"
         assert feature_summary == event.feature_summary
         assert session_key == build_session_key(event.source)
+        assert runtime_mode is RuntimeMode.ACTION
+        assert pr_generation == 2
         return "/workspaces/opus-pid", None, "/workspaces/opus-pid"
 
     def fake_build(request):
