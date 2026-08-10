@@ -1116,6 +1116,7 @@ class TestBusySessionAck:
         runner._running_agents[session_key] = sentinel
         runner._running_agents_ts[session_key] = time.time()
         runner._running_discord_pr_generations = {session_key: 1}
+        runner._running_discord_runtime_modes = {session_key: "action"}
         runner._session_run_generation = {session_key: 4}
         runner._open_start_user_followups(session_key, 4)
         runner.adapters[source.platform] = adapter
@@ -1165,6 +1166,55 @@ class TestBusySessionAck:
         runner._running_agents[session_key] = running_agent
         runner._running_agents_ts[session_key] = time.time()
         runner._running_discord_pr_generations = {session_key: 1}
+        runner._running_discord_runtime_modes = {session_key: "action"}
+        runner.adapters[source.platform] = adapter
+
+        response = await GatewayRunner._handle_message(runner, event)
+
+        assert "next PR" in response
+        assert event.discord_pr_generation == 2
+        running_agent.steer.assert_not_called()
+        assert adapter._pending_messages[session_key] is event
+
+    @pytest.mark.asyncio
+    async def test_discord_action_never_steers_into_live_read_only_turn(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        runner._queued_events = {}
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        adapter = _make_adapter("discord")
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="read-only-thread",
+            chat_type="thread",
+            thread_id="read-only-thread",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="now implement another change",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="action-after-question",
+        )
+        event.discord_runtime_mode = "action"
+        event.participates_in_work_lifecycle = True
+        session_key = build_session_key(source)
+        runner.work_ledger.path.write_text(
+            '{"version":2,"items":{},"discord_pr_lifecycles":'
+            f'{{"{session_key}":{{"generation":1,"status":"merged","updated_at":1}}}}}}',
+            encoding="utf-8",
+        )
+        running_agent = MagicMock()
+        running_agent.steer.return_value = True
+        running_agent.get_activity_summary.return_value = {
+            "seconds_since_activity": 0,
+        }
+        runner._running_agents[session_key] = running_agent
+        runner._running_agents_ts[session_key] = time.time()
+        runner._running_discord_pr_generations = {session_key: 1}
+        runner._running_discord_runtime_modes = {session_key: "read_only"}
         runner.adapters[source.platform] = adapter
 
         response = await GatewayRunner._handle_message(runner, event)

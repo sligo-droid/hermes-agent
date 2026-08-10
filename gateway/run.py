@@ -4438,6 +4438,7 @@ class _GatewayRunnerCore(
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
     _running_discord_pr_generations: Dict[str, int] = {}
+    _running_discord_runtime_modes: Dict[str, str] = {}
     _busy_input_mode: str = "steer"
     _busy_text_mode: str = "steer"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -4530,6 +4531,7 @@ class _GatewayRunnerCore(
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._running_discord_pr_generations: Dict[str, int] = {}
+        self._running_discord_runtime_modes: Dict[str, str] = {}
         self._active_session_leases: Dict[str, Any] = {}
         self._turn_leases = SessionTurnLeaseRegistry()
         self._turn_lease_tokens: Dict[tuple, Any] = {}
@@ -6608,13 +6610,24 @@ class _GatewayRunnerCore(
         """Return whether an action belongs to a different PR than the live turn."""
 
         event_generation = self._discord_action_pr_generation(event)
+        active_runtime_mode = (
+            self.__dict__.get("_running_discord_runtime_modes", {}) or {}
+        ).get(session_key)
         active_generation = (
             self.__dict__.get("_running_discord_pr_generations", {}) or {}
         ).get(session_key)
         return (
             event_generation is not None
-            and active_generation is not None
-            and event_generation != active_generation
+            and (
+                (
+                    active_runtime_mode is not None
+                    and active_runtime_mode != RuntimeMode.ACTION.value
+                )
+                or (
+                    active_generation is not None
+                    and event_generation != active_generation
+                )
+            )
         )
 
     def _stage_start_user_followup(
@@ -18424,11 +18437,19 @@ class _GatewayRunnerCore(
         self._running_agents_ts[_quick_key] = time.time()
         self._refresh_active_agent_runtime_status()
         _run_generation = self._begin_session_run_generation(_quick_key)
-        _discord_pr_generation = self._discord_action_pr_generation(event)
-        if _discord_pr_generation is not None:
+        if getattr(source, "platform", None) == Platform.DISCORD:
+            _discord_runtime_mode = _discord_runtime_mode_for(event)
+            _discord_pr_generation = self._discord_action_pr_generation(event)
+            if _discord_pr_generation is None:
+                _discord_pr_generation = self._ledger().discord_pr_generation(
+                    _quick_key
+                )
             self.__dict__.setdefault("_running_discord_pr_generations", {})[
                 _quick_key
             ] = _discord_pr_generation
+            self.__dict__.setdefault("_running_discord_runtime_modes", {})[
+                _quick_key
+            ] = _discord_runtime_mode.value
         self._open_start_user_followups(_quick_key, _run_generation)
         _work_item_id = str(getattr(event, "work_item_id", "") or "")
         if _work_item_id and getattr(source, "platform", None) == Platform.DISCORD:
@@ -29504,6 +29525,11 @@ class _GatewayRunnerCore(
         )
         if isinstance(running_pr_generations, dict):
             running_pr_generations.pop(session_key, None)
+        running_runtime_modes = self.__dict__.get(
+            "_running_discord_runtime_modes"
+        )
+        if isinstance(running_runtime_modes, dict):
+            running_runtime_modes.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
         if had_running_agent:
@@ -34012,6 +34038,9 @@ class _GatewayRunnerCore(
                             self.__dict__.setdefault(
                                 "_running_discord_pr_generations", {}
                             )[next_session_key] = next_pr_generation
+                            self.__dict__.setdefault(
+                                "_running_discord_runtime_modes", {}
+                            )[next_session_key] = RuntimeMode.ACTION.value
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
