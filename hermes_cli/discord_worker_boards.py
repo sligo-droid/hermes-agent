@@ -70,13 +70,10 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 DEFAULT_REVIEW_LOOP_LIMIT = 5
 FOREMAN_REVIEW_LOOP_LIMIT = 3
-BOARD_RUN_SUMMARY_SCHEMA_VERSION = 3
+BOARD_RUN_SUMMARY_SCHEMA_VERSION = 4
 PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL = "after_review_approval"
 PR_OPEN_POLICY_NEVER = "never"
-MERGE_POLICY_AUTO = "auto"
-MERGE_POLICY_MANUAL = "manual"
 MERGE_POLICY_NEVER = "never"
-VALID_MERGE_POLICIES = frozenset({MERGE_POLICY_AUTO, MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER})
 VALID_PR_OPEN_POLICIES = frozenset({PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL, PR_OPEN_POLICY_NEVER})
 _DISCORD_MESSAGE_URL_RE = re.compile(
     r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
@@ -135,20 +132,14 @@ def _is_foreman_generated_request(request: object) -> bool:
 def pr_policy_for_request(request: object) -> dict[str, str]:
     """Infer board-level PR policy from the user's request.
 
-    Ambiguous implementation requests should take the normal Sligo path:
-    open a PR after reviewer approval, wait for checks, then merge. Explicit
-    review-only / do-not-merge wording overrides that default.
+    Discord implementation work publishes pull requests but never merges them.
+    Explicit local-only wording can still disable the PR lifecycle entirely.
     """
     text = re.sub(r"\s+", " ", str(request or "")).strip().casefold()
     pr_open_policy = PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL
-    merge_policy = MERGE_POLICY_AUTO
+    merge_policy = MERGE_POLICY_NEVER
     if _request_forbids_pr_lifecycle(text):
         pr_open_policy = PR_OPEN_POLICY_NEVER
-        merge_policy = MERGE_POLICY_NEVER
-    elif _request_forbids_merge(text):
-        merge_policy = MERGE_POLICY_NEVER
-    elif _request_requires_manual_merge(text):
-        merge_policy = MERGE_POLICY_MANUAL
     return {
         "pr_open_policy": pr_open_policy,
         "merge_policy": merge_policy,
@@ -167,7 +158,7 @@ def effective_pr_policy_for_worker(worker: dict[str, Any]) -> dict[str, str]:
     ):
         return {
             "pr_open_policy": PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
-            "merge_policy": MERGE_POLICY_AUTO,
+            "merge_policy": MERGE_POLICY_NEVER,
         }
 
     text_parts: list[str] = []
@@ -198,14 +189,7 @@ def effective_pr_policy_for_worker(worker: dict[str, Any]) -> dict[str, str]:
     pr_open_policy = str(worker.get("pr_open_policy") or PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL).strip().lower()
     if pr_open_policy not in VALID_PR_OPEN_POLICIES:
         pr_open_policy = PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL
-    merge_policy = str(worker.get("merge_policy") or inferred["merge_policy"]).strip().lower()
-    if merge_policy not in VALID_MERGE_POLICIES:
-        merge_policy = inferred["merge_policy"]
-    if inferred["merge_policy"] == MERGE_POLICY_NEVER:
-        merge_policy = MERGE_POLICY_NEVER
-    elif inferred["merge_policy"] == MERGE_POLICY_MANUAL and merge_policy == MERGE_POLICY_AUTO:
-        merge_policy = MERGE_POLICY_MANUAL
-    return {"pr_open_policy": pr_open_policy, "merge_policy": merge_policy}
+    return {"pr_open_policy": pr_open_policy, "merge_policy": MERGE_POLICY_NEVER}
 
 
 def _request_forbids_pr_lifecycle(text: str) -> bool:
@@ -221,40 +205,6 @@ def _request_forbids_pr_lifecycle(text: str) -> bool:
         r"\blocal\s+verified\b.{0,160}\b(?:no|without|does\s+not)\b.{0,80}\b(?:pull\s+requests?|prs?|push|merge|remote\s+checks?)\b",
         r"\bdev\s+work\s+stops\s+at\s+(?:a\s+)?local\s+verified\s+branch\s+state\b",
         r"\bdoes\s+not\s+open\s+pull\s+requests?\b.{0,120}\bpush\b.{0,120}\bmerge\b",
-    )
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _request_forbids_merge(text: str) -> bool:
-    if not text:
-        return False
-    patterns = (
-        r"\bdo\s+not\s+merge\b",
-        r"\bdon['’]?t\s+merge\b",
-        r"\bdont\s+merge\b",
-        r"\bwithout\s+merging\b",
-        r"\bunmerged\b",
-        r"\bopen\s+(?:a\s+)?(?:pull\s+request|pr)\s+only\b",
-        r"\b(?:pull\s+request|pr)\s+only\b",
-        r"\bleave\s+(?:the\s+)?(?:pull\s+request|pr)\s+open\b",
-        r"\bkeep\s+(?:the\s+)?(?:pull\s+request|pr)\s+open\b",
-        r"\bclose\s+(?:the\s+)?(?:pull\s+request|pr)\b",
-        r"\bopen\s+(?:a\s+)?(?:pull\s+request|pr)\b.{0,80}\b(?:do\s+not|don['’]?t|dont)\s+merge\b",
-        r"\b(?:do\s+not|don['’]?t|dont)\s+land\b",
-        r"\breview[-\s]?only\b",
-    )
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _request_requires_manual_merge(text: str) -> bool:
-    if not text:
-        return False
-    patterns = (
-        r"\bmanual\s+merge\b",
-        r"\bmerge\s+manually\b",
-        r"\bdo\s+not\s+auto[-\s]?merge\b",
-        r"\bno\s+auto[-\s]?merge\b",
-        r"\bwait\s+for\s+(?:human\s+)?(?:approval|review)\s+before\s+merg",
     )
     return any(re.search(pattern, text) for pattern in patterns)
 
@@ -766,12 +716,7 @@ _TERMINAL_SUMMARY_SYNC_FIELDS = frozenset(
         "pr_error",
         "pr_status_error",
         "pr_state",
-        "pr_merge_state",
-        "pr_mergeable",
         "pr_is_draft",
-        "pr_review_decision",
-        "pr_merged_at",
-        "pr_merge_commit",
         "pr_checks_status",
         "pr_checks_total",
         "pr_checks_failed",
@@ -781,6 +726,9 @@ _TERMINAL_SUMMARY_SYNC_FIELDS = frozenset(
         "pr_ci_wait_seconds",
         "pr_ci_head_sha",
         "pr_blocker",
+        "preview_url",
+        "preview_status",
+        "preview_head_sha",
     }
 )
 
@@ -802,7 +750,7 @@ def _terminal_worker_reaction_state(worker: dict[str, Any]) -> str:
 
 
 def _terminal_worker_has_non_green_finalization(worker: dict[str, Any]) -> bool:
-    pr_success = _worker_has_successful_pr_terminal_evidence(worker)
+    pr_success = _worker_has_published_pr_terminal_evidence(worker)
     if not pr_success:
         if any(str(worker.get(key) or "").strip() for key in ("pr_blocker", "pr_error", "pr_status_error")):
             return True
@@ -829,7 +777,6 @@ def _worker_meta_allows_ready_dispatch(worker: dict[str, Any], *, counts: dict[s
         blocked_reason == "approved reviewer pr finalization failed"
         or bool(finalizer_blocker)
         or _pr_finalizer_failure_is_failed_checks(worker)
-        or _pr_finalizer_failure_is_merge_conflict(worker)
     )
 
 
@@ -3600,11 +3547,7 @@ def _board_runtime_breakdown(
     }
 
 
-def _pr_merge_evidence_present(*, state: str, merged_at: str, merge_commit: str) -> bool:
-    return state.upper() == "MERGED" or bool(merged_at or merge_commit)
-
-
-def _worker_has_successful_pr_terminal_evidence(worker: dict[str, Any]) -> bool:
+def _worker_has_published_pr_terminal_evidence(worker: dict[str, Any]) -> bool:
     context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
     amend = context.get("github_pr_amend") if isinstance(context.get("github_pr_amend"), dict) else {}
     requires_head_sha_advance = amend.get("requires_head_sha_advance") is True
@@ -3619,10 +3562,8 @@ def _worker_has_successful_pr_terminal_evidence(worker: dict[str, Any]) -> bool:
                 "PR-amend completion blocked: missing post-push upstream PR head SHA verification.",
             )
             return False
-    state = str(worker.get("pr_state") or "").strip()
-    merged_at = str(worker.get("pr_merged_at") or "").strip()
-    merge_commit = str(worker.get("pr_merge_commit") or "").strip()
-    if not _pr_merge_evidence_present(state=state, merged_at=merged_at, merge_commit=merge_commit):
+    state = str(worker.get("pr_state") or "").strip().upper()
+    if state != "OPEN" or not str(worker.get("pr_url") or "").strip():
         return False
     checks_status = str(worker.get("pr_checks_status") or "").strip().lower()
     if checks_status not in {"passed", "success"}:
@@ -3630,68 +3571,28 @@ def _worker_has_successful_pr_terminal_evidence(worker: dict[str, Any]) -> bool:
     return not [item for item in worker.get("pr_checks_failed") or [] if str(item).strip()]
 
 
-def _normalized_pr_summary_merge_state(
-    *,
-    state: str,
-    merged_at: str,
-    merge_commit: str,
-    merge_state: str,
-) -> str:
-    raw = str(merge_state or "").strip()
-    raw_upper = raw.upper()
-    if _pr_merge_evidence_present(
-        state=state,
-        merged_at=merged_at,
-        merge_commit=merge_commit,
-    ) and raw_upper in {
-        "",
-        "UNKNOWN",
-        "MERGED",
-    }:
-        return "merged"
-    return raw or "unknown"
-
-
 def _deployment_summary_status(worker: dict[str, Any], pr: dict[str, Any]) -> str:
     explicit = str(worker.get("deployment_status") or "").strip()
     explicit_lower = explicit.lower()
     if explicit and explicit_lower not in {"unknown", "not checked", "unchecked"}:
         return explicit
-    checks_status = str(pr.get("checks_status") or "").strip().lower()
-    if (
-        str(pr.get("merge_state") or "").strip().lower() == "merged"
-        and checks_status in {"passed", "success"}
-        and not str(pr.get("blocker") or pr.get("error") or pr.get("status_error") or "").strip()
-    ):
-        return "done"
+    preview_status = str(worker.get("preview_status") or "").strip()
+    if preview_status:
+        return preview_status
     return explicit or "not checked"
 
 
 def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
     checks_status = str(worker.get("pr_checks_status") or "").strip() or "not checked"
     state = str(worker.get("pr_state") or "").strip() or "unknown"
-    merged_at = str(worker.get("pr_merged_at") or "").strip()
-    merge_commit = str(worker.get("pr_merge_commit") or "").strip()
-    merge_state = str(worker.get("pr_merge_state") or "").strip()
-    merge_state = _normalized_pr_summary_merge_state(
-        state=state,
-        merged_at=merged_at,
-        merge_commit=merge_commit,
-        merge_state=merge_state,
-    )
-    pr_success = _worker_has_successful_pr_terminal_evidence(worker)
+    pr_success = _worker_has_published_pr_terminal_evidence(worker)
     return {
         "url": str(worker.get("pr_url") or "").strip(),
         "number": str(worker.get("pr_number") or "").strip(),
         "error": "" if pr_success else str(worker.get("pr_error") or "").strip(),
         "status_error": "" if pr_success else str(worker.get("pr_status_error") or "").strip(),
         "state": state,
-        "merged_at": merged_at,
-        "merge_commit": merge_commit,
-        "merge_state": merge_state,
-        "mergeable": worker.get("pr_mergeable") if worker.get("pr_mergeable") is not None else "unknown",
         "is_draft": worker.get("pr_is_draft") if worker.get("pr_is_draft") is not None else "unknown",
-        "review_decision": str(worker.get("pr_review_decision") or "").strip() or "unknown",
         "checks_status": checks_status,
         "checks_total": int(worker.get("pr_checks_total") or 0),
         "checks_failed": list(worker.get("pr_checks_failed") or []),
@@ -3761,6 +3662,11 @@ def build_board_run_summary(board: str) -> dict[str, Any]:
         },
         "pr": pr,
         "deployment_status": _deployment_summary_status(worker, pr),
+        "preview": {
+            "url": str(worker.get("preview_url") or "").strip(),
+            "status": str(worker.get("preview_status") or "").strip() or "not checked",
+            "head_sha": str(worker.get("preview_head_sha") or "").strip(),
+        },
         "verification_commands": _verification_commands(tasks, runs_by_task),
         "final_response": {
             "text": str(worker.get("final_discord_response") or ""),
@@ -3929,16 +3835,16 @@ def render_board_run_summary_text(summary: dict[str, Any]) -> str:
     verdict = review.get("final_verdict") if isinstance(review.get("final_verdict"), dict) else {}
     pr_ref = pr.get("url") or pr.get("error") or "not opened"
     checks = pr.get("checks_status") or "not checked"
-    merge = pr.get("merge_state") or "unknown"
-    merge_commit = pr.get("merge_commit") or ""
+    pr_state = pr.get("state") or "unknown"
+    preview = summary.get("preview") if isinstance(summary.get("preview"), dict) else {}
     ci_wait_state = str(pr.get("ci_wait_state") or "").strip()
     lines = [
         f"Kanban goal: {summary.get('goal_status') or 'unknown'} / {summary.get('phase') or 'unknown'}",
         f"Board: {summary.get('public_url') or summary.get('board') or 'unknown'}",
         f"Branch: {summary.get('branch') or 'unknown'}",
         f"PR: {pr_ref}",
-        f"PR merge: {merge}; checks: {checks}",
-        f"Deployment: {summary.get('deployment_status') or 'not checked'}",
+        f"PR state: {pr_state}; checks: {checks}",
+        f"Preview: {preview.get('url') or 'not available'} ({preview.get('status') or 'not checked'})",
         *([f"Outcome: {summary.get('outcome')}"] if summary.get("outcome") else []),
         f"Tasks: {_format_summary_counts(summary.get('task_counts') if isinstance(summary.get('task_counts'), dict) else {})}",
         f"Runs: total={(summary.get('run_counts') or {}).get('total', 0) if isinstance(summary.get('run_counts'), dict) else 0}; outcomes: {_format_run_outcomes(summary.get('run_counts') if isinstance(summary.get('run_counts'), dict) else {})}",
@@ -3950,8 +3856,6 @@ def render_board_run_summary_text(summary: dict[str, Any]) -> str:
         lines.append(f"CI gate: waiting ({ci_wait_state}; {wait_seconds}s elapsed)")
     if blocker:
         lines.append(f"Blocker: {blocker}")
-    if merge_commit:
-        lines.append(f"Merge commit: {merge_commit}")
     commands = summary.get("verification_commands") if isinstance(summary.get("verification_commands"), list) else []
     if commands:
         rendered = "; ".join(
@@ -3984,8 +3888,11 @@ def _terminal_summary_outcome(summary: dict[str, Any]) -> str:
     bits.append(f"Checks: {pr.get('checks_status') or 'not checked'}.")
     if pr.get("ci_wait_state"):
         bits.append(f"CI gate: waiting for {pr.get('ci_wait_state')}.")
-    deployment = summary.get("deployment_status") or "not checked"
-    bits.append(f"Deployment: {deployment}.")
+    preview = summary.get("preview") if isinstance(summary.get("preview"), dict) else {}
+    if preview.get("url"):
+        bits.append(f"Preview: {preview.get('url')} ({preview.get('status') or 'not checked'}).")
+    else:
+        bits.append("Preview: not available.")
     blocker = str(summary.get("blocked_reason") or pr.get("blocker") or "").strip()
     if blocker:
         bits.append(f"Blocker: {blocker}.")
@@ -4046,6 +3953,7 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
         "branch": str(worker.get("worker_branch") or "").strip(),
         "pr_url": str(worker.get("pr_url") or "").strip(),
         "pr_number": str(worker.get("pr_number") or "").strip(),
+        "preview_url": str(worker.get("preview_url") or "").strip(),
         "public_url": str(worker.get("public_url") or "").strip(),
         "board_summary": terminal_summary,
         "runtime_breakdown": runtime_breakdown,
@@ -4190,6 +4098,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
             "branch": summary.get("branch") or "",
             "pr_url": summary.get("pr_url") or "",
             "pr_number": summary.get("pr_number") or "",
+            "preview_url": summary.get("preview_url") or "",
             "public_url": summary.get("public_url") or "",
             "board_summary": summary.get("board_summary") if isinstance(summary.get("board_summary"), dict) else {},
             "runtime_breakdown": summary.get("runtime_breakdown") or {},
@@ -6558,19 +6467,6 @@ def _pr_finalizer_failure_is_pr_body_check_only(worker: dict[str, Any]) -> bool:
     return bool(failed_from_blocker) and all("pr body format" in item for item in failed_from_blocker)
 
 
-def _pr_finalizer_failure_is_merge_conflict(worker: dict[str, Any]) -> bool:
-    merge_state = str(worker.get("pr_merge_state") or worker.get("merge_state") or "").strip().upper()
-    mergeable = str(worker.get("pr_mergeable") or worker.get("mergeable") or "").strip().upper()
-    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip().lower()
-    return (
-        merge_state in {"DIRTY", "CONFLICTING"}
-        or mergeable == "CONFLICTING"
-        or "merge state: dirty" in blocker
-        or "merge conflict" in blocker
-        or "conflicting" in blocker
-    )
-
-
 def _strip_pr_finalizer_recovery_route_text(value: Any) -> str:
     lines: list[str] = []
     for raw_line in str(value or "").splitlines():
@@ -6611,7 +6507,7 @@ def _create_pr_finalizer_recovery_task(
             "source": "pr_finalizer_recovery",
             "confidence": 0.99,
             "rationale": (
-                "PR check/merge-conflict recovery uses mainline coding worker; "
+                "PR check recovery uses the mainline coding worker; "
                 "specialized visual routes are not inherited."
             ),
         },
@@ -6675,42 +6571,6 @@ def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: An
     )
 
 
-def _pr_finalizer_conflict_files(worker: dict[str, Any]) -> list[str]:
-    for key in ("pr_conflict_files", "conflict_files", "pr_merge_conflict_files"):
-        value = worker.get(key)
-        if isinstance(value, list):
-            files = [str(item).strip() for item in value if str(item).strip()]
-            if files:
-                return files
-    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "")
-    files: list[str] = []
-    for token in blocker.replace(",", " ").split():
-        clean = token.strip("`'\".()[]{}")
-        if "/" in clean and clean not in files:
-            files.append(clean)
-    return files
-
-
-def _create_pr_merge_conflict_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
-    conflict_files = _pr_finalizer_conflict_files(worker)
-    instructions = [
-        "The implementation review was already approved; do not restart planner or reviewer work.",
-        "Merge or rebase the current main branch into the worker branch, resolve the concrete PR merge conflicts, rerun focused verification, and push the worker branch.",
-        "Do not do PR lifecycle chores; after the branch is mergeable, let the reviewer/finalizer loop continue.",
-    ]
-    if conflict_files:
-        instructions.insert(2, "Known conflict files: " + ", ".join(conflict_files))
-    return _create_pr_finalizer_recovery_task(
-        board,
-        worker,
-        conn,
-        recovery_kind="merge-conflict",
-        title="Resolve PR merge conflicts",
-        instructions=instructions,
-        extra_payload={"conflict_files": conflict_files},
-    )
-
-
 def _reactivate_after_pr_checks_recovery(board: str, worker: dict[str, Any], blocker: str) -> None:
     worker.update(
         {
@@ -6719,27 +6579,6 @@ def _reactivate_after_pr_checks_recovery(board: str, worker: dict[str, Any], blo
             "blocked_reason": "",
             "pr_blocker": blocker,
             "pr_finalizer_recovery_state": "dev_checks_recovery",
-            "pr_finalizer_recovery_blocker": blocker,
-            "terminal_reaction_sync_pending": True,
-            "terminal_summary_sync_pending": True,
-        }
-    )
-    if not str(worker.get("pr_error") or "").strip():
-        worker["pr_error"] = blocker
-    _clear_board_run_summary(board, worker)
-    worker["terminal_reaction_sync_pending"] = True
-    worker["terminal_summary_sync_pending"] = True
-    _update_worker_meta(board, worker)
-
-
-def _reactivate_after_pr_merge_conflict_recovery(board: str, worker: dict[str, Any], blocker: str) -> None:
-    worker.update(
-        {
-            "phase": "dev",
-            "goal_status": "active",
-            "blocked_reason": "",
-            "pr_blocker": blocker,
-            "pr_finalizer_recovery_state": "dev_merge_conflict_recovery",
             "pr_finalizer_recovery_blocker": blocker,
             "terminal_reaction_sync_pending": True,
             "terminal_summary_sync_pending": True,
@@ -6806,8 +6645,8 @@ def _invalidate_stale_reviewer_evidence(
     return True
 
 
-def _leave_approved_reviewer_waiting_for_ci(board: str, worker: dict[str, Any]) -> None:
-    """Keep an approved board visible and active while its stable CI gate runs."""
+def _leave_approved_reviewer_closeout_pending(board: str, worker: dict[str, Any]) -> None:
+    """Keep an approved board active while preview or QA closeout is pending."""
     worker.update(
         {
             "phase": "reviewing",
@@ -6815,7 +6654,7 @@ def _leave_approved_reviewer_waiting_for_ci(board: str, worker: dict[str, Any]) 
             "blocked_reason": "",
             "pr_blocker": "",
             "pr_error": None,
-            "pr_finalizer_recovery_state": "waiting_for_ci",
+            "pr_finalizer_recovery_state": "closeout_pending",
             "pr_finalizer_recovery_blocker": "",
         }
     )
@@ -6823,40 +6662,16 @@ def _leave_approved_reviewer_waiting_for_ci(board: str, worker: dict[str, Any]) 
     _update_worker_meta(board, worker)
 
 
-def _pr_finalization_merged(outcome: Any) -> bool:
+def _pr_finalization_published(outcome: Any) -> bool:
     from hermes_cli.kanban_codex_worker import PRFinalizationOutcome
 
-    # Keep older deterministic test doubles and third-party callers from
-    # interpreting the new enum as an accidental failure.
-    return outcome is True or outcome == PRFinalizationOutcome.MERGED
+    return outcome is True or outcome == PRFinalizationOutcome.PUBLISHED
 
 
-def _pr_finalization_waiting_for_ci(outcome: Any) -> bool:
+def _pr_finalization_pending(outcome: Any) -> bool:
     from hermes_cli.kanban_codex_worker import PRFinalizationOutcome
 
-    return outcome == PRFinalizationOutcome.WAITING_FOR_CI
-
-
-def _pr_finalization_post_merge_pending(outcome: Any) -> bool:
-    from hermes_cli.kanban_codex_worker import PRFinalizationOutcome
-
-    return outcome == PRFinalizationOutcome.POST_MERGE_PENDING
-
-
-def _leave_approved_reviewer_post_merge_pending(board: str, worker: dict[str, Any]) -> None:
-    worker.update(
-        {
-            "phase": "reviewing",
-            "goal_status": "active",
-            "blocked_reason": "",
-            "pr_blocker": "",
-            "pr_error": None,
-            "pr_finalizer_recovery_state": "post_merge_pending",
-            "pr_finalizer_recovery_blocker": "",
-        }
-    )
-    _clear_board_run_summary(board, worker)
-    _update_worker_meta(board, worker)
+    return outcome == PRFinalizationOutcome.PENDING
 
 
 def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], conn: Any, tasks: list[Any]) -> Optional[str]:
@@ -6877,16 +6692,13 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
             worker.clear()
             worker.update(refreshed)
             return None
-    if _pr_finalization_merged(outcome):
+    if _pr_finalization_published(outcome):
         kanban_codex_worker._update_phase(board, "complete", goal_status="done")
         return "approved_reviewer_finalized"
 
-    if _pr_finalization_waiting_for_ci(outcome):
-        _leave_approved_reviewer_waiting_for_ci(board, refreshed)
-        return "approved_reviewer_waiting_for_ci"
-    if _pr_finalization_post_merge_pending(outcome):
-        _leave_approved_reviewer_post_merge_pending(board, refreshed)
-        return "approved_reviewer_post_merge_pending"
+    if _pr_finalization_pending(outcome):
+        _leave_approved_reviewer_closeout_pending(board, refreshed)
+        return "approved_reviewer_closeout_pending"
     blocker = str(refreshed.get("pr_blocker") or refreshed.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(refreshed):
         if _pr_finalizer_failure_is_pr_body_check_only(refreshed):
@@ -6895,11 +6707,6 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
         _create_pr_checks_recovery_task(board, refreshed, conn)
         _reactivate_after_pr_checks_recovery(board, refreshed, blocker)
         return "approved_reviewer_finalizer_checks_recovery_created"
-    if _pr_finalizer_failure_is_merge_conflict(refreshed):
-        _create_pr_merge_conflict_recovery_task(board, refreshed, conn)
-        _reactivate_after_pr_merge_conflict_recovery(board, refreshed, blocker)
-        return "approved_reviewer_finalizer_merge_conflict_recovery_created"
-
     _block_after_pr_finalizer_failure(board, refreshed, blocker)
     return "approved_reviewer_finalizer_blocked"
 
@@ -6929,16 +6736,6 @@ def _pr_amend_head_advance_blocker_is_retryable(worker: dict[str, Any], blocker:
     return not upstream_head or not trigger_head or upstream_head == trigger_head
 
 
-def _pr_finalizer_canonical_sync_blocker_is_retryable(worker: dict[str, Any], blocker: str) -> bool:
-    """Return whether an operator-blocked finalizer should retry after local sync failure."""
-    normalized = str(blocker or "").strip().lower()
-    if "canonical checkout" not in normalized:
-        return False
-    canonical_error = str(worker.get("canonical_sync_error") or "").strip().lower()
-    canonical_state = str(worker.get("canonical_sync_state") or "").strip().lower()
-    return canonical_state == "blocked" or bool(canonical_error and canonical_error == normalized)
-
-
 def _recover_blocked_approved_reviewer_finalizer(
     board: str,
     worker: dict[str, Any],
@@ -6953,7 +6750,7 @@ def _recover_blocked_approved_reviewer_finalizer(
     finalizer_blocked_reason = blocked_reason == "approved reviewer PR finalization failed"
     finalizer_failure_evidence = _pr_finalizer_failure_is_failed_checks(
         worker
-    ) or _pr_finalizer_failure_is_merge_conflict(worker) or _pr_finalizer_failure_is_pending_checks(worker)
+    ) or _pr_finalizer_failure_is_pending_checks(worker)
     finalizer_blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip()
     if not finalizer_blocked_reason and not finalizer_failure_evidence and not finalizer_blocker:
         return None
@@ -6964,18 +6761,13 @@ def _recover_blocked_approved_reviewer_finalizer(
     if (
         str(worker.get("pr_finalizer_recovery_state") or "") == "operator_blocked"
         and str(worker.get("pr_finalizer_recovery_blocker") or "") == finalizer_blocker
-        and not _pr_finalizer_failure_is_merge_conflict(worker)
         and not _pr_finalizer_failure_is_pending_checks(worker)
         and not _pr_amend_head_advance_blocker_is_retryable(worker, finalizer_blocker)
-        and not _pr_finalizer_canonical_sync_blocker_is_retryable(worker, finalizer_blocker)
     ):
         return None
 
-    # A blocked board may have been recovered by a previously-created dev task.
-    # Do not trust the stored PR blocker blindly: it can still say DIRTY even
-    # after the worker branch was pushed clean. Refresh/finalize first; if an
-    # opaque PR finalizer blocker remains, create visible manual recovery work
-    # instead of leaving the approved board silently inert.
+    # Refresh the authoritative publication state before treating a stored
+    # finalizer blocker as an operator-visible failure.
     from hermes_cli import kanban_codex_worker
 
     if finalizer_blocked_reason or finalizer_failure_evidence or finalizer_blocker:
@@ -6987,16 +6779,13 @@ def _recover_blocked_approved_reviewer_finalizer(
         if _completed_approved_reviewer_task(conn, tasks, worker) is None:
             if _invalidate_stale_reviewer_evidence(board, worker):
                 return None
-        if _pr_finalization_merged(outcome):
+        if _pr_finalization_published(outcome):
             _update_worker_meta(board, {"blocked_reason": "", "pr_blocker": "", "pr_error": None})
             kanban_codex_worker._update_phase(board, "complete", goal_status="done")
             return "approved_reviewer_finalized"
-        if _pr_finalization_waiting_for_ci(outcome):
-            _leave_approved_reviewer_waiting_for_ci(board, worker)
-            return "approved_reviewer_waiting_for_ci"
-        if _pr_finalization_post_merge_pending(outcome):
-            _leave_approved_reviewer_post_merge_pending(board, worker)
-            return "approved_reviewer_post_merge_pending"
+        if _pr_finalization_pending(outcome):
+            _leave_approved_reviewer_closeout_pending(board, worker)
+            return "approved_reviewer_closeout_pending"
 
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(worker):
@@ -7006,10 +6795,6 @@ def _recover_blocked_approved_reviewer_finalizer(
         _create_pr_checks_recovery_task(board, worker, conn)
         _reactivate_after_pr_checks_recovery(board, worker, blocker)
         return "approved_reviewer_finalizer_checks_recovery_created"
-    if _pr_finalizer_failure_is_merge_conflict(worker):
-        _create_pr_merge_conflict_recovery_task(board, worker, conn)
-        _reactivate_after_pr_merge_conflict_recovery(board, worker, blocker)
-        return "approved_reviewer_finalizer_merge_conflict_recovery_created"
     if finalizer_blocker:
         _block_after_pr_finalizer_failure(board, worker, blocker)
         return "approved_reviewer_finalizer_manual_blocked"
@@ -7223,21 +7008,12 @@ def reconcile_board(board: str) -> Optional[str]:
         }
         active_recovery = _active_pr_finalizer_recovery_task(tasks)
         if goal_status == "blocked" and active_recovery is not None:
-            # Legacy finalizer recovery tasks for merge conflicts/manual blockers
-            # were implementation-round shaped even though role workers cannot
-            # perform PR lifecycle work. Archive those without reactivating the
-            # board. Preserve real failing-checks recovery tasks because those
-            # can still represent code/test work; PR-body hygiene failures are
-            # deterministic finalizer work and should not keep a dev round alive.
+            # Legacy finalizer recovery tasks were implementation-round shaped
+            # even though role workers cannot perform PR lifecycle work. Archive
+            # them without reactivating the board. Preserve real failing-checks
+            # recovery tasks because those can still represent code/test work.
             if _pr_finalizer_failure_is_failed_checks(worker) and not _pr_finalizer_failure_is_pr_body_check_only(worker):
                 return None
-            if _pr_finalizer_failure_is_merge_conflict(worker):
-                _reactivate_after_pr_merge_conflict_recovery(
-                    board,
-                    worker,
-                    str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip(),
-                )
-                return "approved_reviewer_finalizer_merge_conflict_recovery_created"
             _archive_active_pr_finalizer_recovery_tasks(conn, tasks)
             tasks = kanban_db.list_tasks(conn, include_archived=False)
             active_roles = {
@@ -7249,10 +7025,6 @@ def reconcile_board(board: str) -> Optional[str]:
             if _pr_finalizer_failure_is_failed_checks(worker):
                 _block_after_pr_finalizer_failure(board, worker, blocker)
                 return "approved_reviewer_finalizer_pr_body_check_blocked"
-            if _pr_finalizer_failure_is_merge_conflict(worker):
-                _create_pr_merge_conflict_recovery_task(board, worker, conn)
-                _reactivate_after_pr_merge_conflict_recovery(board, worker, blocker)
-                return "approved_reviewer_finalizer_merge_conflict_recovery_created"
             if blocker:
                 _block_after_pr_finalizer_failure(board, worker, blocker)
                 return "approved_reviewer_finalizer_manual_blocked"

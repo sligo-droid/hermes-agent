@@ -2226,88 +2226,6 @@ def test_full_lifecycle_allows_preserved_protected_checkout_when_production_is_c
     assert stored["completion_gate"]["reason"] == "no_self_declared_delivery_gap"
 
 
-def test_full_lifecycle_requires_canonical_checkout_sync(tmp_path):
-    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
-    event = _repo_discord_event(text="Implement the feature")
-    item = ledger.accept_event(
-        event,
-        session_key=build_session_key(event.source),
-        freshness_seconds=60,
-    )
-    assert item is not None
-
-    attached = ledger.attach_closeout_workspace(
-        item["id"],
-        workspace_path="/tmp/project-worktree",
-        canonical_path="/tmp/project",
-        repository="acme/project",
-        branch="feature/test",
-        mode="enforce",
-        policy={
-            "post_merge_requirements": {
-                "canonical_sync": False,
-                "deployment": False,
-            }
-        },
-    )
-    assert attached is not None
-    assert attached["policy"]["post_merge_requirements"]["canonical_sync"] is True
-
-    ledger.mark_agent_done(
-        item["id"],
-        final_response=(
-            "Done. PR checks, main CI, and Vercel deployment passed. "
-            "The PR was squash-merged. Canonical checkout sync was intentionally "
-            "blocked: it is protected, 50 commits behind, and contains a pre-existing "
-            "deletion. I preserved that work rather than bypassing the guard."
-        ),
-        summary_status="Complete",
-    )
-
-    stored = ledger.get(item["id"])
-    assert stored["summary_status"] == "Blocked"
-    assert stored["completion_gate"]["allowed_to_complete"] is False
-    assert stored["completion_gate"]["reason"] == "self_declared_delivery_incomplete"
-    assert stored["completion_gate"]["matched_markers"] == ["runtime_not_synced"]
-
-
-def test_exact_trusted_canonical_sync_clears_only_canonical_checkout_gap(tmp_path):
-    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
-    event = _repo_discord_event(text="Implement and ship the feature")
-    item = ledger.accept_event(
-        event,
-        session_key=build_session_key(event.source),
-        freshness_seconds=60,
-    )
-    assert item is not None
-    attached = ledger.attach_closeout_workspace(
-        item["id"],
-        workspace_path="/tmp/project-worktree",
-        canonical_path="/tmp/project",
-        repository="acme/project",
-        branch="feature/test",
-        mode="enforce",
-    )
-    assert attached is not None
-    terminal_item = ledger.get(item["id"])
-    terminal_item["closeout"] = _exact_synced_closeout(attached)
-    terminal_item["closeout_authoritative"] = True
-
-    canonical_gate = classify_delivery_completion(
-        terminal_item,
-        "PR merged, but the canonical checkout was not synced when I finished.",
-    )
-    private_runtime_gate = classify_delivery_completion(
-        terminal_item,
-        "PR merged, but the private runtime is not synced yet.",
-    )
-
-    assert canonical_gate["allowed_to_complete"] is True
-    assert canonical_gate["reason"] == "no_self_declared_delivery_gap"
-    assert private_runtime_gate["allowed_to_complete"] is False
-    assert private_runtime_gate["matched_markers"] == ["runtime_not_synced"]
-
-
 def test_pr_only_closeout_may_leave_canonical_sync_optional(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Open a PR only; do not merge it")
@@ -2330,6 +2248,275 @@ def test_pr_only_closeout_may_leave_canonical_sync_optional(tmp_path):
 
     assert attached is not None
     assert attached["policy"]["post_merge_requirements"]["canonical_sync"] is False
+
+
+def test_preview_delivery_is_exact_head_durable_and_idempotent(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _repo_discord_event(message_id="preview-ready")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+        policy={"require_preview": True},
+    )
+    head_sha = "a" * 40
+    state = deepcopy(attached)
+    state["pr"].update(
+        {
+            "url": "https://github.com/acme/project/pull/7",
+            "state": "OPEN",
+            "head_sha": head_sha,
+        }
+    )
+    state["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": head_sha,
+        "url": "https://feature-test.vercel.app",
+        "deployment_id": "42",
+    }
+
+    updated = ledger.update_closeout(
+        item["id"],
+        state,
+        expected_revision=attached["revision"],
+    )
+    assert updated is not None
+    delivery = ledger.get(item["id"])["preview_delivery"]
+    assert delivery["status"] == "pending"
+    assert delivery["head_sha"] == head_sha
+
+    claimed = ledger.claim_preview_delivery(item["id"], owner="sender-1")
+    assert claimed["preview_delivery"]["status"] == "delivering"
+    assert ledger.begin_preview_send_attempt(item["id"], owner="sender-1") is True
+    assert ledger.complete_preview_delivery(
+        item["id"],
+        owner="sender-1",
+        result_message_id="message-7",
+    ) is True
+    completed = ledger.get(item["id"])["preview_delivery"]
+    assert completed["status"] == "completed"
+    assert completed["result_message_id"] == "message-7"
+    assert ledger.claim_preview_delivery(item["id"], owner="sender-2") is None
+
+
+def test_preview_delivery_retries_safe_failures_and_fences_uncertain_sends(tmp_path):
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now[0])
+    event = _repo_discord_event(message_id="preview-retry")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+        policy={"require_preview": True},
+    )
+    head_sha = "b" * 40
+    state = deepcopy(attached)
+    state["pr"].update(
+        {
+            "url": "https://github.com/acme/project/pull/8",
+            "state": "OPEN",
+            "head_sha": head_sha,
+        }
+    )
+    state["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": head_sha,
+        "url": "https://feature-retry.vercel.app",
+    }
+    assert ledger.update_closeout(
+        item["id"],
+        state,
+        expected_revision=attached["revision"],
+    ) is not None
+
+    assert ledger.claim_preview_delivery(item["id"], owner="sender-1") is not None
+    assert ledger.fail_preview_delivery(
+        item["id"], owner="sender-1", uncertain=False
+    ) is True
+    assert ledger.get(item["id"])["preview_delivery"]["status"] == "pending"
+    assert ledger.claim_preview_delivery(item["id"], owner="sender-early") is None
+
+    now[0] = 102.0
+    assert ledger.claim_preview_delivery(item["id"], owner="sender-2") is not None
+    assert ledger.begin_preview_send_attempt(item["id"], owner="sender-2") is True
+    assert ledger.fail_preview_delivery(
+        item["id"], owner="sender-2", uncertain=True
+    ) is True
+    assert ledger.get(item["id"])["preview_delivery"]["status"] == "uncertain"
+    assert ledger.claim_preview_delivery(item["id"], owner="sender-3") is None
+
+
+def test_preview_retry_backoff_does_not_starve_newer_threads(tmp_path):
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now[0])
+    work_ids = []
+    for index, head_char in enumerate(("a", "b", "c"), start=1):
+        event = _repo_discord_event(message_id=f"preview-fair-{index}")
+        item = ledger.accept_event(
+            event,
+            session_key=build_session_key(event.source),
+            freshness_seconds=60,
+        )
+        attached = ledger.attach_closeout_workspace(
+            item["id"],
+            workspace_path="/tmp/project-worktree",
+            repository="acme/project",
+            branch=f"feature/test-{index}",
+            mode="enforce",
+            policy={"require_preview": True},
+        )
+        head_sha = head_char * 40
+        state = deepcopy(attached)
+        state["pr"].update(
+            {
+                "url": f"https://github.com/acme/project/pull/{index}",
+                "state": "OPEN",
+                "head_sha": head_sha,
+            }
+        )
+        state["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": f"https://feature-{index}.vercel.app",
+        }
+        assert ledger.update_closeout(
+            item["id"],
+            state,
+            expected_revision=attached["revision"],
+        ) is not None
+        work_ids.append(item["id"])
+
+    for index, work_id in enumerate(work_ids[:2], start=1):
+        owner = f"failing-{index}"
+        assert ledger.claim_preview_delivery(work_id, owner=owner) is not None
+        assert ledger.fail_preview_delivery(work_id, owner=owner, uncertain=False) is True
+
+    pending = ledger.pending_preview_deliveries(limit=2)
+    assert [item["id"] for item in pending] == [work_ids[2]]
+    for work_id in work_ids[:2]:
+        assert ledger.get(work_id)["preview_delivery"]["next_attempt_at"] == 102.0
+
+
+def test_head_advance_cancels_unclaimed_old_preview_delivery(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _repo_discord_event(message_id="preview-head-advance")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+        policy={"require_preview": True},
+    )
+    old_head = "c" * 40
+    ready = deepcopy(attached)
+    ready["pr"].update(
+        {
+            "url": "https://github.com/acme/project/pull/9",
+            "state": "OPEN",
+            "head_sha": old_head,
+        }
+    )
+    ready["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": old_head,
+        "url": "https://feature-old.vercel.app",
+    }
+    persisted = ledger.update_closeout(
+        item["id"],
+        ready,
+        expected_revision=attached["revision"],
+    )
+    assert persisted is not None
+    assert ledger.get(item["id"])["preview_delivery"]["status"] == "pending"
+
+    new_head = "d" * 40
+    advanced = deepcopy(persisted)
+    advanced["pr"]["head_sha"] = new_head
+    advanced["preview"] = {
+        "provider": "vercel",
+        "status": "pending",
+        "observed_sha": new_head,
+        "url": "",
+    }
+    assert ledger.update_closeout(
+        item["id"],
+        advanced,
+        expected_revision=persisted["revision"],
+    ) is not None
+
+    delivery = ledger.get(item["id"])["preview_delivery"]
+    assert delivery["status"] == "cancelled"
+    assert delivery["cancelled_reason"] == "pr_head_advanced"
+    assert ledger.claim_preview_delivery(item["id"], owner="sender-old") is None
+
+
+def test_terminal_closeout_keeps_pending_preview_discoverable(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _repo_discord_event(message_id="preview-terminal-retry")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+        policy={"require_preview": True},
+    )
+    head_sha = "e" * 40
+    terminal = deepcopy(attached)
+    terminal["status"] = "pr_published"
+    terminal["next_due_at"] = None
+    terminal["pr"].update(
+        {
+            "url": "https://github.com/acme/project/pull/10",
+            "state": "OPEN",
+            "head_sha": head_sha,
+        }
+    )
+    terminal["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": head_sha,
+        "url": "https://feature-terminal.vercel.app",
+    }
+    assert ledger.update_closeout(
+        item["id"],
+        terminal,
+        expected_revision=attached["revision"],
+    ) is not None
+
+    assert ledger.pending_closeouts(due_at=100.0) == []
+    pending = ledger.pending_preview_deliveries()
+    assert [row["id"] for row in pending] == [item["id"]]
+    assert pending[0]["preview_delivery"]["status"] == "pending"
 
 
 def test_optional_canonical_sync_does_not_hide_private_runtime_lag(tmp_path):
@@ -3965,6 +4152,7 @@ def test_verified_h2_publication_invalidates_h_gates_and_active_lease(
     assert published["ci"]["status"] == "not_checked"
     assert published["pr"]["merge_sha"] == ""
     assert published["pr"]["ready_at"] is None
+    assert published["pr"]["pending_push_head_sha"] == head_sha_2
     assert published["post_merge"]["target_sha"] == ""
     assert published["mutation_uncertainty"] == {}
     assert ledger.publish_closeout_verified_head(
@@ -4562,166 +4750,6 @@ def test_successful_closeout_finalization_is_one_atomic_cas(tmp_path):
     assert stored["final_response"] == "Trusted closeout completed."
     assert stored["closeout"]["status"] == "completed"
     assert stored["closeout"]["lease"] == {"owner": "", "until": None}
-
-
-@pytest.mark.asyncio
-async def test_exact_sync_reopens_stale_blocked_delivery_tail_without_resend(tmp_path):
-    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
-    event = _repo_discord_event(
-        message_id="trusted-sync-stale-gate",
-        text="Implement and ship the feature",
-    )
-    event.feature_summary = {"message_id": "summary-1"}
-    item = ledger.accept_event(
-        event,
-        session_key=build_session_key(event.source),
-        freshness_seconds=3600,
-    )
-    attached = ledger.attach_closeout_workspace(
-        item["id"],
-        workspace_path="/mutable/worktree",
-        canonical_path="/canonical/project",
-        repository="acme/project",
-        branch="feature/test",
-        mode="enforce",
-    )
-    activated = ledger.activate_closeout(
-        item["id"],
-        attached,
-        expected_revision=attached["revision"],
-    )
-    assert activated is not None
-    assert ledger.mark_agent_done(
-        item["id"],
-        final_response=(
-            "PR merged, but the canonical checkout was not synced when I finished."
-        ),
-    )
-    assert ledger.mark_response_delivered(item["id"], result_message_id="result-1")
-    assert ledger.mark_summary_updated(item["id"])
-    assert ledger.mark_blocked(item["id"], reason="self_declared_delivery_incomplete")
-    stale = ledger.get(item["id"])
-    assert stale["completion_gate"]["allowed_to_complete"] is False
-
-    leased = ledger.lease_closeout(
-        item["id"],
-        owner="watcher-1",
-        lease_seconds=30,
-        expected_revision=stale["closeout"]["revision"],
-    )
-    assert leased is not None
-    completed_state = _exact_synced_closeout(leased["closeout"])
-    reopened = ledger.finalize_successful_closeout(
-        item["id"],
-        owner="watcher-1",
-        expected_revision=leased["closeout"]["revision"],
-        expected_generation=leased["closeout"]["lease_generation"],
-        closeout_state=completed_state,
-        final_response="Trusted closeout completed.",
-        expected_run_state=ledger.run_state_snapshot(leased),
-    )
-
-    assert reopened is not None
-    assert reopened["status"] == "response_delivered"
-    assert reopened["summary_status"] == "Complete"
-    assert reopened["completion_gate"]["allowed_to_complete"] is True
-    assert "blocked_at" not in reopened
-    assert "summary_updated_at" not in reopened
-
-    runner = object.__new__(GatewayRunner)
-    runner.work_ledger = ledger
-    adapter = SimpleNamespace(_send_with_retry=AsyncMock())
-    runner.adapters = {Platform.DISCORD: adapter}
-    runner._update_discord_summaries = AsyncMock(return_value=True)
-
-    await runner._resume_finished_discord_work_item(reopened)
-
-    adapter._send_with_retry.assert_not_awaited()
-    runner._update_discord_summaries.assert_awaited_once()
-    assert runner._update_discord_summaries.await_args.kwargs["status"] == "Complete"
-    stored = ledger.get(item["id"])
-    assert stored["status"] == "completed"
-    assert stored["completion_gate"]["allowed_to_complete"] is True
-
-
-@pytest.mark.asyncio
-async def test_startup_repairs_persisted_successful_closeout_gate(tmp_path):
-    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
-    event = _repo_discord_event(
-        message_id="persisted-trusted-sync-stale-gate",
-        text="Implement and ship the feature",
-    )
-    event.feature_summary = {"message_id": "summary-1"}
-    item = ledger.accept_event(
-        event,
-        session_key=build_session_key(event.source),
-        freshness_seconds=3600,
-    )
-    attached = ledger.attach_closeout_workspace(
-        item["id"],
-        workspace_path="/mutable/worktree",
-        canonical_path="/canonical/project",
-        repository="acme/project",
-        branch="feature/test",
-        mode="enforce",
-    )
-    activated = ledger.activate_closeout(
-        item["id"],
-        attached,
-        expected_revision=attached["revision"],
-    )
-    assert activated is not None
-    assert ledger.mark_agent_done(
-        item["id"],
-        final_response=(
-            "PR merged, but the canonical checkout was not synced when I finished."
-        ),
-    )
-    assert ledger.mark_response_delivered(item["id"], result_message_id="result-1")
-    assert ledger.mark_summary_updated(item["id"])
-    assert ledger.mark_blocked(item["id"], reason="self_declared_delivery_incomplete")
-    stale = ledger.get(item["id"])
-    leased = ledger.lease_closeout(
-        item["id"],
-        owner="watcher-1",
-        lease_seconds=30,
-        expected_revision=stale["closeout"]["revision"],
-    )
-    persisted = ledger.release_closeout(
-        item["id"],
-        owner="watcher-1",
-        expected_revision=leased["closeout"]["revision"],
-        expected_generation=leased["closeout"]["lease_generation"],
-        closeout_state=_exact_synced_closeout(leased["closeout"]),
-        expected_run_state=ledger.run_state_snapshot(leased),
-    )
-    assert persisted is not None
-    persisted_item = ledger.get(item["id"])
-    assert persisted_item["status"] == "blocked"
-    assert persisted_item["closeout"]["status"] == "post_merge_complete"
-
-    runner = object.__new__(GatewayRunner)
-    runner.work_ledger = ledger
-    runner._background_tasks = set()
-    adapter = SimpleNamespace(
-        _send_with_retry=AsyncMock(),
-        handle_message=AsyncMock(),
-    )
-    runner.adapters = {Platform.DISCORD: adapter}
-    runner._update_discord_summaries = AsyncMock(return_value=True)
-
-    assert runner._schedule_incomplete_discord_work_items() == 1
-    tasks = list(runner._background_tasks)
-    assert tasks
-    await asyncio.gather(*tasks)
-
-    adapter._send_with_retry.assert_not_awaited()
-    adapter.handle_message.assert_not_awaited()
-    runner._update_discord_summaries.assert_awaited_once()
-    stored = ledger.get(item["id"])
-    assert stored["status"] == "completed"
-    assert stored["summary_status"] == "Complete"
-    assert stored["completion_gate"]["allowed_to_complete"] is True
 
 
 def test_blocked_closeout_run_state_cas_preserves_new_live_run_and_closeout(tmp_path):

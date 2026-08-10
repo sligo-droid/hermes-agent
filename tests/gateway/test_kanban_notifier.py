@@ -1357,13 +1357,13 @@ def test_discord_terminal_status_target_syncs_only_when_pending(tmp_path, monkey
     assert dwb.thread_status_targets() == []
 
 
-def test_discord_terminal_pr_refresh_requeues_summary_sync(tmp_path, monkeypatch):
+def test_discord_terminal_preview_refresh_requeues_summary_sync(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
     board = dwb.set_goal(
         thread_id="99023",
-        goal="Refresh merged PR status",
+        goal="Refresh published PR preview status",
         chat_id="parent-99023",
     )
     conn = kb.connect(board=board.slug)
@@ -1396,10 +1396,9 @@ def test_discord_terminal_pr_refresh_requeues_summary_sync(tmp_path, monkeypatch
         board.slug,
         {
             "pr_checks_status": "passed",
-            "pr_merge_state": "MERGED",
-            "pr_state": "merged",
-            "pr_merged_at": "2026-06-01T17:35:13Z",
-            "pr_merge_commit": "abc123",
+            "pr_state": "OPEN",
+            "preview_url": "https://hermes-pr-185.vercel.app",
+            "preview_status": "ready",
         },
     )
 
@@ -1412,9 +1411,9 @@ def test_discord_terminal_pr_refresh_requeues_summary_sync(tmp_path, monkeypatch
     worker = kb.read_board_metadata(board.slug)["discord_worker"]
     assert worker["terminal_summary_sync_pending"] is True
     assert worker["board_summary"]["pr"]["checks_status"] == "passed"
-    assert worker["board_summary"]["pr"]["merge_state"] == "merged"
-    assert worker["board_summary"]["pr"]["merge_commit"] == "abc123"
-    assert worker["board_summary"]["deployment_status"] == "done"
+    assert worker["board_summary"]["pr"]["state"] == "OPEN"
+    assert worker["board_summary"]["preview"]["url"] == "https://hermes-pr-185.vercel.app"
+    assert worker["board_summary"]["deployment_status"] == "ready"
 
 
 def test_discord_stale_completion_notice_flag_keeps_terminal_target_until_cleared(tmp_path, monkeypatch):

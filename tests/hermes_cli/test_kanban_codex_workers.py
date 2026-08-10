@@ -257,378 +257,6 @@ def _claimed_planner(monkeypatch, tmp_path: Path):
     return board, claimed
 
 
-def test_check_rollup_summary_uses_latest_duplicate_check_run():
-    from hermes_cli import kanban_codex_worker as worker
-
-    status, total, failed = worker._check_rollup_summary(
-        [
-            {
-                "name": "basic",
-                "workflowName": "Basic Tests",
-                "status": "COMPLETED",
-                "conclusion": "CANCELLED",
-                "startedAt": "2026-06-09T15:00:00Z",
-            },
-            {
-                "name": "supply-chain",
-                "workflowName": "Supply Chain Audit",
-                "status": "COMPLETED",
-                "conclusion": "SUCCESS",
-                "startedAt": "2026-06-09T15:01:00Z",
-            },
-            {
-                "name": "basic",
-                "workflowName": "Basic Tests",
-                "status": "COMPLETED",
-                "conclusion": "SUCCESS",
-                "startedAt": "2026-06-09T15:02:00Z",
-            },
-        ]
-    )
-
-    assert status == "passed"
-    assert total == 2
-    assert failed == []
-
-
-def test_required_check_rollup_uses_current_head_skipped_and_latest_rerun():
-    from hermes_cli import kanban_codex_worker as worker
-
-    def trusted(workflow, name, *, conclusion, started_at):
-        _run_id, path = _REQUIRED_CHECK_RUNS[(workflow, name)]
-        return {
-            "name": name,
-            "workflowName": workflow,
-            "status": "COMPLETED",
-            "conclusion": conclusion,
-            "headSha": _TRUSTED_PR_HEAD,
-            "startedAt": started_at,
-            "app": {"slug": "github-actions", "name": "GitHub Actions"},
-            "workflow": {"path": path},
-        }
-
-    status, total, failed, wait_state = worker._required_check_rollup_summary(
-        [
-            trusted(
-                "Basic Tests",
-                "basic",
-                conclusion="CANCELLED",
-                started_at="2026-06-09T15:00:00Z",
-            ),
-            trusted(
-                "Basic Tests",
-                "basic",
-                conclusion="SUCCESS",
-                started_at="2026-06-09T15:02:00Z",
-            ),
-            trusted(
-                "PR Body Format",
-                "pr body",
-                conclusion="SKIPPED",
-                started_at="2026-06-09T15:03:00Z",
-            ),
-            {
-                "name": "unrelated",
-                "workflowName": "Other Workflow",
-                "status": "COMPLETED",
-                "conclusion": "FAILURE",
-                "headSha": _TRUSTED_PR_HEAD,
-            },
-        ],
-        head_sha=_TRUSTED_PR_HEAD,
-    )
-
-    assert (status, total, failed, wait_state) == ("passed", 2, [], "")
-
-
-def test_refresh_pr_status_enriches_raw_checks_and_rejects_spoof_before_canonical(
-    monkeypatch,
-    tmp_path,
-):
-    from hermes_cli import kanban_codex_worker as worker
-
-    repo = "sligo-labs/PID"
-    spoof_url = f"https://github.com/{repo}/actions/runs/303/job/3031"
-    basic_url = _required_check_details_url(repo, "Basic Tests", "basic")
-    basic_rerun_url = basic_url.rsplit("/", 1)[0] + "/1012"
-    pr_body_url = _required_check_details_url(repo, "PR Body Format", "pr body")
-    checks = [
-        {
-            "name": "basic",
-            "workflowName": "Basic Tests",
-            "status": "COMPLETED",
-            "conclusion": "SUCCESS",
-            "startedAt": "2026-06-09T15:05:00Z",
-            "detailsUrl": spoof_url,
-        },
-        {
-            "name": "basic",
-            "workflowName": "Basic Tests",
-            "status": "COMPLETED",
-            "conclusion": "SUCCESS",
-            "startedAt": "2026-06-09T15:00:00Z",
-            "detailsUrl": basic_url,
-        },
-        {
-            "name": "basic",
-            "workflowName": "Basic Tests",
-            "status": "COMPLETED",
-            "conclusion": "FAILURE",
-            "startedAt": "2026-06-09T15:02:00Z",
-            "detailsUrl": basic_rerun_url,
-        },
-        {
-            "name": "pr body",
-            "workflowName": "PR Body Format",
-            "status": "COMPLETED",
-            "conclusion": "SUCCESS",
-            "startedAt": "2026-06-09T15:03:00Z",
-            "detailsUrl": pr_body_url,
-        },
-    ]
-
-    def fake_gh(args, **_kwargs):
-        if args[:2] == ["pr", "view"]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=_pr_view_json(
-                    number=456,
-                    state="OPEN",
-                    checks=checks,
-                ),
-                stderr="",
-            )
-        if args[:1] == ["api"] and "/check-runs?" in args[1]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps(
-                    {
-                        "check_runs": [
-                            {
-                                "id": index,
-                                "name": item["name"],
-                                "head_sha": _TRUSTED_PR_HEAD,
-                                "status": item["status"],
-                                "conclusion": item["conclusion"],
-                                "completed_at": item["startedAt"],
-                                "details_url": item["detailsUrl"],
-                                "app": {"slug": "github-actions"},
-                            }
-                            for index, item in enumerate(checks, start=1)
-                        ]
-                    }
-                ),
-                stderr="",
-            )
-        if args[:1] == ["api"] and "/actions/runs/" in args[1]:
-            run_id = args[1].rsplit("/", 1)[-1]
-            paths = {
-                "101": ".github/workflows/tests.yml",
-                "202": ".github/workflows/pr-body-format.yml",
-                "303": ".github/workflows/spoof-tests.yml",
-            }
-            return SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps(
-                    {"path": paths[run_id], "head_sha": _TRUSTED_PR_HEAD}
-                ),
-                stderr="",
-            )
-        raise AssertionError(args)
-
-    monkeypatch.setattr(worker, "_run_gh", fake_gh)
-    state = {"pr_url": f"https://github.com/{repo}/pull/456"}
-
-    worker._refresh_pr_status(state, root=tmp_path, repo=repo)
-
-    assert state["pr_checks_status"] == "failed"
-    assert state["pr_checks_total"] == 2
-    assert state["pr_checks_failed"] == ["Basic Tests / basic"]
-
-
-@pytest.mark.parametrize("ordering", ["original", "reversed", "rotated"])
-def test_ensure_pr_merge_blocks_newest_failed_rerun_after_many_spoofs(
-    monkeypatch,
-    tmp_path,
-    ordering,
-):
-    from hermes_cli import kanban_codex_worker as worker
-
-    repo = "sligo-labs/PID"
-
-    def details(run_id, job_id):
-        return f"https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}"
-
-    raw_checks = []
-    check_runs = []
-    for offset in range(9):
-        run_id = str(100 + offset)
-        url = details(run_id, f"{run_id}1")
-        raw_checks.append(
-            {"workflowName": "Basic Tests", "name": "basic", "detailsUrl": url}
-        )
-        check_runs.append(
-            {
-                "id": 100 + offset,
-                "name": "basic",
-                "head_sha": _TRUSTED_PR_HEAD,
-                "status": "COMPLETED",
-                "conclusion": "SUCCESS",
-                "created_at": f"2026-07-17T00:00:{offset:02d}Z",
-                "started_at": f"2026-07-17T00:01:{offset:02d}Z",
-                "completed_at": f"2026-07-19T00:00:{offset:02d}Z",
-                "details_url": url,
-                "app": {"slug": "github-actions"},
-            }
-        )
-    for check_id, conclusion, created_at, completed_at in (
-        (9001, "SUCCESS", "2026-07-18T00:04:00Z", "2026-07-18T00:05:00Z"),
-        (9002, "FAILURE", "2026-07-18T00:09:00Z", "2026-07-18T00:10:00Z"),
-    ):
-        url = details("900", str(check_id))
-        raw_checks.append(
-            {"workflowName": "Basic Tests", "name": "basic", "detailsUrl": url}
-        )
-        check_runs.append(
-            {
-                "id": check_id,
-                "name": "basic",
-                "head_sha": _TRUSTED_PR_HEAD,
-                "status": "COMPLETED",
-                "conclusion": conclusion,
-                "created_at": created_at,
-                "started_at": created_at,
-                "completed_at": completed_at,
-                "details_url": url,
-                "app": {"slug": "github-actions"},
-            }
-        )
-    pr_body_url = details("901", "9011")
-    raw_checks.append(
-        {
-            "workflowName": "PR Body Format",
-            "name": "pr body",
-            "detailsUrl": pr_body_url,
-        }
-    )
-    check_runs.append(
-        {
-            "id": 9011,
-            "name": "pr body",
-            "head_sha": _TRUSTED_PR_HEAD,
-            "status": "COMPLETED",
-            "conclusion": "SUCCESS",
-            "created_at": "2026-07-18T00:08:00Z",
-            "started_at": "2026-07-18T00:08:00Z",
-            "completed_at": "2026-07-18T00:09:00Z",
-            "details_url": pr_body_url,
-            "app": {"slug": "github-actions"},
-        }
-    )
-    if ordering == "reversed":
-        raw_checks.reverse()
-        check_runs.reverse()
-    elif ordering == "rotated":
-        raw_checks[:] = raw_checks[4:] + raw_checks[:4]
-        check_runs[:] = check_runs[6:] + check_runs[:6]
-    calls = []
-    queried_runs = []
-
-    def fake_gh(args, **_kwargs):
-        calls.append(args)
-        if args[:2] == ["pr", "view"]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=_pr_view_json(
-                    number=457,
-                    state="OPEN",
-                    checks=raw_checks,
-                ),
-                stderr="",
-            )
-        if args[:1] == ["api"] and "/check-runs?" in args[1]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps({"check_runs": check_runs}),
-                stderr="",
-            )
-        if args[:1] == ["api"] and "/actions/runs/" in args[1]:
-            run_id = args[1].rsplit("/", 1)[-1]
-            queried_runs.append(run_id)
-            path = {
-                "900": ".github/workflows/tests.yml",
-                "901": ".github/workflows/pr-body-format.yml",
-            }.get(run_id, f".github/workflows/spoof-{run_id}.yml")
-            return SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps({"path": path, "head_sha": _TRUSTED_PR_HEAD}),
-                stderr="",
-            )
-        if args[:2] == ["pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        raise AssertionError(args)
-
-    monkeypatch.setattr(worker, "_run_gh", fake_gh)
-    state = {
-        "pr_url": f"https://github.com/{repo}/pull/457",
-        "review_approved_head": _TRUSTED_PR_HEAD,
-    }
-
-    outcome = worker._ensure_pr_merged(state, root=tmp_path, repo=repo)
-
-    assert outcome == worker.PRFinalizationOutcome.FAILED
-    assert state["pr_checks_status"] == "failed"
-    assert state["pr_checks_failed"] == ["Basic Tests / basic"]
-    assert queried_runs == ["900", "901"]
-    assert not any(args[:2] == ["pr", "merge"] for args in calls)
-
-
-def test_required_check_identity_api_failure_is_bounded_blocker(monkeypatch, tmp_path):
-    from hermes_cli import kanban_codex_worker as worker
-
-    repo = "sligo-labs/PID"
-    calls = []
-
-    def fake_gh(args, **_kwargs):
-        calls.append(args)
-        if args[:2] == ["pr", "view"]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=_pr_view_json(number=458, state="OPEN"),
-                stderr="",
-            )
-        if args[:1] == ["api"] and "/check-runs?" in args[1]:
-            return SimpleNamespace(
-                returncode=403,
-                stdout="",
-                stderr=(
-                    "token=supersecret rate limited at "
-                    "https://api.github.com/protected "
-                    + ("x" * 1000)
-                ),
-            )
-        if args[:2] == ["pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        raise AssertionError(args)
-
-    monkeypatch.setattr(worker, "_run_gh", fake_gh)
-    state = {
-        "pr_url": f"https://github.com/{repo}/pull/458",
-        "review_approved_head": _TRUSTED_PR_HEAD,
-    }
-
-    outcome = worker._ensure_pr_merged(state, root=tmp_path, repo=repo)
-
-    assert outcome == worker.PRFinalizationOutcome.FAILED
-    assert state["pr_status_error"].startswith("Required check identity lookup failed")
-    assert state["pr_blocker"] == state["pr_status_error"]
-    assert len(state["pr_status_error"]) <= 600
-    assert "supersecret" not in state["pr_status_error"]
-    assert "api.github.com" not in state["pr_status_error"]
-    assert not state.get("pr_ci_wait_state")
-    assert not any(args[:2] == ["pr", "merge"] for args in calls)
-
-
 def test_legacy_kanban_fields_normalize_and_dual_write_shared_closeout(tmp_path):
     from hermes_cli import kanban_codex_worker as worker
 
@@ -676,24 +304,26 @@ def test_legacy_kanban_fields_normalize_and_dual_write_shared_closeout(tmp_path)
     assert state["pr"]["merge_sha"] == merge_sha
     assert state["ci"]["status"] == "passed"
     assert state["policy"]["early_draft_pr"] is True
-    assert state["policy"]["post_merge_requirements"]["ci"] is True
+    assert state["policy"]["post_merge_requirements"]["ci"] is False
+    assert state["policy"]["merge"] == "never"
     assert state["policy"]["require_visual_qa"] is False
     assert state["visual_qa"] == {"status": "not_required"}
     assert state["review"] == {"status": "approved", "head_sha": head}
     assert state["telemetry"]["green_unmerged_since"] == 90
     assert state["telemetry"]["green_unmerged_overdue"] is True
 
-    state["status"] = "post_merge_pending"
+    state["status"] = "pr_published"
     state["next_due_at"] = 123
+    state["pr"]["merge_sha"] = "c" * 40
     state["telemetry"]["green_unmerged_since"] = 100
     state["telemetry"]["green_unmerged_overdue"] = True
     worker._dual_write_closeout_to_worker(flattened, state)
 
-    assert flattened["closeout"]["status"] == "post_merge_pending"
+    assert flattened["closeout"]["status"] == "pr_published"
     assert flattened["pr_ci_head_sha"] == head
     assert flattened["pr_merge_commit"] == merge_sha
     assert flattened["pr_ci_next_poll_at"] == 123
-    assert flattened["green_unmerged_since"] == 100
+    assert flattened["green_unmerged_since"] == 90
     assert flattened["green_unmerged_overdue"] is True
 
 
@@ -813,7 +443,7 @@ def test_shadow_kanban_closeout_cannot_take_ownership_from_legacy_finalizer(
     outcome = worker._ensure_pr("board-1", str(workspace))
 
     assert observations == ["repair_required"]
-    assert outcome == worker.PRFinalizationOutcome.MERGED
+    assert outcome == worker.PRFinalizationOutcome.PUBLISHED
     assert stored["pr_state"] == "not_needed"
     assert stored["pr_blocker"] == ""
 
@@ -5634,7 +5264,7 @@ def test_update_phase_refreshes_worker_updated_at(monkeypatch, tmp_path):
     assert meta["terminal_completion_message_pending"] is True
 
 
-def test_pr_policy_defaults_auto_but_explicit_do_not_merge_sets_never(monkeypatch, tmp_path):
+def test_pr_policy_always_uses_pr_only_lifecycle(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
@@ -5648,7 +5278,7 @@ def test_pr_policy_defaults_auto_but_explicit_do_not_merge_sets_never(monkeypatc
     auto_meta = kanban_db.read_board_metadata(auto_board.slug)["discord_worker"]
     never_meta = kanban_db.read_board_metadata(never_board.slug)["discord_worker"]
     assert auto_meta["pr_open_policy"] == "after_review_approval"
-    assert auto_meta["merge_policy"] == "auto"
+    assert auto_meta["merge_policy"] == "never"
     assert never_meta["pr_open_policy"] == "after_review_approval"
     assert never_meta["merge_policy"] == "never"
 
@@ -5708,7 +5338,7 @@ def test_ensure_pr_honors_local_only_criteria_over_stale_pr_metadata(monkeypatch
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_open_policy"] == "never"
@@ -5757,14 +5387,14 @@ def test_ensure_pr_never_policy_opens_without_merging(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert ["git", "push", "-u", "origin", "discord/open-only-pr"] in calls
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
     assert meta["merge_policy"] == "never"
     assert meta["pr_state"] == "OPEN"
-    assert meta["pr_checks_status"] == "pending"
+    assert meta["pr_checks_status"] == "not required"
     assert meta["pr_merge_skipped"] is True
     assert meta["pr_merge_skipped_reason"] == "never"
     assert meta["pr_blocker"] == ""
@@ -6006,8 +5636,6 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
     dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
     _bind_reviewer_head(dwb, board.slug)
     calls = []
-    view_states = ["OPEN", "MERGED"]
-
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
         if cmd[:3] == ["gh", "pr", "list"]:
@@ -6015,18 +5643,12 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/123\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
-            state = view_states.pop(0)
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state=state), stderr="")
-        if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        sync_result = _canonical_sync_result(cmd)
-        if sync_result is not None:
-            return sync_result
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state="OPEN"), stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     pr_list = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "list"])
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
@@ -6036,148 +5658,12 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
     assert pr_create[pr_create.index("--base") + 1] == "develop"
     assert pr_create[pr_create.index("--head") + 1] == "discord/explicit-pr"
-    pr_merge = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "merge"])
-    assert pr_merge[pr_merge.index("--repo") + 1] == "sligo-labs/PID"
-    assert pr_merge[pr_merge.index("--match-head-commit") + 1] == _TRUSTED_PR_HEAD
     assert ["git", "push", "-u", "origin", "discord/explicit-pr"] in calls
-    remote_ref = "refs/remotes/origin/develop"
-    sync_commands = [
-        ["git", "status", "--porcelain"],
-        [
-            "git",
-            "fetch",
-            "origin",
-            "--prune",
-            f"+refs/heads/develop:{remote_ref}",
-        ],
-        ["git", "rev-parse", "--verify", remote_ref],
-        ["git", "cat-file", "-e", "abc123^{commit}"],
-        ["git", "merge-base", "--is-ancestor", "abc123", remote_ref],
-        ["git", "checkout", "develop"],
-        ["git", "merge", "--ff-only", remote_ref],
-        ["git", "rev-parse", "HEAD"],
-        ["git", "merge-base", "--is-ancestor", "abc123", "HEAD"],
-    ]
-    assert [cmd for cmd in calls if cmd in sync_commands] == sync_commands
+    assert not any(cmd[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for cmd in calls)
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/123"
-    assert meta["pr_state"] == "MERGED"
-    assert meta["pr_merge_commit"] == "abc123"
-    assert meta["canonical_sync_state"] == "synced"
-    assert meta["canonical_sync_error"] == ""
-    assert meta["canonical_sync_path"] == str(project_path)
-    assert meta["canonical_sync_branch"] == "develop"
-    assert meta["canonical_sync_head"] == "def456"
-    assert meta["canonical_sync_merge_commit"] == "abc123"
-    assert meta["canonical_synced_at"]
-
-
-def test_ensure_pr_syncs_existing_worktree_when_base_branch_already_checked_out(
-    monkeypatch, tmp_path
-):
-    _home(monkeypatch, tmp_path)
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_codex_worker as worker
-    from hermes_cli import kanban_db
-
-    board = dwb.start_direct_goal(
-        thread_id="existing-worktree-pr",
-        goal="Ship explicit PR context",
-        project_context={"github_url": "https://github.com/sligo-labs/PID.git", "base_branch": "develop"},
-    )
-    workspace = tmp_path / "repo"
-    project_path = tmp_path / "canonical"
-    existing_path = tmp_path / "develop-worktree"
-    workspace.mkdir()
-    project_path.mkdir()
-    existing_path.mkdir()
-    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
-    _bind_reviewer_head(dwb, board.slug)
-    calls = []
-    view_states = ["OPEN", "MERGED"]
-
-    def fake_run(cmd, **kwargs):
-        cwd = Path(kwargs.get("cwd") or project_path)
-        calls.append((cmd, cwd))
-        if cmd[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:3] == ["gh", "pr", "create"]:
-            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/123\n", stderr="")
-        if cmd[:3] == ["gh", "pr", "view"]:
-            state = view_states.pop(0)
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state=state), stderr="")
-        if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd == ["git", "status", "--porcelain"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:4] == ["git", "fetch", "origin", "--prune"]:
-            assert cwd == project_path
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:4] == ["git", "rev-parse", "--verify"]:
-            assert cwd == project_path
-            return SimpleNamespace(returncode=0, stdout="remotehead\n", stderr="")
-        if cmd[:3] == ["git", "cat-file", "-e"]:
-            assert cwd == project_path
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd == [
-            "git",
-            "merge-base",
-            "--is-ancestor",
-            "abc123",
-            "refs/remotes/origin/develop",
-        ]:
-            assert cwd == project_path
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd == ["git", "checkout", "develop"]:
-            return SimpleNamespace(
-                returncode=128,
-                stdout="",
-                stderr=f"fatal: 'develop' is already used by worktree at '{existing_path}'",
-            )
-        if cmd == ["git", "worktree", "list", "--porcelain"]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=(
-                    f"worktree {project_path}\n"
-                    "HEAD aaaaaa\n"
-                    "branch refs/heads/main\n\n"
-                    f"worktree {existing_path}\n"
-                    "HEAD existinghead\n"
-                    "branch refs/heads/develop\n"
-                ),
-                stderr="",
-            )
-        if cmd == ["git", "merge", "--ff-only", "refs/remotes/origin/develop"]:
-            assert cwd == existing_path
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd == ["git", "rev-parse", "HEAD"]:
-            assert cwd == existing_path
-            return SimpleNamespace(returncode=0, stdout="existinghead\n", stderr="")
-        if cmd == ["git", "merge-base", "--is-ancestor", "abc123", "HEAD"]:
-            assert cwd == existing_path
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
-
-    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert (["git", "checkout", "develop"], project_path) in calls
-    assert (
-        ["git", "merge", "--ff-only", "refs/remotes/origin/develop"],
-        existing_path,
-    ) in calls
-    assert not any(cmd[:2] == ["git", "pull"] for cmd, _cwd in calls)
-    assert meta["pr_state"] == "MERGED"
-    assert meta["pr_merge_commit"] == "abc123"
-    assert meta["canonical_sync_state"] == "synced_existing_worktree"
-    assert meta["canonical_sync_error"] == ""
-    assert meta["canonical_sync_path"] == str(existing_path)
-    assert meta["canonical_sync_branch"] == "develop"
-    assert meta["canonical_sync_head"] == "existinghead"
-    assert meta["canonical_sync_merge_commit"] == "abc123"
-    assert meta["canonical_synced_at"]
+    assert meta["pr_state"] == "OPEN"
+    assert meta["merge_policy"] == "never"
 
 
 def test_ensure_pr_create_uses_concise_title_and_body(monkeypatch, tmp_path):
@@ -6213,497 +5699,6 @@ def test_ensure_pr_create_uses_concise_title_and_body(monkeypatch, tmp_path):
     assert "full task body details" not in body
 
 
-def test_ensure_pr_syncs_already_merged_pr(monkeypatch, tmp_path):
-    _home(monkeypatch, tmp_path)
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_codex_worker as worker
-    from hermes_cli import kanban_db
-
-    board = dwb.start_direct_goal(
-        thread_id="already-merged-pr",
-        goal="Ship already merged PR",
-        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
-    )
-    workspace = tmp_path / "repo"
-    project_path = tmp_path / "canonical"
-    workspace.mkdir()
-    project_path.mkdir()
-    dwb._update_worker_meta(
-        board.slug,
-        {"project_path": str(project_path), "pr_url": "https://github.com/sligo-labs/PID/pull/123"},
-    )
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state="MERGED"), stderr="")
-        sync_result = _canonical_sync_result(cmd, head="fedcba")
-        if sync_result is not None:
-            return sync_result
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
-
-    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
-    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
-    assert ["git", "status", "--porcelain"] in calls
-    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["pr_state"] == "MERGED"
-    assert meta["canonical_sync_state"] == "synced"
-    assert meta["canonical_sync_head"] == "fedcba"
-
-
-@pytest.mark.parametrize(
-    ("case", "project_exists", "sync_kwargs", "expected"),
-    [
-        ("missing", False, {}, "Canonical checkout missing or invalid"),
-        ("dirty", True, {"dirty": True}, "Canonical checkout is dirty"),
-        ("merge", True, {"pull_failed": True}, "Canonical checkout fast-forward merge failed"),
-        (
-            "ancestor",
-            True,
-            {"ancestor_failed": True},
-            "Canonical checkout remote ref does not contain PR merge commit",
-        ),
-    ],
-)
-def test_ensure_pr_blocks_terminal_completion_when_canonical_sync_fails_after_merge(
-    monkeypatch, tmp_path, case, project_exists, sync_kwargs, expected
-):
-    _home(monkeypatch, tmp_path)
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_codex_worker as worker
-    from hermes_cli import kanban_db
-
-    board = dwb.start_direct_goal(
-        thread_id=f"sync-blocked-{case}",
-        goal="Ship sync blocked PR",
-        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
-    )
-    workspace = tmp_path / "repo"
-    project_path = tmp_path / "canonical"
-    workspace.mkdir()
-    if project_exists:
-        project_path.mkdir()
-    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
-    _bind_reviewer_head(dwb, board.slug)
-    calls = []
-    view_states = ["OPEN", "MERGED"]
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:3] == ["gh", "pr", "create"]:
-            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/123\n", stderr="")
-        if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state=view_states.pop(0)), stderr="")
-        if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        sync_result = _canonical_sync_result(cmd, **sync_kwargs)
-        if sync_result is not None:
-            return sync_result
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
-
-    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["pr_state"] == "MERGED"
-    assert meta["canonical_sync_state"] == "blocked"
-    assert expected in meta["canonical_sync_error"]
-    assert expected in meta["pr_error"]
-    assert expected in meta["pr_blocker"]
-    if not project_exists:
-        assert ["git", "status", "--porcelain"] not in calls
-
-
-def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
-    _home(monkeypatch, tmp_path)
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_codex_worker as worker
-    from hermes_cli import kanban_db
-
-    board = dwb.start_direct_goal(
-        thread_id="blocked-pr",
-        goal="Ship PR blocker facts",
-        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
-    )
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:3] == ["gh", "pr", "create"]:
-            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/125\n", stderr="")
-        if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=_pr_view_json(
-                    number=125,
-                    state="OPEN",
-                    merge_state="BLOCKED",
-                    mergeable="CONFLICTING",
-                    checks=[
-                        {
-                            "name": "basic",
-                            "workflowName": "Basic Tests",
-                            "status": "COMPLETED",
-                            "conclusion": "FAILURE",
-                        },
-                        {
-                            "name": "pr body",
-                            "workflowName": "PR Body Format",
-                            "status": "COMPLETED",
-                            "conclusion": "SUCCESS",
-                        },
-                    ],
-                ),
-                stderr="",
-            )
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
-
-    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/125"
-    assert meta["pr_number"] == "125"
-    assert meta["pr_state"] == "OPEN"
-    assert meta["pr_merge_state"] == "BLOCKED"
-    assert meta["pr_mergeable"] == "CONFLICTING"
-    assert meta["pr_checks_status"] == "failed"
-    assert meta["pr_checks_total"] == 2
-    assert meta["pr_checks_failed"] == ["Basic Tests / basic"]
-    assert meta["pr_blocker"] == "checks failed: Basic Tests / basic"
-    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
-
-
-def test_legacy_merge_rejects_reviewer_approval_for_stale_pr_head(monkeypatch, tmp_path):
-    from hermes_cli import kanban_codex_worker as worker
-
-    approved_head = "a" * 40
-    current_head = "b" * 40
-    calls: list[list[str]] = []
-
-    def fake_gh(args, **_kwargs):
-        calls.append(args)
-        if args[:2] == ["pr", "view"]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=_pr_view_json(
-                    number=126,
-                    state="OPEN",
-                    merge_state="CLEAN",
-                    head_sha=current_head,
-                ),
-                stderr="",
-            )
-        if args[:1] == ["api"] and "/check-runs?" in args[1]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps(
-                    {
-                        "check_runs": [
-                            {
-                                "id": index,
-                                "name": check,
-                                "head_sha": current_head,
-                                "status": "COMPLETED",
-                                "conclusion": "SUCCESS",
-                                "completed_at": f"2026-07-18T00:00:0{index}Z",
-                                "details_url": _required_check_details_url(
-                                    "sligo-labs/PID",
-                                    workflow,
-                                    check,
-                                ),
-                                "app": {"slug": "github-actions"},
-                            }
-                            for index, (workflow, check) in enumerate(
-                                _REQUIRED_CHECK_RUNS,
-                                start=1,
-                            )
-                        ]
-                    }
-                ),
-                stderr="",
-            )
-        if args[:1] == ["api"] and "/actions/runs/" in args[1]:
-            run_id = args[1].rsplit("/", 1)[-1]
-            path = next(
-                path
-                for expected_run_id, path in _REQUIRED_CHECK_RUNS.values()
-                if run_id == expected_run_id
-            )
-            return SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps({"path": path, "head_sha": current_head}),
-                stderr="",
-            )
-        raise AssertionError(args)
-
-    monkeypatch.setattr(worker, "_run_gh", fake_gh)
-    state = {
-        "pr_url": "https://github.com/sligo-labs/PID/pull/126",
-        "review_approved_head": approved_head,
-    }
-
-    outcome = worker._ensure_pr_merged(
-        state,
-        root=tmp_path,
-        repo="sligo-labs/PID",
-    )
-
-    assert outcome == worker.PRFinalizationOutcome.FAILED
-    assert "missing or stale" in state["pr_blocker"]
-    assert not any(args[:2] == ["pr", "merge"] for args in calls)
-
-
-def test_ensure_pr_waits_for_checks_before_merging(monkeypatch, tmp_path):
-    _home(monkeypatch, tmp_path)
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_codex_worker as worker
-    from hermes_cli import kanban_db
-
-    board = dwb.start_direct_goal(
-        thread_id="pending-pr",
-        goal="Ship pending PR",
-        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
-    )
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:3] == ["gh", "pr", "create"]:
-            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/126\n", stderr="")
-        if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=_pr_view_json(
-                    number=126,
-                    state="OPEN",
-                    merge_state="UNSTABLE",
-                    checks=[
-                        {
-                            "name": "basic",
-                            "workflowName": "Basic Tests",
-                            "status": "IN_PROGRESS",
-                            "conclusion": "",
-                        },
-                        {
-                            "name": "pr body",
-                            "workflowName": "PR Body Format",
-                            "status": "QUEUED",
-                            "conclusion": "",
-                        },
-                    ],
-                ),
-                stderr="",
-            )
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-    monkeypatch.setattr(worker.time, "sleep", lambda *_args: pytest.fail("CI polling must not sleep"))
-
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
-
-    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["pr_state"] == "OPEN"
-    assert meta["pr_checks_status"] == "pending"
-    assert meta["pr_blocker"] == ""
-    assert meta["pr_ci_wait_state"] == "running"
-    assert meta["pr_ci_next_poll_at"] - meta["pr_ci_wait_started_at"] >= 10
-    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
-
-    views_before_next_tick = len([cmd for cmd in calls if cmd[:3] == ["gh", "pr", "view"]])
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
-    assert len([cmd for cmd in calls if cmd[:3] == ["gh", "pr", "view"]]) == views_before_next_tick
-
-
-def test_ensure_pr_waits_when_stable_checks_are_missing(monkeypatch, tmp_path):
-    _home(monkeypatch, tmp_path)
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_codex_worker as worker
-    from hermes_cli import kanban_db
-
-    board = dwb.start_direct_goal(
-        thread_id="no-check-pr",
-        goal="Ship PR without checks",
-        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
-    )
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-    calls = []
-    view_states = iter(
-        [
-            _pr_view_json(number=129, state="OPEN", merge_state="CLEAN", checks=[]),
-        ]
-    )
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:3] == ["gh", "pr", "create"]:
-            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/129\n", stderr="")
-        if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=next(view_states), stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
-
-    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
-    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["pr_state"] == "OPEN"
-    assert meta["pr_checks_status"] == "pending"
-    assert meta["pr_checks_total"] == 0
-    assert meta["pr_blocker"] == ""
-    assert meta["pr_ci_wait_state"] == "queued"
-
-
-def test_ensure_pr_merges_after_pending_gate_checks_pass(monkeypatch, tmp_path):
-    _home(monkeypatch, tmp_path)
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_codex_worker as worker
-
-    board = dwb.start_direct_goal(
-        thread_id="pending-then-passed-pr",
-        goal="Ship CI-gated PR",
-        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
-    )
-    workspace = tmp_path / "repo"
-    project_path = tmp_path / "canonical"
-    workspace.mkdir()
-    project_path.mkdir()
-    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
-    _bind_reviewer_head(dwb, board.slug)
-    calls: list[list[str]] = []
-    views = iter(
-        [
-            _pr_view_json(
-                number=130,
-                state="OPEN",
-                merge_state="UNSTABLE",
-                checks=[
-                    {
-                        "name": "basic",
-                        "workflowName": "Basic Tests",
-                        "status": "IN_PROGRESS",
-                        "conclusion": "",
-                    },
-                    {
-                        "name": "pr body",
-                        "workflowName": "PR Body Format",
-                        "status": "QUEUED",
-                        "conclusion": "",
-                    },
-                ],
-            ),
-            _pr_view_json(number=130, state="OPEN", merge_state="CLEAN"),
-            _pr_view_json(number=130, state="MERGED", merge_state="CLEAN"),
-        ]
-    )
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:3] == ["gh", "pr", "create"]:
-            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/130\n", stderr="")
-        if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=next(views), stderr="")
-        if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        sync_result = _canonical_sync_result(cmd)
-        if sync_result is not None:
-            return sync_result
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-    monkeypatch.setattr(worker.time, "sleep", lambda *_args: pytest.fail("CI polling must not sleep"))
-
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
-    dwb._update_worker_meta(board.slug, {"pr_ci_next_poll_at": 0})
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
-    assert any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
-
-
-
-def test_ensure_pr_polls_passed_unstable_nonblockingly_before_merging(monkeypatch, tmp_path):
-    _home(monkeypatch, tmp_path)
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_codex_worker as worker
-    from hermes_cli import kanban_db
-
-    board = dwb.start_direct_goal(
-        thread_id="unstable-pr",
-        goal="Ship unstable PR",
-        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
-    )
-    workspace = tmp_path / "repo"
-    project_path = tmp_path / "canonical"
-    workspace.mkdir()
-    project_path.mkdir()
-    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
-    _bind_reviewer_head(dwb, board.slug)
-    calls = []
-    view_states = iter(
-        [
-            _pr_view_json(number=127, state="OPEN", merge_state="UNSTABLE"),
-            _pr_view_json(number=127, state="OPEN", merge_state="CLEAN"),
-            _pr_view_json(number=127, state="MERGED", merge_state="CLEAN"),
-        ]
-    )
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if cmd[:3] == ["gh", "pr", "create"]:
-            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/127\n", stderr="")
-        if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=next(view_states), stderr="")
-        if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        sync_result = _canonical_sync_result(cmd)
-        if sync_result is not None:
-            return sync_result
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
-    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
-
-    dwb._update_worker_meta(board.slug, {"pr_ci_next_poll_at": 0})
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
-
-    merge_index = next(index for index, cmd in enumerate(calls) if cmd[:3] == ["gh", "pr", "merge"])
-    view_indices = [index for index, cmd in enumerate(calls) if cmd[:3] == ["gh", "pr", "view"]]
-    clean_view_index = view_indices[1]
-    assert clean_view_index < merge_index
-    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["pr_state"] == "MERGED"
-    assert meta["pr_merge_state"] == "CLEAN"
-    assert meta["pr_checks_status"] == "passed"
-    assert meta["pr_blocker"] == ""
-
-
 def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -6726,7 +5721,7 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/124\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=124), stderr="")
+                return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=124, state="OPEN"), stderr="")
         sync_result = _canonical_sync_result(cmd)
         if sync_result is not None:
             return sync_result
@@ -6734,7 +5729,12 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    outcome = worker._ensure_pr(board.slug, str(workspace))
+    finalizer = worker.kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert outcome == worker.PRFinalizationOutcome.PUBLISHED, {
+        key: finalizer.get(key)
+        for key in ("pr_error", "pr_blocker", "pr_url", "pr_state", "pr_status_error")
+    }
 
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
@@ -6814,7 +5814,7 @@ def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatc
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/124\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=124), stderr="")
+                return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=124, state="OPEN"), stderr="")
         sync_result = _canonical_sync_result(cmd)
         if sync_result is not None:
             return sync_result
@@ -6822,7 +5822,7 @@ def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatc
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     pr_list = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "list"])
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
@@ -6862,9 +5862,10 @@ def test_ensure_pr_explicit_target_repo_overrides_checkout_remote(monkeypatch, t
         if cmd[:3] == ["gh", "pr", "view"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=_pr_view_json(
-                    number=7,
-                    repo="sligo-droid/reserve-index-dtf",
+                    stdout=_pr_view_json(
+                        number=7,
+                        repo="sligo-droid/reserve-index-dtf",
+                        state="OPEN",
                 ),
                 stderr="",
             )
@@ -6875,7 +5876,7 @@ def test_ensure_pr_explicit_target_repo_overrides_checkout_remote(monkeypatch, t
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-droid/reserve-index-dtf"
@@ -6923,9 +5924,10 @@ def test_ensure_pr_amend_uses_head_repo_and_never_upstream_for_pr_commands(monke
         if cmd[:3] == ["gh", "pr", "view"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=_pr_view_json(
-                    number=7,
-                    repo="sligo-droid/reserve-index-dtf",
+                    stdout=_pr_view_json(
+                        number=7,
+                        repo="sligo-droid/reserve-index-dtf",
+                        state="OPEN",
                 ),
                 stderr="",
             )
@@ -6936,7 +5938,7 @@ def test_ensure_pr_amend_uses_head_repo_and_never_upstream_for_pr_commands(monke
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     gh_pr_calls = [cmd for cmd in calls if cmd[:2] == ["gh", "pr"]]
     assert gh_pr_calls
@@ -7105,8 +6107,6 @@ def test_ensure_pr_amend_succeeds_when_upstream_head_sha_advances(monkeypatch, t
     project_path.mkdir()
     dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
     _bind_reviewer_head(dwb, board.slug)
-    view_states = ["OPEN", "MERGED"]
-
     def fake_run(cmd, **kwargs):
         if cmd[:3] == ["gh", "pr", "list"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -7120,23 +6120,19 @@ def test_ensure_pr_amend_succeeds_when_upstream_head_sha_advances(monkeypatch, t
                 stdout=_pr_view_json(
                     number=7,
                     repo="sligo-droid/reserve-index-dtf",
-                    state=view_states.pop(0),
+                    state="OPEN",
                 ),
                 stderr="",
             )
-        if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        sync_result = _canonical_sync_result(cmd)
-        if sync_result is not None:
-            return sync_result
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["pr_state"] == "MERGED"
+    assert meta["pr_state"] == "OPEN"
+    assert meta["merge_policy"] == "never"
     assert meta["pr_amend_head_advanced"] is True
     assert meta["pr_amend_upstream_head_sha"] == "b" * 40
     assert meta["pr_blocker"] == ""
@@ -7176,7 +6172,6 @@ def test_ensure_pr_amend_finalizer_ignores_dev_worker_no_pr_text(monkeypatch, tm
         },
     )
     _bind_reviewer_head(dwb, board.slug)
-    view_states = ["OPEN", "MERGED"]
     calls = []
 
     def fake_run(cmd, **kwargs):
@@ -7193,28 +6188,23 @@ def test_ensure_pr_amend_finalizer_ignores_dev_worker_no_pr_text(monkeypatch, tm
                 stdout=_pr_view_json(
                     number=7,
                     repo="sligo-droid/reserve-index-dtf",
-                    state=view_states.pop(0),
+                    state="OPEN",
                 ),
                 stderr="",
             )
-        if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        sync_result = _canonical_sync_result(cmd)
-        if sync_result is not None:
-            return sync_result
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_open_policy"] == dwb.PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL
-    assert meta["merge_policy"] == dwb.MERGE_POLICY_AUTO
+    assert meta["merge_policy"] == dwb.MERGE_POLICY_NEVER
     assert meta.get("pr_skipped_no_changes") is not True
     assert meta["pr_amend_head_advanced"] is True
     assert any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
-    assert any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+    assert not any(cmd[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for cmd in calls)
 
 
 def test_ensure_pr_skips_foreman_no_change_branch(monkeypatch, tmp_path):
@@ -7244,7 +6234,7 @@ def test_ensure_pr_skips_foreman_no_change_branch(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.PUBLISHED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_skipped_no_changes"] is True
@@ -7282,7 +6272,7 @@ def test_ensure_pr_rejects_kanban_role_worker_context(monkeypatch, tmp_path):
     meta = kanban_db.read_board_metadata(board.slug)[DISCORD_WORKER_META_KEY]
     assert meta["pr_finalizer_guard"] == "role_worker_context"
     assert meta["pr_checks_status"] == "not checked"
-    assert meta["pr_merge_state"] == "not attempted"
+    assert "pr_merge_state" not in meta
     assert "dispatcher reconciliation must finalize" in meta["pr_error"]
     assert meta["pr_blocker"] == meta["pr_error"]
 
@@ -7318,7 +6308,7 @@ def test_ensure_pr_records_error_when_repo_or_head_missing(monkeypatch, tmp_path
     assert meta["pr_error"] == "Cannot create PR: missing GitHub repository, worker branch"
     assert meta["pr_blocker"] == meta["pr_error"]
     assert meta["pr_checks_status"] == "not checked"
-    assert meta["pr_merge_state"] == "unknown"
+    assert "pr_merge_state" not in meta
     assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
 
 

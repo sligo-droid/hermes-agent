@@ -3644,6 +3644,11 @@ class DiscordAdapter(BasePlatformAdapter):
         pr_url = str(kanban_snapshot.get("pr_url") or "").strip()
         if pr_url:
             metadata["pr_url"] = pr_url
+        preview_url = self._normalize_public_url(
+            str(kanban_snapshot.get("preview_url") or "")
+        )
+        if preview_url:
+            metadata["branch_url"] = preview_url
         return metadata
 
     def _feature_summary_kanban_url(

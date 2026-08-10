@@ -497,7 +497,7 @@ async def test_cancelled_remote_mutation_uncertainty_survives_for_next_lease(
         updated = dict(value)
         updated["mutation_uncertainty"] = {
             "status": "uncertain",
-            "operation": "github_pr_merge",
+            "operation": "github_pr_create",
             "at": now,
             "head_sha": "a" * 40,
         }
@@ -521,7 +521,7 @@ async def test_cancelled_remote_mutation_uncertainty_survives_for_next_lease(
     assert stored["closeout"]["status"] == state["status"]
     assert stored["closeout_mutation_uncertainty"] == {
         "status": "uncertain",
-        "operation": "github_pr_merge",
+        "operation": "github_pr_create",
         "at": 100.0,
         "head_sha": "a" * 40,
     }
@@ -547,7 +547,7 @@ async def test_immediate_transition_rearms_same_process_wakeup(monkeypatch, tmp_
 
     def reconcile(value, **_kwargs):
         updated = dict(value)
-        updated["status"] = "ready_pending"
+        updated["status"] = "waiting_for_preview"
         updated["next_due_at"] = 100.0
         return SimpleNamespace(state=updated, wake_immediately=True)
 
@@ -626,8 +626,373 @@ async def test_terminal_closeout_synthesizes_result_for_interrupted_agent_withou
     assert await watcher.run_once() == 1
     stored = ledger.get(item["id"])
     assert stored["status"] == "agent_done"
-    assert stored["final_response"].startswith("Trusted closeout completed")
+    assert stored["final_response"].startswith("PR preview QA completed")
     assert callbacks[0]["id"] == item["id"]
+
+
+@pytest.mark.asyncio
+async def test_preview_ready_callback_runs_before_terminal_closeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    callbacks = []
+    head_sha = "a" * 40
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "waiting_for_gates"
+        updated["next_due_at"] = 130.0
+        updated["policy"] = {**updated["policy"], "require_preview": True}
+        updated["pr"] = {
+            **updated["pr"],
+            "url": "https://github.com/acme/example/pull/7",
+            "head_sha": head_sha,
+        }
+        updated["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": "https://example-git-thread.vercel.app",
+            "deployment_id": "42",
+        }
+        return SimpleNamespace(state=updated)
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        on_preview=lambda stored: callbacks.append(stored),
+    )
+
+    assert await watcher.run_once() == 1
+    assert callbacks[0]["preview_delivery"]["status"] == "pending"
+    assert callbacks[0]["preview_delivery"]["preview_url"] == (
+        "https://example-git-thread.vercel.app"
+    )
+    assert ledger.get(item["id"])["closeout"]["status"] == "waiting_for_gates"
+
+
+@pytest.mark.asyncio
+async def test_ready_preview_is_notified_before_blocked_terminal_callback(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    callbacks = []
+    head_sha = "b" * 40
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "repair_required"
+        updated["next_due_at"] = None
+        updated["policy"] = {**updated["policy"], "require_preview": True}
+        updated["pr"] = {
+            **updated["pr"],
+            "url": "https://github.com/acme/example/pull/8",
+            "head_sha": head_sha,
+        }
+        updated["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": "https://example-git-blocked.vercel.app",
+            "deployment_id": "43",
+        }
+        return SimpleNamespace(state=updated)
+
+    def on_preview(stored):
+        callbacks.append("preview")
+        owner = "blocked-preview"
+        assert ledger.claim_preview_delivery(stored["id"], owner=owner) is not None
+        assert ledger.begin_preview_send_attempt(stored["id"], owner=owner) is True
+        assert ledger.complete_preview_delivery(
+            stored["id"],
+            owner=owner,
+            result_message_id="blocked-preview-message",
+        ) is True
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        on_preview=on_preview,
+        on_terminal=lambda _stored: callbacks.append("terminal"),
+    )
+
+    assert await watcher.run_once() == 1
+    assert callbacks == ["preview", "terminal"]
+    assert ledger.get(item["id"])["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_ready_preview_is_notified_before_success_terminal_callback(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    callbacks = []
+    head_sha = "c" * 40
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "pr_published"
+        updated["next_due_at"] = None
+        updated["policy"] = {
+            **updated["policy"],
+            "require_preview": True,
+            "require_local_verification": False,
+            "require_review": False,
+            "require_visual_qa": False,
+        }
+        updated["pr"] = {
+            **updated["pr"],
+            "url": "https://github.com/acme/example/pull/9",
+            "state": "OPEN",
+            "head_sha": head_sha,
+        }
+        updated["ci"] = {
+            **updated["ci"],
+            "head_sha": head_sha,
+            "status": "passed",
+        }
+        updated["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": "https://example-git-success.vercel.app",
+            "deployment_id": "44",
+        }
+        return SimpleNamespace(state=updated)
+
+    def on_preview(stored):
+        callbacks.append("preview")
+        owner = "success-preview"
+        assert ledger.claim_preview_delivery(stored["id"], owner=owner) is not None
+        assert ledger.begin_preview_send_attempt(stored["id"], owner=owner) is True
+        assert ledger.complete_preview_delivery(
+            stored["id"],
+            owner=owner,
+            result_message_id="success-preview-message",
+        ) is True
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        on_preview=on_preview,
+        on_terminal=lambda _stored: callbacks.append("terminal"),
+    )
+
+    assert await watcher.run_once() == 1
+    assert callbacks == ["preview", "terminal"]
+    assert ledger.get(item["id"])["status"] == "agent_done"
+
+
+@pytest.mark.asyncio
+async def test_terminal_callback_waits_for_preview_retry_completion(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: now[0])
+    item, _state = _pending_item(ledger)
+    callbacks = []
+    head_sha = "9" * 40
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "pr_published"
+        updated["next_due_at"] = None
+        updated["policy"] = {
+            **updated["policy"],
+            "require_preview": True,
+            "require_local_verification": False,
+            "require_review": False,
+            "require_visual_qa": False,
+        }
+        updated["pr"] = {
+            **updated["pr"],
+            "url": "https://github.com/acme/example/pull/12",
+            "state": "OPEN",
+            "head_sha": head_sha,
+        }
+        updated["ci"] = {**updated["ci"], "head_sha": head_sha, "status": "passed"}
+        updated["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": "https://example-git-ordered.vercel.app",
+            "deployment_id": "47",
+        }
+        return SimpleNamespace(state=updated)
+
+    attempts = [0]
+
+    def on_preview(stored):
+        attempts[0] += 1
+        owner = f"ordered-preview-{attempts[0]}"
+        assert ledger.claim_preview_delivery(stored["id"], owner=owner) is not None
+        if attempts[0] == 1:
+            callbacks.append("preview_failed")
+            assert ledger.fail_preview_delivery(
+                stored["id"], owner=owner, uncertain=False
+            ) is True
+            return
+        callbacks.append("preview")
+        assert ledger.begin_preview_send_attempt(stored["id"], owner=owner) is True
+        assert ledger.complete_preview_delivery(
+            stored["id"],
+            owner=owner,
+            result_message_id="ordered-preview-message",
+        ) is True
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        on_preview=on_preview,
+        on_terminal=lambda _stored: callbacks.append("terminal"),
+    )
+
+    assert await watcher.run_once() == 1
+    assert callbacks == ["preview_failed"]
+    assert ledger.get(item["id"])["status"] == "agent_done"
+
+    now[0] = 102.0
+    assert await watcher.run_once() == 1
+    assert callbacks == ["preview_failed", "preview", "terminal"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_preview_retry_is_scanned_without_reopening_closeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, state = _pending_item(ledger)
+    head_sha = "d" * 40
+    terminal = dict(state)
+    terminal["status"] = "pr_published"
+    terminal["next_due_at"] = None
+    terminal["policy"] = {**terminal["policy"], "require_preview": True}
+    terminal["pr"] = {
+        **terminal["pr"],
+        "url": "https://github.com/acme/example/pull/10",
+        "state": "OPEN",
+        "head_sha": head_sha,
+    }
+    terminal["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": head_sha,
+        "url": "https://example-git-retry.vercel.app",
+        "deployment_id": "45",
+    }
+    persisted = ledger.update_closeout(
+        item["id"],
+        terminal,
+        expected_revision=state["revision"],
+    )
+    assert persisted is not None
+    assert ledger.pending_closeouts(due_at=100.0) == []
+    delivered = []
+
+    def on_preview(stored):
+        owner = "retry-sender"
+        assert ledger.claim_preview_delivery(stored["id"], owner=owner) is not None
+        assert ledger.begin_preview_send_attempt(stored["id"], owner=owner) is True
+        assert ledger.complete_preview_delivery(
+            stored["id"],
+            owner=owner,
+            result_message_id="preview-10",
+        ) is True
+        delivered.append(stored["id"])
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal closeout must not be reconciled again")
+        ),
+        owner="watcher-1",
+        on_preview=on_preview,
+    )
+
+    assert await watcher.run_once() == 1
+    assert delivered == [item["id"]]
+    assert ledger.get(item["id"])["preview_delivery"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_preview_send_names_exact_head_when_branch_advances_in_flight(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, state = _pending_item(ledger)
+    old_head = "e" * 40
+    ready = dict(state)
+    ready["policy"] = {**ready["policy"], "require_preview": True}
+    ready["pr"] = {
+        **ready["pr"],
+        "url": "https://github.com/acme/example/pull/11",
+        "state": "OPEN",
+        "head_sha": old_head,
+    }
+    ready["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": old_head,
+        "url": "https://example-git-old.vercel.app",
+        "deployment_id": "46",
+    }
+    persisted = ledger.update_closeout(
+        item["id"],
+        ready,
+        expected_revision=state["revision"],
+    )
+    assert persisted is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Visual QA passed for the old head.",
+    )
+    sent = []
+
+    class Adapter:
+        async def _send_with_retry(self, **kwargs):
+            sent.append(kwargs["content"])
+            current = ledger.get(item["id"])["closeout"]
+            advanced = dict(current)
+            new_head = "f" * 40
+            advanced["pr"] = {**advanced["pr"], "head_sha": new_head}
+            advanced["preview"] = {
+                "provider": "vercel",
+                "status": "pending",
+                "observed_sha": new_head,
+                "url": "",
+            }
+            assert ledger.update_closeout(
+                item["id"],
+                advanced,
+                expected_revision=current["revision"],
+            ) is not None
+            return SimpleNamespace(
+                success=True,
+                message_id="stale-preview-message",
+                confirmed_message_ids=("stale-preview-message",),
+            )
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._adapter_for_source = lambda _source: Adapter()
+
+    await runner._on_trusted_closeout_preview(ledger.get(item["id"]))
+
+    assert f"exact commit `{old_head}`" in sent[0]
+    assert "newer commit will get a separate preview message" in sent[0]
+    delivery = ledger.get(item["id"])["preview_delivery"]
+    assert delivery["status"] == "cancelled"
+    assert delivery["cancelled_reason"] == "pr_head_advanced"
+    assert ledger.preview_delivery_satisfied(item["id"]) is False
+    terminal_callbacks = []
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        owner="watcher-1",
+        on_terminal=lambda _stored: terminal_callbacks.append("terminal"),
+    )
+    assert await watcher._notify_terminal_ready(item["id"]) is False
+    assert terminal_callbacks == []
 
 
 @pytest.mark.asyncio
@@ -987,13 +1352,6 @@ async def test_same_process_notify_wakes_forever_loop(monkeypatch, tmp_path):
         ("poll_seconds", 5000, "poll_seconds", 3600.0),
         ("lease_seconds", False, "lease_seconds", 120.0),
         ("lease_seconds", "2.5", "lease_seconds", 2.5),
-        ("green_unmerged_overdue_seconds", -1, "green_unmerged_overdue_seconds", 0.0),
-        (
-            "green_unmerged_overdue_seconds",
-            99 * 24 * 3600,
-            "green_unmerged_overdue_seconds",
-            30 * 24 * 3600.0,
-        ),
         ("max_concurrency", None, "max_concurrency", 2),
         ("max_concurrency", True, "max_concurrency", 2),
         ("max_concurrency", "bad", "max_concurrency", 2),
@@ -1388,6 +1746,146 @@ async def test_partial_terminal_delivery_persists_prefix_and_restart_does_not_re
     assert stored["terminal_delivery"]["confirmed_message_ids"] == ["chunk-1"]
     assert stored["terminal_delivery"]["uncertain_reason"] == "partial_send_confirmed"
     assert stored["terminal_delivery"]["status"] == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_restart_terminal_delivery_waits_for_preview_completion(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, state = _pending_item(ledger)
+    head_sha = "8" * 40
+    terminal = dict(state)
+    terminal["status"] = "pr_published"
+    terminal["next_due_at"] = None
+    terminal["policy"] = {**terminal["policy"], "require_preview": True}
+    terminal["pr"] = {
+        **terminal["pr"],
+        "url": "https://github.com/acme/example/pull/13",
+        "state": "OPEN",
+        "head_sha": head_sha,
+    }
+    terminal["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": head_sha,
+        "url": "https://example-git-restart.vercel.app",
+        "deployment_id": "48",
+    }
+    persisted = ledger.update_closeout(
+        item["id"],
+        terminal,
+        expected_revision=state["revision"],
+    )
+    assert persisted is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Visual QA passed for the draft PR.",
+    )
+    agent_done = ledger.get(item["id"])
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="terminal-after-preview")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(agent_done)
+    adapter._send_with_retry.assert_not_awaited()
+
+    owner = "restart-preview"
+    assert ledger.claim_preview_delivery(item["id"], owner=owner) is not None
+    assert ledger.begin_preview_send_attempt(item["id"], owner=owner) is True
+    assert ledger.complete_preview_delivery(
+        item["id"],
+        owner=owner,
+        result_message_id="restart-preview-message",
+    ) is True
+
+    await runner._resume_finished_discord_work_item(ledger.get(item["id"]))
+    adapter._send_with_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre_closeout_failure_delivers_without_impossible_preview(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    event = _event(message_id="failure-before-closeout")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+        policy={"require_preview": True},
+    )
+    assert attached is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Implementation failed before a pull request was created.",
+        summary_status="Blocked",
+    )
+    failed = ledger.get(item["id"])
+    assert "preview_delivery" not in failed
+    assert ledger.preview_delivery_satisfied(item["id"]) is True
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="failure-message")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(failed)
+
+    adapter._send_with_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_activated_failure_without_preview_delivers_blocker(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, state = _pending_item(ledger)
+    failed_state = dict(state)
+    failed_state["status"] = "repair_required"
+    failed_state["next_due_at"] = None
+    failed_state["policy"] = {**failed_state["policy"], "require_preview": True}
+    persisted = ledger.update_closeout(
+        item["id"],
+        failed_state,
+        expected_revision=state["revision"],
+    )
+    assert persisted is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Closeout failed before Vercel produced a preview.",
+        summary_status="Blocked",
+    )
+    failed = ledger.get(item["id"])
+    assert ledger.preview_delivery_satisfied(item["id"]) is True
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="activated-failure")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(failed)
+
+    adapter._send_with_retry.assert_awaited_once()
 
 
 @pytest.mark.asyncio

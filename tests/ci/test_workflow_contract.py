@@ -68,6 +68,15 @@ def test_js_autofix_install_is_self_contained_and_retried():
     assert "sleep 10" in source
 
 
+def test_js_autofix_only_opens_draft_prs_and_never_merges():
+    source = (WORKFLOWS / "js-autofix.yml").read_text(encoding="utf-8")
+
+    assert "gh pr create" in source
+    assert "--draft" in source
+    assert "gh pr merge" not in source
+    assert "gh pr ready" not in source
+
+
 def test_pr_body_is_a_separate_trusted_base_gate():
     source = (WORKFLOWS / "pr-body-format.yml").read_text(encoding="utf-8")
 

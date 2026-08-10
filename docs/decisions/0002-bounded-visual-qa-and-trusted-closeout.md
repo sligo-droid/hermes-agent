@@ -1,13 +1,13 @@
-# ADR 0002: Bound visual QA and make trusted closeout durable
+# ADR 0002: Bound visual QA and publish preview pull requests
 
 Status: accepted
-Date: 2026-07-18
+Date: 2026-08-09
 
 ## Context
 
-Rendered UI checks and pull-request closeout both benefit from fast follow-up, but foreground agents are the wrong long-lived owner. Unbounded visual inspection can consume tool/model budgets or retain sensitive browser material. Foreground CI polling can pin a chat turn, race a changing PR head, replay model work after restart, or merge using evidence collected for an older commit.
+Rendered UI checks and pull-request publication both benefit from fast follow-up, but foreground agents are the wrong long-lived owner. Unbounded visual inspection can consume tool/model budgets or retain sensitive browser material. Foreground deployment and CI polling can pin a chat turn, race a changing PR head, or replay model work after restart.
 
-Hermes therefore needs acceleration without weakening evidence: visual checks must be small and deterministic, while PR/merge/post-merge reconciliation must survive process boundaries and remain bound to the exact commit it observed.
+Hermes therefore needs acceleration without weakening evidence: visual checks must be small and deterministic, while PR and preview reconciliation must survive process boundaries and remain bound to the exact commit it observed. Discord feature work must leave `main` untouched for human review.
 
 ## Decision
 
@@ -41,15 +41,20 @@ Adopt two related, bounded mechanisms.
 - Reconcile with a storage-neutral, synchronous one-shot engine. One pass has a bounded command budget, never sleeps, never calls a model, and returns a normalized state plus `next_due_at`.
 - Let the gateway watcher own durable scheduling. It wakes from same-process signals, an identifier-only cross-process dirty marker, or a bounded periodic fallback; claims work with revision-checked leases; runs a bounded concurrent batch off the event loop; and persists the next state with compare-and-swap semantics.
 - Do not replay a model turn merely to continue closeout. Do not synthesize terminal delivery over a live model/worker turn; persist terminal state and let the existing owner finish delivery first.
+- Push the exact feature-branch head and create or refresh a draft pull request. Hermes never marks the pull request ready and never merges it.
+- Discover the Vercel preview through GitHub Deployments for the exact PR head, `Preview` environment, feature branch, and a Vercel creator identity. Accept only HTTPS `*.vercel.app` environment URLs.
+- As soon as the exact-head preview is ready, persist one durable Discord delivery obligation and post the preview URL with the draft PR URL in the originating thread. State that `main` is untouched and visual QA continues in the background.
+- Continue current-head CI and visual QA asynchronously. Post a separate terminal result in the same thread after those gates pass or require repair.
+- Treat legacy persisted `auto` and `manual` merge policy values as `never`. An upgrade cannot merge an in-flight PR.
 
-## Exact-head and exact-SHA invariants
+## Exact-head invariants
 
 - A PR head is accepted only as a full valid SHA. Local verification, review, visual-QA, and CI receipts are bound to that head.
 - When GitHub reports a different head, all head-bound evidence is invalidated and required checks are recomputed only from the current head.
-- Immediately before merge, refresh the authoritative PR snapshot and re-evaluate draft, review, CI, visual, local-verification, and mergeability gates even if the SHA did not change.
-- Merge with GitHub's exact-head guard (`--match-head-commit <head-sha>`). A concurrent head change must fail the merge attempt rather than merge unverified code.
-- After merge, persist GitHub's independently reported merge SHA before starting collectors. Canonical sync, post-merge CI, deployment, production QA, and restart receipts target that exact SHA.
-- Every required post-merge receipt must be `passed` and report `observed_sha` equal to the persisted target SHA before closeout can complete.
+- A preview is publishable only when its deployment SHA equals the current PR head and its deployment ref matches the feature branch or exact head SHA.
+- A preview delivery is keyed by preview URL, draft PR URL, and exact head SHA. A completed delivery is not sent again; an uncertain send requires operator repair instead of risking a duplicate.
+- A changed PR head invalidates the prior preview and creates a new delivery obligation only after Vercel reports the new exact-head URL.
+- PR publication never depends on mergeability, canonical checkout sync, post-merge CI, production deployment, restart, or live-runtime pickup.
 
 ## Rollout and rollback
 
@@ -57,8 +62,8 @@ Both mechanisms are non-enforcing by default.
 
 - Visual QA modes are `off`, `shadow`, and `enforce_explicit`; the default is `shadow`.
 - Trusted closeout modes are `off`, `shadow`, and `enforce`; the default is `shadow`.
-- Shadow mode records what enforcement would observe but does not authorize completion or perform closeout mutations. The previously authorized legacy finalizer remains responsible where applicable.
-- Roll out enforcement per surface/repository only after shadow evidence is stable and required post-merge adapters are configured.
+- Shadow mode records what enforcement would observe but does not authorize completion or perform closeout mutations.
+- Roll out enforcement per surface/repository only after shadow evidence is stable and Vercel GitHub Deployments are available.
 - Roll back new work by returning the relevant mode to `shadow` or `off`. Already-authoritative in-flight closeouts remain durable and must be explicitly completed, repaired, or transitioned; rollback must not silently discard ownership or reinterpret stale evidence as success.
 
 ## Sensitive-data boundaries
@@ -74,11 +79,12 @@ Positive:
 
 - Visual evidence is faster and cheaper without turning screenshots or browser state into an unbounded durable record.
 - Premium visual-model spend is concentrated on design judgement and one rendered review while mechanical implementation remains on the normal coding worker.
-- CI, merge, canonical sync, and post-merge ownership survive gateway restarts without foreground polling or model replay.
-- A newer PR head or mismatched post-merge SHA fails closed instead of inheriting stale success.
+- Draft PR publication, preview delivery, CI, and visual-QA ownership survive gateway restarts without foreground polling or model replay.
+- A newer PR head or mismatched preview deployment fails closed instead of inheriting stale success.
+- Every Discord feature thread can receive its own feature-branch preview before visual QA completes.
 
 Costs:
 
-- Enforcement depends on durable ledger integrity, watcher availability, and correctly configured required adapters.
+- Enforcement depends on durable ledger integrity, watcher availability, and Vercel publishing GitHub Deployment status for preview branches.
 - Conservative classification can leave ambiguous visual work in shadow or require an explicit follow-up.
-- Blocked exact-head or exact-SHA gates require repair rather than best-effort completion.
+- Blocked exact-head preview or QA gates require repair rather than best-effort completion.

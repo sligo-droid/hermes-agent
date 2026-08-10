@@ -91,12 +91,12 @@ class TrustedCloseoutWatcher:
         reconcile: Callable[..., Any] = reconcile_trusted_closeout,
         owner: str = "",
         is_agent_active: Callable[[dict[str, Any]], bool] | None = None,
+        on_preview: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
         on_terminal: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     ) -> None:
         raw = config if isinstance(config, dict) else {}
         self.ledger = ledger
         self.reconcile = reconcile
-        self.post_merge_config = dict(raw)
         self.poll_seconds = _bounded_float(
             raw.get("poll_seconds"),
             default=30.0,
@@ -109,12 +109,6 @@ class TrustedCloseoutWatcher:
             minimum=1.0,
             maximum=3600.0,
         )
-        self.green_unmerged_overdue_seconds = _bounded_float(
-            raw.get("green_unmerged_overdue_seconds"),
-            default=0.0,
-            minimum=0.0,
-            maximum=30 * 24 * 3600.0,
-        )
         self.max_concurrency = _bounded_int(
             raw.get("max_concurrency"),
             default=2,
@@ -123,10 +117,49 @@ class TrustedCloseoutWatcher:
         )
         self.owner = str(owner or f"gateway-closeout:{os.getpid()}:{uuid.uuid4().hex[:8]}")[:160]
         self.is_agent_active = is_agent_active or (lambda _item: False)
+        self.on_preview = on_preview
         self.on_terminal = on_terminal
         self.wakeup = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._marker_path = closeout_dirty_marker_path()
+
+    async def _notify_preview_ready(self, work_id: str) -> bool:
+        if self.ledger.preview_delivery_satisfied(work_id):
+            return True
+        callback = self.on_preview
+        if callback is None:
+            return False
+        item = self.ledger.get(work_id)
+        delivery = item.get("preview_delivery") if isinstance(item, dict) else None
+        if not isinstance(item, dict) or not isinstance(delivery, dict):
+            return False
+        if str(delivery.get("status") or "") not in {"pending", "delivering", "sending"}:
+            return False
+        callback_result = callback(item)
+        if asyncio.iscoroutine(callback_result):
+            await callback_result
+        return self.ledger.preview_delivery_satisfied(work_id)
+
+    async def _notify_terminal_ready(self, work_id: str) -> bool:
+        if not self.ledger.preview_delivery_satisfied(work_id):
+            return False
+        callback = self.on_terminal
+        if callback is None:
+            return False
+        item = self.ledger.get(work_id)
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("status") or "") not in {
+            "agent_done",
+            "response_delivered",
+            "summary_updated",
+            "blocked",
+        }:
+            return False
+        callback_result = callback(item)
+        if asyncio.iscoroutine(callback_result):
+            await callback_result
+        return True
 
     def notify(self, work_item_id: str = "", *, cross_process: bool = False) -> None:
         if cross_process:
@@ -272,8 +305,6 @@ class TrustedCloseoutWatcher:
             async def reconcile_with_guard() -> Any:
                 kwargs: dict[str, Any] = {
                     "poll_seconds": self.poll_seconds,
-                    "post_merge_config": self.post_merge_config,
-                    "green_unmerged_overdue_seconds": self.green_unmerged_overdue_seconds,
                     "mutation_allowed": guard.mutation_allowed,
                     "mutation_started": fence_remote_mutation,
                     "control": guard,
@@ -349,6 +380,8 @@ class TrustedCloseoutWatcher:
                             expected_generation=lease_generation,
                             closeout_state=next_state,
                         )
+                        if released is not None:
+                            await self._notify_preview_ready(work_id)
                         return released is not None
                     await stop_heartbeat()
                     if guard.cancelled():
@@ -369,11 +402,8 @@ class TrustedCloseoutWatcher:
                     )
                     if blocked is None:
                         return False
-                    callback = self.on_terminal
-                    if callback is not None:
-                        callback_result = callback(blocked)
-                        if asyncio.iscoroutine(callback_result):
-                            await callback_result
+                    await self._notify_preview_ready(work_id)
+                    await self._notify_terminal_ready(work_id)
                     return True
 
                 await stop_heartbeat()
@@ -398,12 +428,19 @@ class TrustedCloseoutWatcher:
                             closeout_state=next_state,
                             expected_run_state=expected_run_state,
                         )
+                        if released is not None:
+                            await self._notify_preview_ready(work_id)
                         return released is not None
-                    status = str(next_state.get("status") or "completed")
+                    preview = next_state.get("preview") if isinstance(next_state.get("preview"), dict) else {}
+                    pr = next_state.get("pr") if isinstance(next_state.get("pr"), dict) else {}
+                    policy = next_state.get("policy") if isinstance(next_state.get("policy"), dict) else {}
+                    visual_text = "passed" if policy.get("require_visual_qa") is True else "not required"
                     summary = (
-                        "Trusted closeout completed: the PR is open and intentionally unmerged under the configured policy."
-                        if status == "pr_open"
-                        else "Trusted closeout completed: the PR merge and all configured closeout gates passed."
+                        "PR preview QA completed.\n\n"
+                        f"- Preview: {preview.get('url') or 'not required'}\n"
+                        f"- Draft PR: {pr.get('url') or 'open'}\n"
+                        "- Main: untouched and unmerged\n"
+                        f"- Visual QA: {visual_text}"
                     )
                     finalized = await asyncio.to_thread(
                         self.ledger.finalize_successful_closeout,
@@ -417,11 +454,8 @@ class TrustedCloseoutWatcher:
                     )
                     if finalized is None:
                         return False
-                    callback = self.on_terminal
-                    if callback is not None:
-                        callback_result = callback(finalized)
-                        if asyncio.iscoroutine(callback_result):
-                            await callback_result
+                    await self._notify_preview_ready(work_id)
+                    await self._notify_terminal_ready(work_id)
                     return True
                 released = await asyncio.to_thread(
                     self.ledger.release_closeout,
@@ -433,6 +467,7 @@ class TrustedCloseoutWatcher:
                 )
                 if released is None:
                     return False
+                await self._notify_preview_ready(work_id)
                 if wake_immediately:
                     self.wakeup.set()
                 return True
@@ -444,18 +479,37 @@ class TrustedCloseoutWatcher:
         """Reconcile one bounded due batch."""
 
         self._loop = asyncio.get_running_loop()
+        preview_items = await asyncio.to_thread(
+            self.ledger.pending_preview_deliveries,
+            limit=self.max_concurrency,
+        )
+        preview_work_ids = [str(item.get("id") or "") for item in preview_items]
+        preview_results = await asyncio.gather(
+            *(self._notify_preview_ready(work_id) for work_id in preview_work_ids),
+            return_exceptions=False,
+        )
+        await asyncio.gather(
+            *(
+                self._notify_terminal_ready(work_id)
+                for work_id, delivered in zip(preview_work_ids, preview_results)
+                if delivered is True
+            ),
+            return_exceptions=False,
+        )
         items = await asyncio.to_thread(
             self.ledger.pending_closeouts,
             limit=self.max_concurrency,
         )
         if not items:
-            return 0
+            return sum(result is True for result in preview_results)
         semaphore = asyncio.Semaphore(self.max_concurrency)
         results = await asyncio.gather(
             *(self._reconcile_item(item, semaphore) for item in items),
             return_exceptions=False,
         )
-        return sum(result is True for result in results)
+        return sum(result is True for result in preview_results) + sum(
+            result is True for result in results
+        )
 
     async def _wait_for_wakeup(self) -> None:
         """Wait for an event while polling the cross-process marker cheaply."""
