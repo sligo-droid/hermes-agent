@@ -87,7 +87,7 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
     routing for recognized mutation, operational requests, and narrow referential
     approvals in established action threads. If read-only observation reveals that
     mutation is required, `escalate_to_action` ends the turn and the gateway
-    replays the original request through `discord_action` Sol/high with its
+    replays the original request through `discord_action` Sol/medium with its
     isolated worktree and lifecycle policy. Explicit human requests for higher
     reasoning select `deep_review` Sol/high for that turn; ordinary risk wording
     does not automatically promote the route. Read-only orchestration should

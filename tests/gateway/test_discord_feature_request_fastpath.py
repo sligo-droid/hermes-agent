@@ -159,14 +159,14 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     )
 
     assert result["final_response"] == "ok"
-    assert result["reasoning_effort"] == "high"
+    assert result["reasoning_effort"] == "medium"
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
     assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
     assert init["model"] == "gpt-5.6-sol"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "medium"}
     cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
     audit = cached_agent._runtime_audit_context
     assert audit["model_tier"] == "discord_action"
@@ -247,11 +247,11 @@ async def test_discord_action_request_uses_routine_tier_regardless_of_keywords(
         intent=True,
     )
 
-    assert result["reasoning_effort"] == "high"
+    assert result["reasoning_effort"] == "medium"
     assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
     assert _CapturingAgent.last_init["reasoning_config"] == {
         "enabled": True,
-        "effort": "high",
+        "effort": "medium",
     }
     audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
     assert audit["model_tier"] == "discord_action"
