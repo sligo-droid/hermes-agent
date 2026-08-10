@@ -923,6 +923,7 @@ async def test_preview_send_names_exact_head_when_branch_advances_in_flight(monk
     item, state = _pending_item(ledger)
     old_head = "e" * 40
     ready = dict(state)
+    ready["policy"] = {**ready["policy"], "require_preview": True}
     ready["pr"] = {
         **ready["pr"],
         "url": "https://github.com/acme/example/pull/11",
@@ -942,6 +943,10 @@ async def test_preview_send_names_exact_head_when_branch_advances_in_flight(monk
         expected_revision=state["revision"],
     )
     assert persisted is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Visual QA passed for the old head.",
+    )
     sent = []
 
     class Adapter:
@@ -979,6 +984,15 @@ async def test_preview_send_names_exact_head_when_branch_advances_in_flight(monk
     delivery = ledger.get(item["id"])["preview_delivery"]
     assert delivery["status"] == "cancelled"
     assert delivery["cancelled_reason"] == "pr_head_advanced"
+    assert ledger.preview_delivery_satisfied(item["id"]) is False
+    terminal_callbacks = []
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        owner="watcher-1",
+        on_terminal=lambda _stored: terminal_callbacks.append("terminal"),
+    )
+    assert await watcher._notify_terminal_ready(item["id"]) is False
+    assert terminal_callbacks == []
 
 
 @pytest.mark.asyncio
@@ -1826,6 +1840,44 @@ async def test_pre_closeout_failure_delivers_without_impossible_preview(monkeypa
     adapter = SimpleNamespace(
         _send_with_retry=AsyncMock(
             return_value=SimpleNamespace(success=True, message_id="failure-message")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(failed)
+
+    adapter._send_with_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_activated_failure_without_preview_delivers_blocker(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, state = _pending_item(ledger)
+    failed_state = dict(state)
+    failed_state["status"] = "repair_required"
+    failed_state["next_due_at"] = None
+    failed_state["policy"] = {**failed_state["policy"], "require_preview": True}
+    persisted = ledger.update_closeout(
+        item["id"],
+        failed_state,
+        expected_revision=state["revision"],
+    )
+    assert persisted is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Closeout failed before Vercel produced a preview.",
+        summary_status="Blocked",
+    )
+    failed = ledger.get(item["id"])
+    assert ledger.preview_delivery_satisfied(item["id"]) is True
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="activated-failure")
         )
     )
     runner.adapters = {Platform.DISCORD: adapter}

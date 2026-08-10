@@ -4937,10 +4937,27 @@ class GatewayWorkLedger:
             return True
         delivery = item.get("preview_delivery") if isinstance(item.get("preview_delivery"), dict) else {}
         if not delivery or not _preview_delivery_matches_closeout(item, delivery):
-            # Failures before a PR/preview exists have no preview obligation to
-            # order before their error response. Exact-head ready previews are
-            # persisted with a matching delivery in the same ledger write.
-            return True
+            activated = (
+                item.get("closeout_authoritative") is True
+                or item.get("closeout_activated_at") is not None
+            )
+            if not activated:
+                # Failures before closeout activation have no preview
+                # obligation to order before their error response.
+                return True
+            preview = closeout.get("preview") if isinstance(closeout.get("preview"), dict) else {}
+            closeout_status = str(closeout.get("status") or "")
+            preview_status = str(preview.get("status") or "")
+            if (
+                closeout_status in {"blocked", "repair_required"}
+                and preview_status not in {"pending", "ready"}
+            ):
+                # Deterministic activation failures that never produced a
+                # preview must still report their blocker.
+                return True
+            # A successful or reopened activated closeout with a stale/missing
+            # current-head delivery must wait for the replacement preview.
+            return False
         return str(delivery.get("status") or "") == "completed"
 
     def pending_preview_deliveries(self, *, limit: int = 20) -> list[dict[str, Any]]:
