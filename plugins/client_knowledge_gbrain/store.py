@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DB_RELATIVE_PATH = "client-knowledge/intake.db"
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_SECONDS = 300.0
 SYNTHESIS_ITEM_CAPTURE_TIMEOUT_SECONDS = 15 * 60
@@ -1073,6 +1073,43 @@ class IntakeStore:
                         "VALUES('schema_version', '12')"
                     )
                     version = 12
+                if version < 13:
+                    conn.execute(
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_synthesis_item_publications (
+                            item_id TEXT PRIMARY KEY REFERENCES client_knowledge_synthesis_items(item_id) ON DELETE CASCADE,
+                            synthesis_id TEXT NOT NULL REFERENCES client_knowledge_syntheses(synthesis_id) ON DELETE CASCADE,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            synthesis_version TEXT NOT NULL,
+                            content_sha256 TEXT NOT NULL,
+                            branch_ref TEXT NOT NULL,
+                            expected_head TEXT NOT NULL,
+                            commit_sha TEXT,
+                            state TEXT NOT NULL,
+                            manifest_json TEXT NOT NULL,
+                            error_class TEXT,
+                            sync_verified INTEGER NOT NULL DEFAULT 0,
+                            updated_at REAL NOT NULL
+                        )"""
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS client_knowledge_synthesis_item_publications_synthesis_idx "
+                        "ON client_knowledge_synthesis_item_publications(synthesis_id, state, updated_at)"
+                    )
+                    now = time.time()
+                    conn.execute(
+                        "UPDATE jobs SET status='queued', attempt_count=0, next_retry_at=NULL, "
+                        "last_error_class=NULL, updated_at=? WHERE stage='synthesized' "
+                        "AND status IN ('failed','operator_blocked') AND EXISTS ("
+                        "SELECT 1 FROM client_knowledge_syntheses AS syntheses "
+                        "JOIN client_knowledge_synthesis_items AS items USING(synthesis_id) "
+                        "WHERE syntheses.artifact_id=jobs.artifact_id AND items.state='approved')",
+                        (now,),
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '13')"
+                    )
+                    version = 13
                 if version != CURRENT_SCHEMA_VERSION:
                     raise RuntimeError(f"unsupported client knowledge schema version {version}")
                 conn.commit()
@@ -1560,7 +1597,8 @@ class IntakeStore:
             "AND (next_retry_at IS NULL OR next_retry_at<=?) "
             "AND NOT EXISTS ("
             "SELECT 1 FROM jobs blocker WHERE blocker.artifact_id=jobs.artifact_id "
-            "AND blocker.stage IN ('needs_mapping','needs_review') "
+            "AND (blocker.stage='needs_mapping' OR "
+            "(blocker.stage='needs_review' AND jobs.stage!='synthesized')) "
             "AND blocker.status!='succeeded' AND blocker.job_id!=jobs.job_id"
             ") "
             "AND ("
@@ -2094,6 +2132,12 @@ class IntakeStore:
         ).fetchone() is not None:
             raise ValueError("synthesis already has publication state")
         if conn.execute(
+            "SELECT 1 FROM client_knowledge_synthesis_item_publications "
+            "WHERE synthesis_id=? LIMIT 1",
+            (synthesis_id,),
+        ).fetchone() is not None:
+            raise ValueError("synthesis items already have publication state")
+        if conn.execute(
             "SELECT 1 FROM stage_receipts WHERE artifact_id=? AND stage='synthesized' LIMIT 1",
             (synthesis["artifact_id"],),
         ).fetchone() is not None:
@@ -2616,7 +2660,19 @@ class IntakeStore:
             ).rowcount == 1
 
     @staticmethod
+    def _queue_synthesis_publication_locked(
+        conn: sqlite3.Connection, artifact_id: str, *, now: float
+    ) -> None:
+        conn.execute(
+            "UPDATE jobs SET status='queued', attempt_count=0, next_retry_at=NULL, "
+            "last_error_class=NULL, updated_at=? WHERE artifact_id=? AND stage='synthesized' "
+            "AND status IN ('queued','failed','operator_blocked')",
+            (now, artifact_id),
+        )
+
+    @classmethod
     def _release_synthesis_if_resolved_locked(
+        cls,
         conn: sqlite3.Connection, synthesis_id: str, artifact_id: str, *, now: float
     ) -> None:
         unresolved = conn.execute(
@@ -2641,12 +2697,7 @@ class IntakeStore:
             "VALUES(?,?,?,?)",
             (artifact_id, "needs_review", f"synthesis-review:{synthesis_id}:resolved", now),
         )
-        conn.execute(
-            "UPDATE jobs SET status='queued', attempt_count=0, next_retry_at=NULL, "
-            "last_error_class=NULL, updated_at=? WHERE artifact_id=? AND stage='synthesized' "
-            "AND status IN ('queued','failed','operator_blocked')",
-            (now, artifact_id),
-        )
+        cls._queue_synthesis_publication_locked(conn, artifact_id, now=now)
 
     def decide_synthesis_item(
         self,
@@ -2692,6 +2743,10 @@ class IntakeStore:
             ).fetchone()
             if synthesis is None:
                 raise ValueError("synthesis disappeared during item decision")
+            if decision == "approved":
+                self._queue_synthesis_publication_locked(
+                    conn, str(synthesis[0]), now=now
+                )
             self._release_synthesis_if_resolved_locked(
                 conn, str(item[0]), str(synthesis[0]), now=now
             )
@@ -3040,18 +3095,21 @@ class IntakeStore:
             artifact = conn.execute(
                 "SELECT * FROM artifacts WHERE artifact_id=?", (claim.artifact_id,)
             ).fetchone()
-            if synthesis is None or artifact is None or synthesis["state"] != "ready":
-                raise ValueError("synthesis is not ready for publication")
-            unresolved = conn.execute(
-                "SELECT COUNT(*) FROM client_knowledge_synthesis_items WHERE synthesis_id=? "
-                "AND state IN ('pending','instructions_pending')",
-                (synthesis["synthesis_id"],),
-            ).fetchone()[0]
-            if unresolved:
-                raise ValueError("synthesis still has unresolved items")
+            if (
+                synthesis is None
+                or artifact is None
+                or synthesis["state"] not in {"review_pending", "ready"}
+            ):
+                raise ValueError("synthesis is not publishable")
             items = conn.execute(
-                "SELECT * FROM client_knowledge_synthesis_items WHERE synthesis_id=? "
-                "AND state!='superseded' ORDER BY position, revision_number",
+                "SELECT items.*, publications.state AS publication_state, "
+                "publications.commit_sha AS publication_commit_sha, "
+                "publications.sync_verified AS publication_sync_verified, "
+                "publications.updated_at AS publication_updated_at "
+                "FROM client_knowledge_synthesis_items AS items "
+                "LEFT JOIN client_knowledge_synthesis_item_publications AS publications "
+                "USING(item_id) WHERE items.synthesis_id=? "
+                "AND items.state!='superseded' ORDER BY items.position, items.revision_number",
                 (synthesis["synthesis_id"],),
             ).fetchall()
             return self._artifact_from_row(artifact), dict(synthesis), [dict(row) for row in items]
@@ -3328,6 +3386,110 @@ class IntakeStore:
                     old_expected_head,
                     old_manifest_json,
                 ),
+            ).rowcount == 1
+
+    def record_synthesis_item_publication(
+        self,
+        *,
+        item_id: str,
+        synthesis_id: str,
+        artifact_id: str,
+        synthesis_version: str,
+        content_sha256: str,
+        branch_ref: str,
+        expected_head: str,
+        manifest_json: str,
+        state: str,
+        commit_sha: str = "",
+        error_class: str = "",
+    ) -> None:
+        now = time.time()
+        with self._write() as conn:
+            item = conn.execute(
+                "SELECT synthesis_id FROM client_knowledge_synthesis_items WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            if item is None or str(item[0]) != synthesis_id:
+                raise ValueError("synthesis item publication identity is invalid")
+            existing = conn.execute(
+                "SELECT synthesis_id, artifact_id, synthesis_version, content_sha256, branch_ref, "
+                "expected_head, manifest_json, commit_sha, state "
+                "FROM client_knowledge_synthesis_item_publications WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            identity = (
+                synthesis_id, artifact_id, synthesis_version, content_sha256,
+                branch_ref, expected_head, manifest_json,
+            )
+            if existing is not None and tuple(existing[:7]) != identity:
+                raise ValueError("synthesis item publication identity conflicts")
+            if existing is not None and existing[7] and commit_sha and existing[7] != commit_sha:
+                raise ValueError("synthesis item publication commit identity conflicts")
+            allowed = {
+                None: {"prepared", "committed", "cas_succeeded_materialization_blocked"},
+                "prepared": {"prepared", "committed", "cas_succeeded_materialization_blocked"},
+                "cas_succeeded_materialization_blocked": {
+                    "cas_succeeded_materialization_blocked", "committed",
+                },
+                "committed": {"committed"},
+            }
+            previous_state = str(existing[8]) if existing is not None else None
+            if state not in allowed.get(previous_state, set()):
+                raise ValueError("synthesis item publication state transition is invalid")
+            conn.execute(
+                "INSERT INTO client_knowledge_synthesis_item_publications("
+                "item_id, synthesis_id, artifact_id, synthesis_version, content_sha256, branch_ref, "
+                "expected_head, commit_sha, state, manifest_json, error_class, sync_verified, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(item_id) DO UPDATE SET "
+                "commit_sha=COALESCE(client_knowledge_synthesis_item_publications.commit_sha, excluded.commit_sha), "
+                "state=excluded.state, error_class=excluded.error_class, updated_at=excluded.updated_at",
+                (
+                    item_id, synthesis_id, artifact_id, synthesis_version, content_sha256,
+                    branch_ref, expected_head, commit_sha or None, state, manifest_json,
+                    error_class or None, 0, now,
+                ),
+            )
+
+    def get_synthesis_item_publication(self, item_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_synthesis_item_publications WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def reset_prepared_synthesis_item_publication(
+        self,
+        *,
+        item_id: str,
+        old_expected_head: str,
+        old_manifest_json: str,
+        new_expected_head: str,
+        new_manifest_json: str,
+    ) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_item_publications SET expected_head=?, "
+                "manifest_json=?, error_class=NULL, updated_at=? WHERE item_id=? "
+                "AND state='prepared' AND commit_sha IS NULL AND expected_head=? "
+                "AND manifest_json=?",
+                (
+                    new_expected_head, new_manifest_json, now, item_id,
+                    old_expected_head, old_manifest_json,
+                ),
+            ).rowcount == 1
+
+    def mark_synthesis_item_publication_synced(
+        self, item_id: str, *, commit_sha: str
+    ) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_item_publications "
+                "SET sync_verified=1, updated_at=? WHERE item_id=? AND state='committed' "
+                "AND commit_sha=?",
+                (now, item_id, commit_sha),
             ).rowcount == 1
 
     def complete_synthesis(
@@ -4981,6 +5143,32 @@ class IntakeStore:
         now = time.time() if now is None else float(now)
         error_class = _error_class(error_class)
         with self._write() as conn:
+            job = conn.execute(
+                "SELECT artifact_id, stage FROM jobs WHERE job_id=? AND status='running' "
+                "AND claim_token=? AND lease_expires_at>?",
+                (job_id, claim_token, now),
+            ).fetchone()
+            if (
+                job is not None
+                and error_class == "synthesis_items_pending"
+                and job[1] == "synthesized"
+                and conn.execute(
+                    "SELECT 1 FROM client_knowledge_synthesis_items AS items "
+                    "JOIN client_knowledge_syntheses AS syntheses USING(synthesis_id) "
+                    "LEFT JOIN client_knowledge_synthesis_item_publications AS publications USING(item_id) "
+                    "WHERE syntheses.artifact_id=? AND items.state='approved' "
+                    "AND (publications.state IS NULL OR publications.state!='committed' "
+                    "OR publications.sync_verified!=1) LIMIT 1",
+                    (job[0],),
+                ).fetchone() is not None
+            ):
+                return conn.execute(
+                    "UPDATE jobs SET status='queued', claim_token=NULL, owner_pid=NULL, "
+                    "owner_host=NULL, owner_started_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, "
+                    "next_retry_at=NULL, last_error_class=NULL, updated_at=? WHERE job_id=? "
+                    "AND status='running' AND claim_token=? AND lease_expires_at>?",
+                    (now, job_id, claim_token, now),
+                ).rowcount == 1
             cursor = conn.execute(
                 "UPDATE jobs SET status='operator_blocked', claim_token=NULL, owner_pid=NULL, "
                 "owner_host=NULL, owner_started_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, "
@@ -5163,6 +5351,13 @@ class IntakeStore:
                     "GROUP BY state"
                 ).fetchall()
             }
+            item_publications = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) FROM client_knowledge_synthesis_item_publications "
+                    "GROUP BY state"
+                ).fetchall()
+            }
             stages = {
                 str(row[0]): {"total": int(row[1]), "active": int(row[2])}
                 for row in conn.execute(
@@ -5179,6 +5374,7 @@ class IntakeStore:
             "syntheses": syntheses,
             "item_revisions": revisions,
             "publications": publications,
+            "item_publications": item_publications,
             "stage_jobs": stages,
         }
 

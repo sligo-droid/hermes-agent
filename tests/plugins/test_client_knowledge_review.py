@@ -395,14 +395,29 @@ def _record_instruction(store, item_id, **kwargs):
     )
 
 
-def test_partial_resolution_never_releases_and_final_resolution_releases(tmp_path):
+def test_approval_queues_publication_before_final_resolution(tmp_path):
     store, artifact_id = _durable_store(tmp_path)
     assert store.decide_synthesis_item(
         "1" * 64, decision="approved", reviewer_user_id="600",
         reviewer_role_id="300", decision_message_id="500",
     ) is True
     assert store.get_synthesis("s" * 64)["state"] == "review_pending"
-    assert store.get_job("a" * 32)["status"] == "operator_blocked"
+    assert store.get_job("a" * 32)["status"] == "queued"
+    with store._write() as conn:
+        conn.execute(
+            "INSERT INTO stage_receipts(artifact_id, stage, receipt_id, recorded_at) "
+            "VALUES(?,?,?,?)",
+            (artifact_id, "extracted", "extraction:e", time.time()),
+        )
+    claim = store.claim_next(
+        stage="synthesized",
+        spool=SimpleNamespace(storage_id="storage", verify=lambda *_args, **_kwargs: None),
+    )
+    assert claim is not None
+    assert claim.job_id == "a" * 32
+    assert store.block_stage(
+        claim.job_id, claim.claim_token, error_class="synthesis_items_pending"
+    ) is True
     assert store.decide_synthesis_item(
         "2" * 64, decision="rejected", reviewer_user_id="600",
         reviewer_role_id="300", decision_message_id="501",
@@ -410,6 +425,49 @@ def test_partial_resolution_never_releases_and_final_resolution_releases(tmp_pat
     assert store.get_synthesis("s" * 64)["state"] == "ready"
     assert store.get_job("a" * 32)["status"] == "queued"
     assert store.get_synthesis_publication("s" * 64) is None
+
+
+def test_schema_v13_queues_existing_approved_items(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.decide_synthesis_item(
+        "1" * 64, decision="approved", reviewer_user_id="600",
+        reviewer_role_id="300", decision_message_id="500",
+    ) is True
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='operator_blocked', last_error_class='synthesis_items_pending' "
+            "WHERE job_id=?",
+            ("a" * 32,),
+        )
+        conn.execute("DROP TABLE client_knowledge_synthesis_item_publications")
+        conn.execute("UPDATE schema_meta SET value='12' WHERE key='schema_version'")
+    migrated = IntakeStore(store.path)
+    assert migrated.get_job("a" * 32)["status"] == "queued"
+
+
+def test_item_publication_receipt_tracks_commit_and_sync(tmp_path):
+    store, artifact_id = _durable_store(tmp_path)
+    values = {
+        "item_id": "1" * 64,
+        "synthesis_id": "s" * 64,
+        "artifact_id": artifact_id,
+        "synthesis_version": "v1",
+        "content_sha256": "c" * 64,
+        "branch_ref": "refs/heads/main",
+        "expected_head": "head",
+        "manifest_json": '[{"path":"learning"}]',
+    }
+    store.record_synthesis_item_publication(**values, state="prepared")
+    store.record_synthesis_item_publication(
+        **values, state="committed", commit_sha="commit"
+    )
+    assert store.mark_synthesis_item_publication_synced(
+        "1" * 64, commit_sha="commit"
+    ) is True
+    receipt = store.get_synthesis_item_publication("1" * 64)
+    assert receipt["state"] == "committed"
+    assert receipt["commit_sha"] == "commit"
+    assert receipt["sync_verified"] == 1
 
 
 def test_prepared_publication_reset_is_durable_compare_and_swap(tmp_path):

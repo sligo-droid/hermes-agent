@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from plugins.client_knowledge_gbrain.derived import canonical_json
 from plugins.client_knowledge_gbrain.models import IntakeArtifact
 from plugins.client_knowledge_gbrain.publisher import (
     GitSourcePublisher,
@@ -17,6 +18,7 @@ from plugins.client_knowledge_gbrain.publisher import (
 )
 from plugins.client_knowledge_gbrain.store import IntakeStore, JobClaim
 from plugins.client_knowledge_gbrain.synthesis import (
+    SynthesisFailure,
     SynthesisSettings,
     SynthesisWorker,
     render_learning_markdown,
@@ -159,7 +161,7 @@ def test_new_completion_has_no_honcho_or_legacy_complete_stage(tmp_path):
     assert jobs == {"synthesized": "succeeded"}
 
 
-def test_final_resolution_publishes_only_approved_items_atomically(tmp_path, monkeypatch):
+def test_approved_item_publishes_while_another_item_remains_pending(tmp_path, monkeypatch):
     artifact = _artifact()
     root = _repo(tmp_path)
     completed = {}
@@ -176,16 +178,39 @@ def test_final_resolution_publishes_only_approved_items_atomically(tmp_path, mon
 
     class Store:
         def get_synthesis_for_artifact(self, _):
-            return {"state": "ready"}
+            return {"state": "review_pending"}
 
         def get_synthesis_for_publication_claim(self, claim):
-            return artifact, synthesis, [
+            items = [
                 _item("1" * 64, "approved", "Approved statement."),
-                _item("2" * 64, "rejected", "Rejected statement."),
+                _item("2" * 64, "pending", "Pending statement."),
             ]
+            for item in items:
+                publication = published.get(item["item_id"])
+                if publication:
+                    item.update({
+                        "publication_state": publication["state"],
+                        "publication_commit_sha": publication.get("commit_sha"),
+                        "publication_sync_verified": publication.get("sync_verified", 0),
+                        "publication_updated_at": publication.get("updated_at", 0),
+                    })
+            return artifact, synthesis, items
 
-        def record_synthesis_publication(self, **kwargs):
-            published.update(kwargs)
+        def get_synthesis_item_publication(self, item_id):
+            return published.get(item_id)
+
+        def record_synthesis_item_publication(self, **kwargs):
+            published[kwargs["item_id"]] = {**kwargs, "updated_at": time.time(), "sync_verified": 0}
+
+        def reset_prepared_synthesis_item_publication(self, **_kwargs):
+            return False
+
+        def mark_synthesis_item_publication_synced(self, item_id, *, commit_sha):
+            published[item_id].update({
+                "state": "committed", "commit_sha": commit_sha,
+                "sync_verified": 1, "updated_at": time.time(),
+            })
+            return True
 
         def complete_synthesis(self, claim, **kwargs):
             completed.update(kwargs)
@@ -230,7 +255,7 @@ def test_final_resolution_publishes_only_approved_items_atomically(tmp_path, mon
     def capture_publish(self, **kwargs):
         assert len(kwargs["files"]) == 1
         assert b"Approved statement." in kwargs["files"][0].content
-        assert b"Rejected statement." not in kwargs["files"][0].content
+        assert b"Pending statement." not in kwargs["files"][0].content
         return original_publish(self, **kwargs)
 
     monkeypatch.setattr(
@@ -238,8 +263,129 @@ def test_final_resolution_publishes_only_approved_items_atomically(tmp_path, mon
         capture_publish,
     )
     worker = _worker(Store(), Client())
-    worker.process_claim(JobClaim("j" * 32, artifact.artifact_id, "synthesized", "t", 1, "h", 99, 1))
-    assert published["state"] == "committed"
+    with pytest.raises(SynthesisFailure, match="synthesis_items_pending") as exc:
+        worker.process_claim(
+            JobClaim("j" * 32, artifact.artifact_id, "synthesized", "t", 1, "h", 99, 1)
+        )
+    assert exc.value.operator_blocked is True
+    assert published["1" * 64]["state"] == "committed"
+    assert published["1" * 64]["sync_verified"] == 1
+    assert "2" * 64 not in published
+    assert completed == {}
+
+
+def test_v12_aggregate_publication_is_recovered_without_duplicate_commit(tmp_path):
+    artifact = _artifact()
+    root = _repo(tmp_path)
+    item = _item("1" * 64, "approved", "Approved statement.")
+    synthesis = {
+        "synthesis_id": "s" * 64,
+        "synthesis_version": "v1",
+        "output_sha256": "o" * 64,
+        "notion_ref": "notion:page:source",
+    }
+
+    class Client:
+        settings = SimpleNamespace(
+            source_branch="main", source_checkout=root, source_id="client-knowledge",
+            timeout_seconds=10,
+        )
+
+        def assert_source_checkout(self):
+            return root
+
+        def assert_runtime_ready(self):
+            return root
+
+        def sync_no_pull(self):
+            return None
+
+        def parse_markdown(self, _content, *, file_path, expected_slug):
+            assert file_path == f"{expected_slug}.md"
+            return {
+                "errors": [], "slug": expected_slug, "title": "Client learning",
+                "compiled_truth": "Approved statement.", "timeline": "## Timeline",
+            }
+
+        def get_page(self, slug):
+            return {
+                "source_id": "client-knowledge", "slug": slug, "title": "Client learning",
+                "frontmatter": {
+                    "project": "pid", "status": "current", "effective_at": "2026-08-07",
+                    "updated_at": "synthesis-managed", "source_refs": ["notion:page:source"],
+                    "supersedes": [], "confidence": "high", "sensitivity": "internal",
+                },
+                "compiled_truth": "Approved statement.", "timeline": "",
+            }
+
+    content = render_learning_markdown(
+        project_key="pid",
+        statement=item["statement"],
+        evidence=json.loads(item["evidence_json"]),
+        notion_ref=synthesis["notion_ref"],
+        source_artifact_id=artifact.artifact_id,
+        source_date="2026-08-07",
+    )
+    publication_rows = {}
+
+    class Recorder:
+        def record_publication(self, **kwargs):
+            publication_rows.update(kwargs)
+
+        def reset_publication(self, **_kwargs):
+            return False
+
+    with GitSourcePublisher(Client(), project_key="pid", store=Recorder()) as publisher:
+        publication = publisher.publish(
+            artifact_id=artifact.artifact_id,
+            assimilation_id=synthesis["synthesis_id"],
+            assimilation_version=synthesis["synthesis_version"],
+            proposal_sha256=hashlib.sha256(canonical_json([
+                {"item_id": item["item_id"], "item_sha256": item["item_sha256"]}
+            ])).hexdigest(),
+            expected_head=publisher.head(),
+            authored_at=int(artifact.occurred_at),
+            files=[PublicationFile(
+                relative_slug=f"learnings/{synthesis['synthesis_id'][:16]}-{item['item_id'][:16]}",
+                content=content,
+            )],
+            review_id="items:1",
+            trailer_label="Synthesis",
+        )
+    assert publication_rows["state"] == "committed"
+    completed = {}
+
+    class Store:
+        def get_synthesis_for_artifact(self, _artifact_id):
+            return {"state": "ready"}
+
+        def get_synthesis_for_publication_claim(self, _claim):
+            return artifact, synthesis, [item]
+
+        def get_synthesis_publication(self, _synthesis_id):
+            return dict(publication_rows)
+
+        def record_synthesis_publication(self, **kwargs):
+            publication_rows.update(kwargs)
+
+        def reset_prepared_synthesis_publication(self, **_kwargs):
+            return False
+
+        def complete_synthesis(self, _claim, **kwargs):
+            completed.update(kwargs)
+
+    head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, text=True, capture_output=True
+    ).stdout.strip()
+    worker = _worker(Store(), Client())
+    worker.process_claim(
+        JobClaim("j" * 32, artifact.artifact_id, "synthesized", "t", 1, "h", 99, 1)
+    )
+    head_after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, text=True, capture_output=True
+    ).stdout.strip()
+    assert head_before == head_after == publication.commit_sha
+    assert completed["commit_sha"] == publication.commit_sha
     assert completed["sync_verified"] is True
 
 
@@ -261,31 +407,51 @@ def test_sequential_syntheses_use_publication_time_head(tmp_path, monkeypatch):
 
     class Store:
         def __init__(self):
-            self.index = 0
             self.publications = {}
 
         def get_synthesis_for_artifact(self, _):
             return {"state": "ready"}
 
         def get_synthesis_for_publication_claim(self, claim):
-            self.index += 1
+            index = int(claim.job_id[0])
             artifact = IntakeArtifact.from_bytes(
                 project_key="pid", provider_id="gmail",
-                provider_artifact_id=f"message-{self.index}",
-                occurred_at=1786089600, content=f"source-{self.index}".encode(),
+                provider_artifact_id=f"message-{index}",
+                occurred_at=1786089600, content=f"source-{index}".encode(),
             )
-            synthesis_id = str(self.index) * 64
+            synthesis_id = str(index) * 64
+            item = _item(str(index) * 64, "approved", f"Statement {index}.")
+            publication = self.publications.get(item["item_id"])
+            if publication:
+                item.update({
+                    "publication_state": publication["state"],
+                    "publication_commit_sha": publication.get("commit_sha"),
+                    "publication_sync_verified": publication.get("sync_verified", 0),
+                    "publication_updated_at": publication.get("updated_at", 0),
+                })
             return artifact, {
                 "synthesis_id": synthesis_id, "synthesis_version": "v1",
                 "output_sha256": "o" * 64, "notion_ref": "notion:page:source",
                 "base_git_head": "stale",
-            }, [_item(str(self.index) * 64, "approved", f"Statement {self.index}.")]
+            }, [item]
 
-        def get_synthesis_publication(self, synthesis_id):
-            return self.publications.get(synthesis_id)
+        def get_synthesis_item_publication(self, item_id):
+            return self.publications.get(item_id)
 
-        def record_synthesis_publication(self, **kwargs):
-            self.publications[kwargs["synthesis_id"]] = kwargs
+        def record_synthesis_item_publication(self, **kwargs):
+            self.publications[kwargs["item_id"]] = {
+                **kwargs, "sync_verified": 0, "updated_at": time.time(),
+            }
+
+        def reset_prepared_synthesis_item_publication(self, **_kwargs):
+            return False
+
+        def mark_synthesis_item_publication_synced(self, item_id, *, commit_sha):
+            self.publications[item_id].update({
+                "state": "committed", "commit_sha": commit_sha,
+                "sync_verified": 1, "updated_at": time.time(),
+            })
+            return True
 
         def complete_synthesis(self, _claim, **_kwargs):
             return None
