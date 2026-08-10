@@ -127,6 +127,12 @@ def _assert_nonsymlink_directory(path: Path, label: str) -> Path:
 
 def client_knowledge_environment(settings: GBrainSettings) -> dict[str, str]:
     env = {key: os.environ[key] for key in _ENV_ALLOWLIST if os.environ.get(key)}
+    path_entries = [str(settings.executable.parent)]
+    git = shutil.which("git")
+    if git:
+        git_parent = str(Path(git).parent)
+        if git_parent not in path_entries:
+            path_entries.append(git_parent)
     env.update(
         {
             # Pinned GBrain treats GBRAIN_HOME as a parent root and creates
@@ -134,7 +140,7 @@ def client_knowledge_environment(settings: GBrainSettings) -> dict[str, str]:
             # root so no secondary config/cache path can escape the boundary.
             "HOME": str(settings.home),
             "GBRAIN_HOME": str(settings.home),
-            "PATH": str(settings.executable.parent),
+            "PATH": os.pathsep.join(path_entries),
             "LANG": env.get("LANG", "C.UTF-8"),
             "LC_ALL": env.get("LC_ALL", "C.UTF-8"),
             "TZ": env.get("TZ", "UTC"),
@@ -150,7 +156,7 @@ class GBrainClient:
     def __init__(self, settings: GBrainSettings):
         self.settings = settings
 
-    def _run(self, args: list[str]) -> Any:
+    def _run(self, args: list[str], *, allow_plain_success: bool = False) -> Any:
         command = [str(self.settings.executable), *self.settings.args, *args]
         completed = subprocess.run(
             command,
@@ -170,6 +176,8 @@ class GBrainClient:
         try:
             return json.loads(stdout)
         except json.JSONDecodeError as exc:
+            if allow_plain_success and stdout.strip():
+                return {"status": stdout.strip()}
             raise RuntimeError("pinned GBrain returned malformed JSON") from exc
 
     def list_sources(self) -> list[dict[str, Any]]:
@@ -368,7 +376,8 @@ class GBrainClient:
             [
                 "sync", "--source", self.settings.source_id, "--no-pull",
                 "--no-embed", "--yes", "--json",
-            ]
+            ],
+            allow_plain_success=True,
         )
         if not isinstance(result, dict):
             raise RuntimeError("pinned GBrain sync did not return an object")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -110,12 +111,16 @@ def test_allowlisted_environment_excludes_provider_and_host_paths(monkeypatch, t
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("GBRAIN_CHAT_MODEL", "provider:model")
     monkeypatch.setenv("HERMES_HOME", "/real/hermes")
+    monkeypatch.setattr(
+        "plugins.client_knowledge_gbrain.client.shutil.which",
+        lambda name: "/usr/bin/git" if name == "git" else None,
+    )
 
     env = client_knowledge_environment(settings)
 
     assert env["GBRAIN_HOME"] == str(home)
     assert env["HOME"] == str(home)
-    assert env["PATH"] == str(binary.parent)
+    assert env["PATH"].split(os.pathsep) == [str(binary.parent), "/usr/bin"]
     assert "OPENAI_API_KEY" not in env
     assert "GBRAIN_CHAT_MODEL" not in env
     assert "HERMES_HOME" not in env
@@ -216,6 +221,27 @@ def test_keyword_only_requires_db_plane_readback(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="must read back as true"):
         client.assert_keyword_only()
+
+
+def test_sync_accepts_pinned_cli_plain_success(monkeypatch, tmp_path):
+    binary = tmp_path / "bun"
+    binary.write_text("", encoding="utf-8")
+    binary.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    client = GBrainClient(GBrainSettings(binary, home))
+    monkeypatch.setattr(client, "assert_runtime_ready", lambda: None)
+    completed = type(
+        "Completed",
+        (),
+        {"returncode": 0, "stdout": "Already up to date.\n", "stderr": ""},
+    )()
+    monkeypatch.setattr(
+        "plugins.client_knowledge_gbrain.client.subprocess.run",
+        lambda *args, **kwargs: completed,
+    )
+
+    assert client.sync_no_pull() == {"status": "Already up to date."}
 
 
 def test_parse_markdown_invokes_pinned_parser_and_returns_exact_shape(monkeypatch, tmp_path):
