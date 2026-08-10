@@ -741,6 +741,7 @@ def test_schema_v10_history_migrates_to_current_without_rewriting_legacy_rows(tm
              "ev", "lv", "rv", "extracted", "storage", "object", "x" * 64, 1, 1, "{}", now),
         )
         conn.execute("DROP TABLE client_knowledge_synthesis_publications")
+        conn.execute("DROP TABLE client_knowledge_synthesis_item_publications")
         conn.execute("DROP TABLE client_knowledge_synthesis_item_revisions")
         conn.execute("DROP TABLE client_knowledge_synthesis_notifications")
         conn.execute("DROP TABLE client_knowledge_synthesis_items")

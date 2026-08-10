@@ -490,14 +490,65 @@ def _verify_rendered_markdown(
         raise SynthesisFailure("gbrain_markdown_parser_verification_failed", quarantine=True)
 
 
+class _SynthesisItemPublicationRecorder:
+    def __init__(self, store: IntakeStore, *, synthesis_id: str) -> None:
+        self.store = store
+        self.synthesis_id = synthesis_id
+
+    def record_publication(self, **value: Any) -> None:
+        item_id = str(value["assimilation_id"])
+        get_publication = getattr(self.store, "get_synthesis_item_publication", None)
+        existing = get_publication(item_id) if callable(get_publication) else None
+        state = str(value["state"])
+        commit_sha = str(value.get("commit_sha") or "")
+        error_class = str(value.get("error_class") or "")
+        if state == "prepared" and existing is not None and existing["state"] in {
+            "committed", "cas_succeeded_materialization_blocked",
+        }:
+            state = str(existing["state"])
+            commit_sha = str(existing.get("commit_sha") or commit_sha)
+            error_class = str(existing.get("error_class") or error_class)
+        self.store.record_synthesis_item_publication(
+            item_id=item_id,
+            synthesis_id=self.synthesis_id,
+            artifact_id=str(value["artifact_id"]),
+            synthesis_version=str(value["assimilation_version"]),
+            content_sha256=str(value["proposal_sha256"]),
+            branch_ref=str(value["branch_ref"]),
+            expected_head=str(value["expected_head"]),
+            manifest_json=str(value["manifest_json"]),
+            state=state,
+            commit_sha=commit_sha,
+            error_class=error_class,
+        )
+
+    def reset_publication(
+        self,
+        *,
+        assimilation_id: str,
+        old_expected_head: str,
+        old_manifest_json: str,
+        new_expected_head: str,
+        new_manifest_json: str,
+    ) -> bool:
+        return self.store.reset_prepared_synthesis_item_publication(
+            item_id=assimilation_id,
+            old_expected_head=old_expected_head,
+            old_manifest_json=old_manifest_json,
+            new_expected_head=new_expected_head,
+            new_manifest_json=new_manifest_json,
+        )
+
+
 class _SynthesisPublicationRecorder:
+    """Recover publication transactions created before per-item publication."""
+
     def __init__(self, store: IntakeStore) -> None:
         self.store = store
 
     def record_publication(self, **value: Any) -> None:
         synthesis_id = str(value["assimilation_id"])
-        get_publication = getattr(self.store, "get_synthesis_publication", None)
-        existing = get_publication(synthesis_id) if callable(get_publication) else None
+        existing = self.store.get_synthesis_publication(synthesis_id)
         state = str(value["state"])
         commit_sha = str(value.get("commit_sha") or "")
         error_class = str(value.get("error_class") or "")
@@ -715,32 +766,29 @@ class SynthesisWorker:
         self.store.require_synthesis_review(claim, synthesis=row, items=items)
         return synthesis_id
 
-    def _publish(self, claim: JobClaim) -> str:
-        artifact, synthesis, items = self.store.get_synthesis_for_publication_claim(claim)
-        approved = [item for item in items if item["state"] == "approved"]
+    def _publish_legacy_synthesis(
+        self,
+        claim: JobClaim,
+        *,
+        artifact: IntakeArtifact,
+        synthesis: Mapping[str, Any],
+        items: list[Mapping[str, Any]],
+        persisted: Mapping[str, Any],
+    ) -> str:
         if any(item["state"] not in {"approved", "rejected"} for item in items):
-            raise SynthesisFailure("synthesis_review_incomplete", operator_blocked=True)
-        if not approved:
-            self.store.complete_synthesis(
-                claim,
-                synthesis_id=synthesis["synthesis_id"],
-                commit_sha="none",
-                output_sha256=synthesis["output_sha256"],
-                sync_verified=False,
-            )
-            return str(synthesis["synthesis_id"])
+            raise SynthesisFailure("legacy_synthesis_publication_incomplete", operator_blocked=True)
+        approved = [item for item in items if item["state"] == "approved"]
         source_date = time.strftime("%Y-%m-%d", time.gmtime(artifact.occurred_at))
         files: list[PublicationFile] = []
-        expected: dict[str, dict[str, Any]] = {}
+        expected: dict[str, Mapping[str, Any]] = {}
         expected_content: dict[str, bytes] = {}
         for item in approved:
-            evidence = json.loads(item["evidence_json"])
-            relative_slug = _slug_for_item(synthesis["synthesis_id"], item["item_id"])
+            relative_slug = _slug_for_item(str(synthesis["synthesis_id"]), str(item["item_id"]))
             content = render_learning_markdown(
                 project_key=artifact.project_key,
-                statement=item["statement"],
-                evidence=evidence,
-                notion_ref=synthesis["notion_ref"],
+                statement=str(item["statement"]),
+                evidence=json.loads(str(item["evidence_json"])),
+                notion_ref=str(synthesis["notion_ref"]),
                 source_artifact_id=artifact.artifact_id,
                 source_date=source_date,
             )
@@ -755,33 +803,20 @@ class SynthesisWorker:
             expected[full_slug] = item
             expected_content[full_slug] = content
         content_sha = hashlib.sha256(
-            canonical_json(
-                [
-                    {"item_id": item["item_id"], "item_sha256": item["item_sha256"]}
-                    for item in approved
-                ]
-            )
+            canonical_json([
+                {"item_id": item["item_id"], "item_sha256": item["item_sha256"]}
+                for item in approved
+            ])
         ).hexdigest()
         try:
-            get_publication = getattr(self.store, "get_synthesis_publication", None)
-            persisted = (
-                get_publication(synthesis["synthesis_id"])
-                if callable(get_publication)
-                else None
-            )
             with GitSourcePublisher(
                 self.client,
                 project_key=artifact.project_key,
                 store=_SynthesisPublicationRecorder(self.store),
             ) as publisher:
-                expected_head = (
-                    str(persisted["expected_head"])
-                    if persisted is not None
-                    else publisher.head()
-                )
+                expected_head = str(persisted["expected_head"])
                 if (
-                    persisted is not None
-                    and persisted["state"] == "committed"
+                    persisted["state"] == "committed"
                     and str(persisted.get("commit_sha") or "")
                 ):
                     publication = publisher.verify_committed(
@@ -793,8 +828,8 @@ class SynthesisWorker:
                 else:
                     publication = publisher.publish(
                         artifact_id=artifact.artifact_id,
-                        assimilation_id=synthesis["synthesis_id"],
-                        assimilation_version=synthesis["synthesis_version"],
+                        assimilation_id=str(synthesis["synthesis_id"]),
+                        assimilation_version=str(synthesis["synthesis_version"]),
                         proposal_sha256=content_sha,
                         expected_head=expected_head,
                         authored_at=int(artifact.occurred_at),
@@ -825,14 +860,152 @@ class SynthesisWorker:
         )
         return str(synthesis["synthesis_id"])
 
+    def _publish_item(
+        self,
+        *,
+        artifact: IntakeArtifact,
+        synthesis: Mapping[str, Any],
+        item: Mapping[str, Any],
+    ) -> str:
+        source_date = time.strftime("%Y-%m-%d", time.gmtime(artifact.occurred_at))
+        evidence = json.loads(str(item["evidence_json"]))
+        relative_slug = _slug_for_item(str(synthesis["synthesis_id"]), str(item["item_id"]))
+        content = render_learning_markdown(
+            project_key=artifact.project_key,
+            statement=str(item["statement"]),
+            evidence=evidence,
+            notion_ref=str(synthesis["notion_ref"]),
+            source_artifact_id=artifact.artifact_id,
+            source_date=source_date,
+        )
+        full_slug = full_project_slug(artifact.project_key, relative_slug)
+        _verify_rendered_markdown(
+            self.client,
+            full_slug=full_slug,
+            content=content,
+            statement=str(item["statement"]),
+        )
+        files = [PublicationFile(relative_slug=relative_slug, content=content)]
+        content_sha = hashlib.sha256(
+            canonical_json({"item_id": item["item_id"], "item_sha256": item["item_sha256"]})
+        ).hexdigest()
+        try:
+            get_publication = getattr(self.store, "get_synthesis_item_publication", None)
+            persisted = (
+                get_publication(str(item["item_id"]))
+                if callable(get_publication)
+                else None
+            )
+            with GitSourcePublisher(
+                self.client,
+                project_key=artifact.project_key,
+                store=_SynthesisItemPublicationRecorder(
+                    self.store, synthesis_id=str(synthesis["synthesis_id"])
+                ),
+            ) as publisher:
+                expected_head = (
+                    str(persisted["expected_head"])
+                    if persisted is not None
+                    else publisher.head()
+                )
+                if (
+                    persisted is not None
+                    and persisted["state"] == "committed"
+                    and str(persisted.get("commit_sha") or "")
+                ):
+                    publication = publisher.verify_committed(
+                        expected_head=expected_head,
+                        commit_sha=str(persisted["commit_sha"]),
+                        manifest_json=str(persisted["manifest_json"]),
+                        files=files,
+                    )
+                else:
+                    publication = publisher.publish(
+                        artifact_id=artifact.artifact_id,
+                        assimilation_id=str(item["item_id"]),
+                        assimilation_version=str(synthesis["synthesis_version"]),
+                        proposal_sha256=content_sha,
+                        expected_head=expected_head,
+                        authored_at=int(artifact.occurred_at),
+                        files=files,
+                        review_id=f"item:{item['item_id']}",
+                        trailer_label="Synthesis-Item",
+                    )
+        except PublicationFailure as exc:
+            raise SynthesisFailure(exc.error_class, operator_blocked=True) from exc
+        try:
+            self.client.sync_no_pull()
+            _verify_published_pages(
+                self.client,
+                project_key=artifact.project_key,
+                expected={full_slug: item},
+                expected_content={full_slug: content},
+            )
+        except SynthesisFailure:
+            raise
+        except Exception as exc:
+            raise SynthesisFailure("gbrain_sync_failed") from exc
+        if not self.store.mark_synthesis_item_publication_synced(
+            str(item["item_id"]), commit_sha=publication.commit_sha
+        ):
+            raise SynthesisFailure("synthesis_item_sync_receipt_failed", operator_blocked=True)
+        return publication.commit_sha
+
+    def _publish(self, claim: JobClaim) -> str:
+        while True:
+            artifact, synthesis, items = self.store.get_synthesis_for_publication_claim(claim)
+            get_legacy = getattr(self.store, "get_synthesis_publication", None)
+            legacy = (
+                get_legacy(str(synthesis["synthesis_id"]))
+                if callable(get_legacy)
+                else None
+            )
+            if legacy is not None:
+                return self._publish_legacy_synthesis(
+                    claim,
+                    artifact=artifact,
+                    synthesis=synthesis,
+                    items=items,
+                    persisted=legacy,
+                )
+            publishable = [
+                item for item in items
+                if item["state"] == "approved"
+                and not (
+                    item.get("publication_state") == "committed"
+                    and int(item.get("publication_sync_verified") or 0) == 1
+                )
+            ]
+            if publishable:
+                for item in publishable:
+                    self._publish_item(artifact=artifact, synthesis=synthesis, item=item)
+                continue
+            if any(item["state"] not in {"approved", "rejected"} for item in items):
+                raise SynthesisFailure("synthesis_items_pending", operator_blocked=True)
+            committed = sorted(
+                (
+                    item for item in items
+                    if item.get("publication_state") == "committed"
+                    and int(item.get("publication_sync_verified") or 0) == 1
+                ),
+                key=lambda item: float(item.get("publication_updated_at") or 0),
+            )
+            commit_sha = str(committed[-1]["publication_commit_sha"]) if committed else "none"
+            self.store.complete_synthesis(
+                claim,
+                synthesis_id=synthesis["synthesis_id"],
+                commit_sha=commit_sha,
+                output_sha256=synthesis["output_sha256"],
+                sync_verified=bool(committed),
+            )
+            return str(synthesis["synthesis_id"])
+
     def process_claim(self, claim: JobClaim) -> str:
         if claim.stage != "synthesized":
             raise SynthesisFailure("synthesis_wrong_stage", quarantine=True)
         existing = self.store.get_synthesis_for_artifact(claim.artifact_id)
         if existing is not None:
-            if existing["state"] == "review_pending":
-                raise SynthesisFailure("synthesis_items_pending", operator_blocked=True)
-            if existing["state"] == "ready":
+            if existing["state"] in {"review_pending", "ready"}:
                 return self._publish(claim)
             if existing["state"] == "complete":
                 return str(existing["synthesis_id"])
