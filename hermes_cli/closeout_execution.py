@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from agent.execution_guard import ExecutionGuardExpired
 from hermes_cli.github_remote import github_cli_env
@@ -28,7 +29,7 @@ class ClassifiedCommand:
 
 
 class UnsupportedCloseoutCommand(RuntimeError):
-    """Raised before an unrecognized Git or GitHub command can execute."""
+    """Raised before an unrecognized closeout command can execute."""
 
 
 class RemoteMutationUncertain(TimeoutError):
@@ -129,7 +130,29 @@ def classify_closeout_command(args: Sequence[Any]) -> ClassifiedCommand:
             return ClassifiedCommand(CommandEffect.READ_ONLY, "github_api_get")
         raise UnsupportedCloseoutCommand("unsupported GitHub CLI command")
 
-    raise UnsupportedCloseoutCommand("closeout commands must use Git or GitHub CLI")
+    if executable == "vercel":
+        if (
+            len(tokens) == 4
+            and tokens[1].lower() == "inspect"
+            and tokens[3] == "--json"
+        ):
+            parsed = urlsplit(tokens[2])
+            hostname = str(parsed.hostname or "").lower()
+            if (
+                parsed.scheme == "https"
+                and hostname.endswith(".vercel.app")
+                and not parsed.username
+                and not parsed.password
+                and parsed.path in {"", "/"}
+                and not parsed.query
+                and not parsed.fragment
+            ):
+                return ClassifiedCommand(CommandEffect.READ_ONLY, "vercel_inspect")
+        raise UnsupportedCloseoutCommand("unsupported Vercel CLI command")
+
+    raise UnsupportedCloseoutCommand(
+        "closeout commands must use Git, GitHub CLI, or bounded Vercel inspection"
+    )
 
 
 def _control_remaining(control: Any | None, requested: float) -> float:

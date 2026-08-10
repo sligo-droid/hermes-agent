@@ -13,8 +13,6 @@ access:
   exact_applications:
     - domain: claw.sligolabs.com
       action: allow
-    - domain: pid.sligolabs.com
-      action: allow
 
   # Keep these entries aligned with the hosts actually used by monitoring and
   # Chronos. Add/remove host-specific entries here; do not broaden their paths.
@@ -51,9 +49,6 @@ tunnels:
         service: port:9119
       - hostname: claw.sligolabs.com
         service: port:8720
-      # Pre-existing unpublished PID ingress; this rollout does not create DNS.
-      - hostname: pid.sligolabs.com
-        service: port:5173
       - service: http_status:404
 
   remote_hermes:

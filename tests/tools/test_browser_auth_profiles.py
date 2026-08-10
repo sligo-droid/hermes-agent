@@ -34,6 +34,16 @@ def _profile_config(env_file):
     }
 
 
+def _preview_profile_config(env_file):
+    config = _profile_config(env_file)
+    profile = config["browser"]["auth_profiles"]["pid_hermes_qa"]
+    profile["origins"] = []
+    profile["origin_patterns"] = [
+        "https://pid-git-*-sligo-labs.vercel.app",
+    ]
+    return config
+
+
 def test_supervisor_prefers_navigated_page_over_initial_blank_target():
     targets = [
         {"targetId": "blank", "type": "page", "url": "about:blank"},
@@ -102,6 +112,73 @@ def test_matching_profiles_returns_only_valid_exact_origin_profiles(
     assert matching_browser_auth_profile_names(
         "https://example.com", config=config
     ) == ()
+
+
+def test_profile_matches_narrow_vercel_preview_origin_pattern(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    secrets = hermes_home / "secrets"
+    secrets.mkdir(parents=True)
+    env_file = secrets / "pid-qa-readonly.env"
+    env_file.write_text(
+        "PID_QA_USERNAME=hermes_qa\nPID_QA_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = _preview_profile_config(env_file)
+
+    preview_origin = (
+        "https://pid-git-discord-action-pid-e3b40e1a059a-"
+        "sligo-labs.vercel.app"
+    )
+    assert matching_browser_auth_profile_names(preview_origin, config=config) == (
+        "pid_hermes_qa",
+    )
+    assert select_browser_auth_profile(preview_origin, config=config).name == (
+        "pid_hermes_qa"
+    )
+    assert matching_browser_auth_profile_names(
+        "https://pid-git-main-other-team.vercel.app", config=config
+    ) == ()
+    assert matching_browser_auth_profile_names(
+        "https://pid-preview-sligo-labs.vercel.app", config=config
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "http://pid-git-*-sligo-labs.vercel.app",
+        "https://*.vercel.app",
+        "https://pid-git-*-example.com:443",
+        "https://pid-git-*-example.com/path",
+        "https://pid-*-*.vercel.app",
+    ],
+)
+def test_profile_rejects_broad_or_invalid_origin_patterns(
+    tmp_path, monkeypatch, pattern
+):
+    hermes_home = tmp_path / ".hermes"
+    secrets = hermes_home / "secrets"
+    secrets.mkdir(parents=True)
+    env_file = secrets / "pid-qa-readonly.env"
+    env_file.write_text(
+        "PID_QA_USERNAME=hermes_qa\nPID_QA_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = _preview_profile_config(env_file)
+    config["browser"]["auth_profiles"]["pid_hermes_qa"]["origin_patterns"] = [
+        pattern
+    ]
+
+    with pytest.raises(BrowserAuthProfileError, match="origin pattern"):
+        select_browser_auth_profile(
+            "https://pid-preview-sligo-labs.vercel.app",
+            requested_name="pid_hermes_qa",
+            config=config,
+        )
 
 
 def test_navigation_auth_hint_is_limited_to_matching_sign_in_pages(monkeypatch):
@@ -181,18 +258,24 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
         if method == "Runtime.evaluate" and params.get("expression") == "globalThis":
             return {"result": {"result": {"objectId": "global-1"}}}
         if method == "Runtime.evaluate":
-            value = (
-                True
-                if params.get("expression") == "document.readyState === 'complete'"
-                else submitted
-            )
+            expression = params.get("expression")
+            if expression == "location.origin":
+                return {
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": "https://pid.sligolabs.com",
+                        }
+                    }
+                }
+            value = True if expression == "document.readyState === 'complete'" else submitted
             return {"result": {"result": {"type": "boolean", "value": value}}}
         if method == "Runtime.callFunctionOn":
+            if "expectedOrigin" in params["functionDeclaration"]:
+                return {"result": {"result": {"type": "string", "value": "inserted"}}}
             if "requestSubmit" in params["functionDeclaration"]:
                 submitted = True
             return {"result": {"result": {"type": "boolean", "value": True}}}
-        if method == "Input.insertText":
-            return {"result": {}}
         raise AssertionError(method)
 
     supervisor._cdp = fake_cdp
@@ -204,6 +287,7 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
             password_selector="#login-pass",
             submit_selector="button[type=submit]",
             success_selector="#header",
+            expected_origin="https://pid.sligolabs.com",
             timeout=2,
         )
     finally:
@@ -223,9 +307,17 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
     ]
     assert all("hermes_qa" not in source for source in function_sources)
     assert all("top-secret-password" not in source for source in function_sources)
-    assert [
-        params["text"] for method, params in calls if method == "Input.insertText"
-    ] == ["hermes_qa", "top-secret-password"]
+    insert_arguments = [
+        params["arguments"]
+        for method, params in calls
+        if method == "Runtime.callFunctionOn"
+        and "expectedOrigin" in params["functionDeclaration"]
+    ]
+    assert [arguments[2]["value"] for arguments in insert_arguments] == [
+        "hermes_qa",
+        "top-secret-password",
+    ]
+    assert all(method != "Input.insertText" for method, _params in calls)
     assert "hermes_qa" not in json.dumps(result)
     assert "top-secret-password" not in json.dumps(result)
 
@@ -247,6 +339,14 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
             return {"result": {"result": {"objectId": "global-1"}}}
         if method == "Runtime.evaluate":
             expression = params.get("expression", "")
+            if expression == "location.origin":
+                return {
+                    "result": {
+                        "result": {
+                            "value": "https://pid.sligolabs.com",
+                        }
+                    }
+                }
             if expression == "document.readyState === 'complete'":
                 value = True
             elif expression == "performance.timeOrigin":
@@ -259,12 +359,12 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
                 value = False
             return {"result": {"result": {"value": value}}}
         if method == "Runtime.callFunctionOn":
+            if "expectedOrigin" in params["functionDeclaration"]:
+                return {"result": {"result": {"value": "inserted"}}}
             if "requestSubmit" in params["functionDeclaration"]:
                 submitted = True
                 time_origin = 2000.0
             return {"result": {"result": {"value": True}}}
-        if method == "Input.insertText":
-            return {"result": {}}
         raise AssertionError(method)
 
     supervisor._cdp = fake_cdp
@@ -276,6 +376,7 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
             password_selector="#login-pass",
             submit_selector="button[type=submit]",
             success_selector="#header",
+            expected_origin="https://pid.sligolabs.com",
             timeout=2,
         )
     finally:
@@ -290,6 +391,68 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
             "use a stable local preview without external HMR redirects"
         ),
     }
+    assert "hermes_qa" not in json.dumps(result)
+    assert "top-secret-password" not in json.dumps(result)
+
+
+def test_supervisor_checks_origin_and_inserts_credentials_atomically():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    supervisor = CDPSupervisor(task_id="auth-origin-test", cdp_url="ws://example.test")
+    supervisor._loop = loop
+    supervisor._active = True
+    supervisor._page_session_id = "page-1"
+    calls = []
+
+    async def fake_cdp(method, params=None, **kwargs):
+        calls.append((method, params))
+        if method == "Runtime.evaluate" and params.get("expression") == "globalThis":
+            return {"result": {"result": {"objectId": "global-1"}}}
+        if method == "Runtime.evaluate":
+            expression = params.get("expression", "")
+            if expression == "document.readyState === 'complete'":
+                value = True
+            elif expression == "performance.timeOrigin":
+                value = 1000.0
+            else:
+                value = False
+            return {"result": {"result": {"value": value}}}
+        if method == "Runtime.callFunctionOn":
+            if "expectedOrigin" in params["functionDeclaration"]:
+                arguments = params["arguments"]
+                assert arguments[1]["value"] == "https://pid.sligolabs.com"
+                assert arguments[2]["value"] == "hermes_qa"
+                return {"result": {"result": {"value": "origin_changed"}}}
+            return {"result": {"result": {"value": True}}}
+        raise AssertionError(method)
+
+    supervisor._cdp = fake_cdp
+    try:
+        result = supervisor.authenticate_form(
+            username="hermes_qa",
+            password="top-secret-password",
+            username_selector="#login-user",
+            password_selector="#login-pass",
+            submit_selector="button[type=submit]",
+            success_selector="#header",
+            expected_origin="https://pid.sligolabs.com",
+            timeout=2,
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+    assert result == {
+        "ok": False,
+        "error": "browser origin changed before protected credentials were inserted",
+    }
+    assert all(method != "Input.insertText" for method, _params in calls)
+    assert not any(
+        method == "Runtime.evaluate" and params.get("expression") == "location.origin"
+        for method, params in calls
+    )
     assert "hermes_qa" not in json.dumps(result)
     assert "top-secret-password" not in json.dumps(result)
 

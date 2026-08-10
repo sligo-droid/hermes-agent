@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 from pathlib import Path
@@ -147,9 +148,49 @@ def _completed(args, returncode=0, *, stdout="", stderr=""):
     return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
 
 
-def _preview_run(calls, *, preview_state="success", preview_url="https://example-git-feature.vercel.app"):
+def _preview_run(
+    calls,
+    *,
+    preview_state="success",
+    preview_url="https://example-a1b2c3-acme.vercel.app",
+):
+    branch_url = "https://example-git-feature-test-acme.vercel.app"
+    inspector_url = "https://vercel.com/acme/example/deployment-1"
+    comment_payload = base64.b64encode(
+        json.dumps(
+            {
+                "projects": [
+                    {
+                        "name": "example",
+                        "inspectorUrl": inspector_url,
+                        "previewUrl": branch_url.removeprefix("https://"),
+                        "nextCommitStatus": "DEPLOYED",
+                    }
+                ],
+                "requestReviewUrl": (
+                    "https://vercel.com/vercel-agent/request-review"
+                    "?owner=acme&repo=example&pr=7"
+                ),
+            }
+        ).encode()
+    ).decode()
+
     def run(args, **_kwargs):
         calls.append(args)
+        if args[:2] == ["vercel", "inspect"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": "dpl_deployment-1",
+                        "name": "example",
+                        "url": "example-a1b2c3-acme.vercel.app",
+                        "target": "preview",
+                        "readyState": "READY",
+                        "aliases": ["example-git-feature-test-acme.vercel.app"],
+                    }
+                ),
+            )
         if args[:3] == ["gh", "auth", "status"]:
             return _completed(args)
         if args[:3] == ["gh", "pr", "view"]:
@@ -164,7 +205,9 @@ def _preview_run(calls, *, preview_state="success", preview_url="https://example
                             "sha": HEAD_SHA,
                             "ref": "feature/test",
                             "environment": "Preview",
-                            "creator": {"login": "vercel[bot]"},
+                            "creator": {"login": "vercel[bot]", "type": "Bot"},
+                            "created_at": "2026-07-17T00:00:00Z",
+                            "updated_at": "2026-07-17T00:00:01Z",
                         }
                     ]
                 ),
@@ -173,7 +216,37 @@ def _preview_run(calls, *, preview_state="success", preview_url="https://example
             return _completed(
                 args,
                 stdout=json.dumps(
-                    [{"state": preview_state, "environment_url": preview_url}]
+                    [
+                        {
+                            "state": preview_state,
+                            "environment_url": preview_url,
+                            "creator": {"login": "vercel[bot]", "type": "Bot"},
+                            "created_at": "2026-07-17T00:00:01Z",
+                            "updated_at": "2026-07-17T00:00:01Z",
+                        }
+                    ]
+                ),
+            )
+        if args[:2] == ["gh", "api"] and "/comments?" in args[2]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "user": {"login": "vercel[bot]", "type": "Bot"},
+                            "performed_via_github_app": {
+                                "id": 8329,
+                                "slug": "vercel",
+                            },
+                            "updated_at": "2026-07-17T00:00:02Z",
+                            "body": (
+                                f"[vc]: #signature:{comment_payload}\n"
+                                "[example](https://vercel.com/acme/example) "
+                                f"[Ready]({inspector_url}) "
+                                f"[Preview]({branch_url})"
+                            ),
+                        }
+                    ]
                 ),
             )
         raise AssertionError(args)
@@ -200,7 +273,7 @@ def test_preview_is_published_before_visual_qa_completes(monkeypatch, tmp_path):
         "provider": "vercel",
         "status": "ready",
         "observed_sha": HEAD_SHA,
-        "url": "https://example-git-feature.vercel.app",
+        "url": "https://example-git-feature-test-acme.vercel.app",
         "deployment_id": "42",
     }
     assert not any(args[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for args in calls)
@@ -262,7 +335,7 @@ def test_failed_ci_waits_for_required_preview_before_terminal_repair(monkeypatch
                             "sha": HEAD_SHA,
                             "ref": "feature/test",
                             "environment": "Preview",
-                            "creator": {"login": "vercel[bot]"},
+                            "creator": {"login": "vercel[bot]", "type": "Bot"},
                         }
                     ]
                 ),
