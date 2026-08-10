@@ -497,7 +497,7 @@ async def test_cancelled_remote_mutation_uncertainty_survives_for_next_lease(
         updated = dict(value)
         updated["mutation_uncertainty"] = {
             "status": "uncertain",
-            "operation": "github_pr_merge",
+            "operation": "github_pr_create",
             "at": now,
             "head_sha": "a" * 40,
         }
@@ -521,7 +521,7 @@ async def test_cancelled_remote_mutation_uncertainty_survives_for_next_lease(
     assert stored["closeout"]["status"] == state["status"]
     assert stored["closeout_mutation_uncertainty"] == {
         "status": "uncertain",
-        "operation": "github_pr_merge",
+        "operation": "github_pr_create",
         "at": 100.0,
         "head_sha": "a" * 40,
     }
@@ -547,7 +547,7 @@ async def test_immediate_transition_rearms_same_process_wakeup(monkeypatch, tmp_
 
     def reconcile(value, **_kwargs):
         updated = dict(value)
-        updated["status"] = "ready_pending"
+        updated["status"] = "waiting_for_preview"
         updated["next_due_at"] = 100.0
         return SimpleNamespace(state=updated, wake_immediately=True)
 
@@ -626,8 +626,50 @@ async def test_terminal_closeout_synthesizes_result_for_interrupted_agent_withou
     assert await watcher.run_once() == 1
     stored = ledger.get(item["id"])
     assert stored["status"] == "agent_done"
-    assert stored["final_response"].startswith("Trusted closeout completed")
+    assert stored["final_response"].startswith("PR preview QA completed")
     assert callbacks[0]["id"] == item["id"]
+
+
+@pytest.mark.asyncio
+async def test_preview_ready_callback_runs_before_terminal_closeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    callbacks = []
+    head_sha = "a" * 40
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "waiting_for_gates"
+        updated["next_due_at"] = 130.0
+        updated["policy"] = {**updated["policy"], "require_preview": True}
+        updated["pr"] = {
+            **updated["pr"],
+            "url": "https://github.com/acme/example/pull/7",
+            "head_sha": head_sha,
+        }
+        updated["preview"] = {
+            "provider": "vercel",
+            "status": "ready",
+            "observed_sha": head_sha,
+            "url": "https://example-git-thread.vercel.app",
+            "deployment_id": "42",
+        }
+        return SimpleNamespace(state=updated)
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        on_preview=lambda stored: callbacks.append(stored),
+    )
+
+    assert await watcher.run_once() == 1
+    assert callbacks[0]["preview_delivery"]["status"] == "pending"
+    assert callbacks[0]["preview_delivery"]["preview_url"] == (
+        "https://example-git-thread.vercel.app"
+    )
+    assert ledger.get(item["id"])["closeout"]["status"] == "waiting_for_gates"
 
 
 @pytest.mark.asyncio
@@ -987,13 +1029,6 @@ async def test_same_process_notify_wakes_forever_loop(monkeypatch, tmp_path):
         ("poll_seconds", 5000, "poll_seconds", 3600.0),
         ("lease_seconds", False, "lease_seconds", 120.0),
         ("lease_seconds", "2.5", "lease_seconds", 2.5),
-        ("green_unmerged_overdue_seconds", -1, "green_unmerged_overdue_seconds", 0.0),
-        (
-            "green_unmerged_overdue_seconds",
-            99 * 24 * 3600,
-            "green_unmerged_overdue_seconds",
-            30 * 24 * 3600.0,
-        ),
         ("max_concurrency", None, "max_concurrency", 2),
         ("max_concurrency", True, "max_concurrency", 2),
         ("max_concurrency", "bad", "max_concurrency", 2),

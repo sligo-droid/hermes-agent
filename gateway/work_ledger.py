@@ -81,7 +81,15 @@ _FULL_RECORD_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _TOMBSTONE_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _COMPACTION_INTERVAL_SECONDS = 60 * 60
 _QUIESCENT_CLOSEOUT_STATUSES = frozenset(
-    {"completed", "not_required", "pr_open", "post_merge_complete", "blocked", "repair_required"}
+    {
+        "completed",
+        "not_required",
+        "pr_open",
+        "pr_published",
+        "post_merge_complete",
+        "blocked",
+        "repair_required",
+    }
 )
 _REQUIRED_ASYNC_RECOVERY_STATUSES = frozenset(
     {
@@ -196,6 +204,46 @@ def _bounded_delivery_message_ids(
     ):
         normalized.append(primary_text)
     return tuple(normalized)
+
+
+def _sync_closeout_preview_delivery(
+    item: dict[str, Any],
+    closeout: Mapping[str, Any],
+    *,
+    now: float,
+) -> None:
+    """Create one durable delivery obligation for an exact-head preview URL."""
+
+    preview = closeout.get("preview") if isinstance(closeout.get("preview"), Mapping) else {}
+    pr = closeout.get("pr") if isinstance(closeout.get("pr"), Mapping) else {}
+    if (
+        str(preview.get("status") or "") != "ready"
+        or not str(preview.get("url") or "").startswith("https://")
+        or not str(pr.get("url") or "").startswith("https://")
+        or str(preview.get("observed_sha") or "") != str(pr.get("head_sha") or "")
+    ):
+        return
+    identity = {
+        "preview_url": str(preview.get("url") or "")[:1200],
+        "pr_url": str(pr.get("url") or "")[:1200],
+        "head_sha": str(preview.get("observed_sha") or "")[:64],
+    }
+    current = item.get("preview_delivery") if isinstance(item.get("preview_delivery"), dict) else {}
+    if all(str(current.get(key) or "") == value for key, value in identity.items()):
+        return
+    item["preview_delivery"] = {
+        **identity,
+        "status": "pending",
+        "revision": 1,
+        "owner": "",
+        "lease_until": None,
+        "attempt_count": 0,
+        "send_started_at": None,
+        "send_confirmed_at": None,
+        "result_message_id": None,
+        "confirmed_message_ids": [],
+        "created_at": now,
+    }
 
 
 def _discord_thread_key(item: Any) -> tuple[str, str, str, str] | None:
@@ -1557,40 +1605,6 @@ def _canonical_sync_explicitly_not_required(item: dict[str, Any]) -> bool:
     return requirements.get("canonical_sync") is False
 
 
-def _authoritative_canonical_sync_verified(item: dict[str, Any]) -> bool:
-    """Return whether trusted closeout proves the exact canonical merge SHA."""
-
-    closeout = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
-    policy = closeout.get("policy") if isinstance(closeout.get("policy"), dict) else {}
-    requirements = (
-        policy.get("post_merge_requirements")
-        if isinstance(policy.get("post_merge_requirements"), dict)
-        else {}
-    )
-    post_merge = (
-        closeout.get("post_merge")
-        if isinstance(closeout.get("post_merge"), dict)
-        else {}
-    )
-    receipt = (
-        post_merge.get("canonical_sync")
-        if isinstance(post_merge.get("canonical_sync"), dict)
-        else {}
-    )
-    pr = closeout.get("pr") if isinstance(closeout.get("pr"), dict) else {}
-    target_sha = str(post_merge.get("target_sha") or "").strip().lower()
-    return bool(
-        item.get("closeout_authoritative") is True
-        and closeout.get("mode") == "enforce"
-        and closeout.get("status") == "post_merge_complete"
-        and requirements.get("canonical_sync") is True
-        and _CLOSEOUT_SHA_RE.fullmatch(target_sha)
-        and str(pr.get("merge_sha") or "").strip().lower() == target_sha
-        and receipt.get("status") == "passed"
-        and str(receipt.get("observed_sha") or "").strip().lower() == target_sha
-    )
-
-
 def _is_canonical_checkout_only_gap(text: str, match: re.Match[str]) -> bool:
     """Return whether a runtime-gap match concerns only the local checkout."""
 
@@ -1619,13 +1633,6 @@ def _incomplete_final_markers(text: str, item: dict[str, Any] | None = None) -> 
             if reason == "runtime_not_synced" and _is_explicitly_healthy_runtime_match(match):
                 continue
             if reason == "runtime_not_synced" and _is_preserved_protected_checkout_gap(text, match):
-                continue
-            if (
-                reason == "runtime_not_synced"
-                and isinstance(item, dict)
-                and _authoritative_canonical_sync_verified(item)
-                and _is_canonical_checkout_only_gap(text, match)
-            ):
                 continue
             if (
                 reason == "runtime_not_synced"
@@ -3675,22 +3682,6 @@ class GatewayWorkLedger:
             normalized_source = str(
                 source or existing.get("source") or "direct"
             ).strip().lower()
-            if (
-                normalized_source in {"direct", "fable", "opus"}
-                and str(canonical_path or "").strip()
-                and _repo_backed_discord_item(item)
-                and _delivery_intent_for_item(item) == "full_lifecycle"
-            ):
-                # A full Discord action lifecycle does not end at the remote
-                # merge.  Persist canonical synchronization as a required
-                # exact-SHA receipt even when an older/default config opted
-                # out; dirty or diverged checkouts then block visibly instead
-                # of being reported as completed while the base checkout lags.
-                resolved_policy = dict(resolved_policy or {})
-                post_merge = resolved_policy.get("post_merge_requirements")
-                post_merge = dict(post_merge) if isinstance(post_merge, dict) else {}
-                post_merge["canonical_sync"] = True
-                resolved_policy["post_merge_requirements"] = post_merge
             state = normalize_closeout_state(
                 {
                     **existing,
@@ -3876,6 +3867,7 @@ class GatewayWorkLedger:
                 int(state.get("revision") or 0) + 1,
             )
             item["closeout"] = state
+            _sync_closeout_preview_delivery(item, state, now=now)
             item.pop("closeout_visual_completion", None)
             item["updated_at"] = now
             self._write(data)
@@ -3973,16 +3965,18 @@ class GatewayWorkLedger:
             existing = item.get("closeout") if isinstance(item.get("closeout"), dict) else None
             if existing is None or int(existing.get("revision") or 0) != int(expected_revision):
                 return None
+            now = self._now()
             state = normalize_closeout_state(closeout_state)
             state["revision"] = int(expected_revision) + 1
             item["closeout"] = state
+            _sync_closeout_preview_delivery(item, state, now=now)
             item.pop("closeout_mutation_uncertainty", None)
             item.pop("closeout_mutation_fence", None)
             if state["mode"] != "enforce":
                 item["closeout_authoritative"] = False
             elif item.get("closeout_activated_at") is not None:
                 item["closeout_authoritative"] = True
-            item["updated_at"] = self._now()
+            item["updated_at"] = now
             self._write(data)
             return dict(state)
 
@@ -4229,6 +4223,7 @@ class GatewayWorkLedger:
             state["lease"] = {"owner": "", "until": None}
             state["revision"] = int(expected_revision) + 1
             item["closeout"] = state
+            _sync_closeout_preview_delivery(item, state, now=now)
             item.pop("closeout_mutation_uncertainty", None)
             item.pop("closeout_mutation_fence", None)
             item["closeout_authoritative"] = state["mode"] == "enforce"
@@ -4374,6 +4369,7 @@ class GatewayWorkLedger:
                 return None
 
             item["closeout"] = state
+            _sync_closeout_preview_delivery(item, state, now=now)
             item["closeout_authoritative"] = state["mode"] == "enforce"
             item.pop("closeout_mutation_uncertainty", None)
             item.pop("closeout_mutation_fence", None)
@@ -4406,97 +4402,6 @@ class GatewayWorkLedger:
                 item["updated_at"] = now
             self._write(data)
             return dict(item)
-
-    @_locked_ledger_mutation
-    def repair_successful_closeout_completion(
-        self,
-        work_id: str,
-    ) -> dict[str, Any] | None:
-        """Repair a persisted stale gate from already-terminal trusted closeout."""
-
-        data = self._read()
-        item = data["items"].get(work_id)
-        gate = item.get("completion_gate") if isinstance(item, dict) else None
-        if (
-            not isinstance(item, dict)
-            or not isinstance(gate, dict)
-            or gate.get("allowed_to_complete") is not False
-            or not _authoritative_canonical_sync_verified(item)
-        ):
-            return None
-        if not _refresh_successful_closeout_completion(item, now=self._now()):
-            return None
-        refreshed_gate = item.get("completion_gate")
-        if (
-            not isinstance(refreshed_gate, dict)
-            or refreshed_gate.get("allowed_to_complete") is not True
-        ):
-            return None
-        self._write(data)
-        return dict(item)
-
-    @_locked_ledger_mutation
-    def adopt_observed_direct_closeout(
-        self,
-        work_id: str,
-        closeout_state: dict[str, Any],
-        *,
-        expected_run_state: Any = _RUN_STATE_UNSET,
-    ) -> dict[str, Any] | None:
-        """Adopt a read-only, exact merged-PR observation before delivery.
-
-        A fully observed lifecycle may be terminal immediately, or it may hand
-        the independently reported merge SHA to required post-merge collectors.
-        """
-
-        from hermes_cli.trusted_closeout import (
-            closeout_terminal_eligible,
-            normalize_closeout_state,
-        )
-
-        data = self._read()
-        item = data["items"].get(work_id)
-        if (
-            not isinstance(item, dict)
-            or not _run_state_matches(item, expected_run_state)
-            or item.get("closeout_authoritative") is True
-            or not isinstance(item.get("closeout"), dict)
-        ):
-            return None
-        current = normalize_closeout_state(item["closeout"])
-        state = normalize_closeout_state(closeout_state)
-        head_sha = str(state["pr"].get("head_sha") or "").strip().lower()
-        merge_sha = str(state["pr"].get("merge_sha") or "").strip().lower()
-        pending_exact_post_merge = bool(
-            state["status"] == "post_merge_pending"
-            and state["workspace"] == current["workspace"]
-            and state["policy"] == current["policy"]
-            and state["pr"].get("state") == "MERGED"
-            and _CLOSEOUT_SHA_RE.fullmatch(head_sha)
-            and _CLOSEOUT_SHA_RE.fullmatch(merge_sha)
-            and state["post_merge"].get("target_sha") == merge_sha
-            and state["local_verification"].get("status") == "passed"
-            and state["local_verification"].get("head_sha") == head_sha
-            and state["ci"].get("status") == "passed"
-            and state["ci"].get("head_sha") == head_sha
-            and any(state["policy"]["post_merge_requirements"].values())
-        )
-        if (
-            current["source"] not in {"direct", "fable", "opus"}
-            or state["source"] != current["source"]
-            or state["mode"] != "enforce"
-            or not (closeout_terminal_eligible(state) or pending_exact_post_merge)
-        ):
-            return None
-        state["revision"] = int(current.get("revision") or 0) + 1
-        state["lease_generation"] = int(current.get("lease_generation") or 0)
-        state["lease"] = {"owner": "", "until": None}
-        item["closeout"] = state
-        item["closeout_authoritative"] = True
-        item["closeout_activated_at"] = self._now()
-        item["updated_at"] = item["closeout_activated_at"]
-        self._write(data)
-        return dict(item)
 
     def claim_terminal_delivery(
         self,
@@ -4562,6 +4467,164 @@ class GatewayWorkLedger:
             item["updated_at"] = now
             self._write(data)
             return dict(item)
+
+    def claim_preview_delivery(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        lease_seconds: float = 120.0,
+    ) -> dict[str, Any] | None:
+        """Claim the one preview-ready Discord notification."""
+
+        owner_text = str(owner or "").strip()
+        if not owner_text:
+            return None
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("preview_delivery") if isinstance(item, dict) else None
+            if not isinstance(item, dict) or not isinstance(delivery, dict):
+                return None
+            now = self._now()
+            status = str(delivery.get("status") or "")
+            if status in {"completed", "uncertain"}:
+                return None
+            if status in {"delivering", "sending"} and float(delivery.get("lease_until") or 0) > now:
+                return None
+            if status == "sending":
+                next_delivery = dict(delivery)
+                next_delivery.update(
+                    {
+                        "status": "uncertain",
+                        "owner": "",
+                        "lease_until": None,
+                        "uncertain_at": now,
+                        "uncertain_reason": "send_attempt_outcome_unknown",
+                    }
+                )
+                item["preview_delivery"] = next_delivery
+                item["updated_at"] = now
+                self._write(data)
+                return None
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "delivering",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "owner": owner_text[:160],
+                    "lease_until": now + max(1.0, min(3600.0, float(lease_seconds))),
+                }
+            )
+            item["preview_delivery"] = next_delivery
+            item["updated_at"] = now
+            self._write(data)
+            return dict(item)
+
+    def begin_preview_send_attempt(self, work_id: str, *, owner: str) -> bool:
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("preview_delivery") if isinstance(item, dict) else None
+            now = self._now()
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") != "delivering"
+                or str(delivery.get("owner") or "") != str(owner or "")
+                or float(delivery.get("lease_until") or 0) <= now
+            ):
+                return False
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "sending",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "attempt_count": _positive_int(delivery.get("attempt_count")) + 1,
+                    "send_started_at": now,
+                }
+            )
+            item["preview_delivery"] = next_delivery
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
+    def complete_preview_delivery(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
+    ) -> bool:
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("preview_delivery") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") != "sending"
+                or str(delivery.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            now = self._now()
+            confirmed_ids = _bounded_delivery_message_ids(
+                confirmed_message_ids,
+                primary=result_message_id,
+            )
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "completed",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "owner": "",
+                    "lease_until": None,
+                    "send_confirmed_at": now,
+                    "confirmed_message_ids": list(confirmed_ids),
+                    "result_message_id": confirmed_ids[0] if confirmed_ids else None,
+                }
+            )
+            item["preview_delivery"] = next_delivery
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
+    def fail_preview_delivery(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        uncertain: bool,
+    ) -> bool:
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("preview_delivery") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") not in {"delivering", "sending"}
+                or str(delivery.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            now = self._now()
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "uncertain" if uncertain else "pending",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "owner": "",
+                    "lease_until": None,
+                }
+            )
+            if uncertain:
+                next_delivery["uncertain_at"] = now
+                next_delivery["uncertain_reason"] = "send_attempt_outcome_unknown"
+            item["preview_delivery"] = next_delivery
+            item["updated_at"] = now
+            self._write(data)
+            return True
 
     def begin_terminal_send_attempt(self, work_id: str, *, owner: str) -> bool:
         """Persist the ambiguous send window before invoking the platform side effect."""
@@ -5561,22 +5624,9 @@ class GatewayWorkLedger:
                     or terminal_delivery.get("summary_updated_at") is None
                 )
             )
-            gate = (
-                item.get("completion_gate")
-                if isinstance(item.get("completion_gate"), dict)
-                else {}
-            )
-            stale_successful_closeout = bool(
-                item.get("status") == "blocked"
-                and not terminal_delivery
-                and gate.get("allowed_to_complete") is False
-                and _authoritative_canonical_sync_verified(item)
-                and classify_delivery_completion(item).get("allowed_to_complete") is True
-            )
             if (
                 item.get("status") not in INCOMPLETE_STATUSES
                 and not blocked_delivery_pending
-                and not stale_successful_closeout
             ):
                 continue
             if _required_async_completion_state(item)["owns_recovery"]:

@@ -96,14 +96,14 @@ def test_closeout_repository_overrides_are_generic_and_nested():
             "mode": "shadow",
             "surfaces": {"direct": False, "kanban": True},
             "early_draft_pr": False,
-            "post_merge_requirements": {"ci": False, "restart": False},
+            "preview": {"required": False},
             "repositories": {
                 "acme/pid": {
                     "mode": "enforce",
                     "surfaces": {"direct": True},
                     "early_draft_pr": True,
                     "visual_qa": {"mode": "enforce_explicit"},
-                    "post_merge_requirements": {"ci": True},
+                    "preview": {"required": True},
                 }
             },
         },
@@ -114,10 +114,7 @@ def test_closeout_repository_overrides_are_generic_and_nested():
     assert effective["surfaces"] == {"direct": True, "kanban": True}
     assert effective["early_draft_pr"] is True
     assert effective["visual_qa"] == {"mode": "enforce_explicit"}
-    assert effective["post_merge_requirements"] == {
-        "ci": True,
-        "restart": False,
-    }
+    assert effective["preview"] == {"required": True}
 
 
 def test_action_workspace_origin_overrides_stale_discord_mapping(tmp_path, caplog):
@@ -841,7 +838,7 @@ def test_fable_closeout_compatibility_preserves_legacy_opt_outs():
     )
 
     assert ordinary_mode == "enforce"
-    assert ordinary_policy["merge"] == "auto"
+    assert ordinary_policy["merge"] == "never"
     assert none_mode == "off"
     assert disabled_mode == "off"
     assert pr_mode == "enforce"
@@ -2712,18 +2709,17 @@ async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("initial_request", "expected_merge"),
+    "initial_request",
     [
-        ("Implement and ship this through the normal lifecycle.", "auto"),
-        ("Implement this and open a PR only; do not merge it.", "never"),
+        "Implement and ship this through the normal lifecycle.",
+        "Implement this and open a PR only; do not merge it.",
     ],
 )
 @pytest.mark.parametrize("fable_implementation", [False, True])
-async def test_direct_closeout_policy_preserves_pr_lifecycle_intent(
+async def test_direct_closeout_policy_always_publishes_without_merging(
     tmp_path,
     monkeypatch,
     initial_request,
-    expected_merge,
     fable_implementation,
 ):
     canonical_root = tmp_path / "canonical"
@@ -2782,7 +2778,7 @@ async def test_direct_closeout_policy_preserves_pr_lifecycle_intent(
         "fable" if fable_implementation else "direct"
     )
     assert captured["closeout"]["mode"] == "shadow"
-    assert captured["closeout"]["policy"]["merge"] == expected_merge
+    assert captured["closeout"]["policy"]["merge"] == "never"
     assert captured["closeout"]["policy"]["pr_open"] == "after_review_approval"
 
 

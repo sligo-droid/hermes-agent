@@ -1861,8 +1861,10 @@ async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapt
             "goal_status": "done",
             "phase": "complete",
             "pr_url": "https://github.com/acme/hermes-project/pull/44",
+            "pr_state": "OPEN",
             "pr_checks_status": "passed",
-            "pr_merge_state": "CLEAN",
+            "preview_url": "https://hermes-project-thread-44.vercel.app",
+            "preview_status": "ready",
             "terminal_summary_sync_pending": True,
         },
     )
@@ -1883,7 +1885,7 @@ async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapt
     fields = {field.name: field.value for field in edited_embed.fields}
     assert fields["Status"] == "✅ Done"
     assert "Checks: passed" in fields["Concise Outcome"]
-    assert "Deployment: not checked" in fields["Concise Outcome"]
+    assert "Preview: https://hermes-project-thread-44.vercel.app (ready)" in fields["Concise Outcome"]
     assert message.add_reaction.await_args_list[-1].args == ("✅",)
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_summary_sync_pending" not in worker

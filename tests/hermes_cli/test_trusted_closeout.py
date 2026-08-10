@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
 
@@ -28,7 +27,7 @@ def _state(tmp_path: Path, **updates):
             "base_branch": "main",
         },
         "policy": {
-            "merge": "auto",
+            "merge": "never",
             "pr_open": "after_review_approval",
             "require_local_verification": True,
             "require_review": True,
@@ -144,6 +143,93 @@ def _completed(args, returncode=0, *, stdout="", stderr=""):
     return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
 
 
+def _preview_run(calls, *, preview_state="success", preview_url="https://example-git-feature.vercel.app"):
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
+        if args[:2] == ["gh", "api"] and "/deployments?" in args[2]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": 42,
+                            "sha": HEAD_SHA,
+                            "ref": "feature/test",
+                            "environment": "Preview",
+                            "creator": {"login": "vercel[bot]"},
+                        }
+                    ]
+                ),
+            )
+        if args[:2] == ["gh", "api"] and "/deployments/42/statuses?" in args[2]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [{"state": preview_state, "environment_url": preview_url}]
+                ),
+            )
+        raise AssertionError(args)
+
+    return run
+
+
+def test_preview_is_published_before_visual_qa_completes(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["policy"]["require_preview"] = True
+    state["visual_qa"] = {"status": "pending", "head_sha": HEAD_SHA}
+
+    transition = closeout.reconcile_trusted_closeout(
+        state,
+        now=100,
+        run=_preview_run(calls),
+    )
+
+    assert transition.outcome == "waiting_for_gates"
+    assert transition.state["preview"] == {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": HEAD_SHA,
+        "url": "https://example-git-feature.vercel.app",
+        "deployment_id": "42",
+    }
+    assert not any(args[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for args in calls)
+
+    completed = dict(transition.state)
+    completed["visual_qa"] = {"status": "passed", "head_sha": HEAD_SHA}
+    final = closeout.reconcile_trusted_closeout(
+        completed,
+        now=130,
+        run=_preview_run(calls),
+    )
+
+    assert final.outcome == "pr_published"
+    assert closeout.closeout_terminal_eligible(final.state) is True
+    assert not any(args[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for args in calls)
+
+
+def test_failed_vercel_preview_requires_repair(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["policy"]["require_preview"] = True
+
+    transition = closeout.reconcile_trusted_closeout(
+        state,
+        now=100,
+        run=_preview_run([], preview_state="failure", preview_url=""),
+    )
+
+    assert transition.outcome == "repair_required"
+    assert transition.state["preview"]["status"] == "failed"
+
+
 def _raw_required_check(
     workflow,
     name,
@@ -231,7 +317,7 @@ def test_normalize_closeout_state_is_bounded_and_additive(tmp_path):
 
     assert state["schema_version"] == 1
     assert state["mode"] == "off"
-    assert state["policy"]["merge"] == "auto"
+    assert state["policy"]["merge"] == "never"
     assert state["policy"]["post_merge_requirements"]["deployment"] is True
     assert len(state["errors"]) == 8
     assert "secret" not in state["errors"][0]["message"]
@@ -725,67 +811,7 @@ def test_initial_identity_api_failure_is_retryable_with_durable_error(monkeypatc
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
 
 
-def test_premerge_identity_api_failure_is_retryable_with_durable_error(
-    monkeypatch,
-    tmp_path,
-):
-    _patch_repo_boundary(monkeypatch)
-    raw_basic, basic_run = _raw_required_check("Basic Tests", "basic", "101")
-    raw_body, body_run = _raw_required_check("PR Body Format", "pr body", "202")
-    check_runs_calls = 0
-    calls = []
-
-    def run(args, **_kwargs):
-        nonlocal check_runs_calls
-        calls.append(args)
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(
-                args,
-                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
-            )
-        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
-            check_runs_calls += 1
-            if check_runs_calls == 2:
-                return _completed(
-                    args,
-                    returncode=403,
-                    stderr="password=should-not-persist identity endpoint denied",
-                )
-            return _completed(
-                args,
-                stdout=json.dumps({"check_runs": [basic_run, body_run]}),
-            )
-        if args[:2] == ["gh", "api"] and "/actions/runs/" in args[2]:
-            run_id = args[2].rsplit("/", 1)[-1]
-            path = {
-                "101": ".github/workflows/tests.yml",
-                "202": ".github/workflows/pr-body-format.yml",
-            }[run_id]
-            return _completed(
-                args,
-                stdout=json.dumps({"path": path, "head_sha": HEAD_SHA}),
-            )
-        raise AssertionError(args)
-
-    transition = closeout.reconcile_trusted_closeout(
-        _state(tmp_path),
-        now=100,
-        run=run,
-    )
-
-    assert transition.outcome == "pending"
-    assert transition.next_due_at == 130
-    error = transition.state["errors"][-1]
-    assert error["code"] == "premerge_required_check_identity_failed"
-    assert "should-not-persist" not in error["message"]
-    assert len(error["message"]) <= 600
-    assert transition.state["pr"]["merge_attempted_head_sha"] == ""
-    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
-
-
-def test_default_command_budget_reaches_merge_after_maximum_identity_lookups(
+def test_default_command_budget_reaches_publication_after_maximum_identity_lookups(
     monkeypatch,
     tmp_path,
 ):
@@ -841,8 +867,6 @@ def test_default_command_budget_reaches_merge_after_maximum_identity_lookups(
                     {"path": workflow_paths[run_id], "head_sha": HEAD_SHA}
                 ),
             )
-        if args[:3] == ["gh", "pr", "merge"]:
-            return _completed(args)
         raise AssertionError(args)
 
     transition = closeout.reconcile_trusted_closeout(
@@ -851,13 +875,11 @@ def test_default_command_budget_reaches_merge_after_maximum_identity_lookups(
         run=run,
     )
 
-    assert transition.outcome == "pending"
-    assert transition.wake_immediately is True
+    assert transition.outcome == "pr_published"
+    assert transition.terminal is True
     assert transition.state["errors"] == []
-    assert len(calls) == 24
-    merge_calls = [args for args in calls if args[:3] == ["gh", "pr", "merge"]]
-    assert len(merge_calls) == 1
-    assert merge_calls[0][-2:] == ["--match-head-commit", HEAD_SHA]
+    assert len(calls) == 12
+    assert not any(args[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for args in calls)
 
 
 def test_command_budget_exhaustion_is_retryable_error_not_ci_wait(monkeypatch, tmp_path):
@@ -1042,7 +1064,7 @@ def test_shadow_never_readies_or_merges(monkeypatch, tmp_path):
         run=run,
     )
 
-    assert draft.outcome == "ready_pending"
+    assert draft.outcome == "pr_published"
     assert closeout.closeout_terminal_eligible(draft.state) is False
     assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
@@ -1057,18 +1079,18 @@ def test_shadow_never_readies_or_merges(monkeypatch, tmp_path):
             return _completed(args, stdout=json.dumps(_pr_payload()))
         raise AssertionError(args)
 
-    merge = closeout.reconcile_trusted_closeout(
+    published = closeout.reconcile_trusted_closeout(
         _state(tmp_path, mode="shadow"),
         now=101,
         run=run_ready,
     )
 
-    assert merge.outcome == "pending"
-    assert closeout.closeout_terminal_eligible(merge.state) is False
+    assert published.outcome == "pr_published"
+    assert closeout.closeout_terminal_eligible(published.state) is False
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
 
 
-def test_draft_becomes_ready_only_after_current_head_gates(monkeypatch, tmp_path):
+def test_draft_remains_draft_after_current_head_gates(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
     _patch_identity_passthrough(monkeypatch)
     calls = []
@@ -1079,18 +1101,15 @@ def test_draft_becomes_ready_only_after_current_head_gates(monkeypatch, tmp_path
             return _completed(args)
         if args[:3] == ["gh", "pr", "view"]:
             return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
-        if args[:3] == ["gh", "pr", "ready"]:
-            return _completed(args)
         raise AssertionError(args)
 
     transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
 
-    assert transition.outcome == "ready_pending"
-    assert transition.next_due_at == 100
-    assert transition.wake_immediately is True
-    assert transition.state["pr"]["is_draft"] is False
-    assert transition.state["pr"]["ready_at"] == 100
-    assert sum(args[:3] == ["gh", "pr", "ready"] for args in calls) == 1
+    assert transition.outcome == "pr_published"
+    assert transition.terminal is True
+    assert transition.state["pr"]["is_draft"] is True
+    assert transition.state["pr"]["ready_at"] is None
+    assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
 
 
@@ -1112,13 +1131,11 @@ def test_external_repo_without_hermes_workflows_does_not_wait_for_impossible_che
             return _completed(args)
         if args[:3] == ["gh", "pr", "view"]:
             return _completed(args, stdout=json.dumps(_pr_payload(draft=True, checks=[])))
-        if args[:3] == ["gh", "pr", "ready"]:
-            return _completed(args)
         raise AssertionError(args)
 
     transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
 
-    assert transition.outcome == "ready_pending"
+    assert transition.outcome == "pr_published"
     assert transition.state["ci"] == {
         "head_sha": HEAD_SHA,
         "status": "passed",
@@ -1127,8 +1144,8 @@ def test_external_repo_without_hermes_workflows_does_not_wait_for_impossible_che
         "wait_state": "not_required",
         "required": [],
     }
-    assert transition.state["pr"]["is_draft"] is False
-    assert any(args[:3] == ["gh", "pr", "ready"] for args in calls)
+    assert transition.state["pr"]["is_draft"] is True
+    assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
 
 
 @pytest.mark.parametrize("visual_status", ["pending", "stale", "failed"])
@@ -1157,87 +1174,6 @@ def test_incomplete_visual_gate_never_readies_or_merges(
     assert transition.terminal is False
     assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
-
-
-def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path):
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    calls = []
-
-    def run_open(args, **_kwargs):
-        calls.append(args)
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(args, stdout=json.dumps(_pr_payload()))
-        if args[:3] == ["gh", "pr", "merge"]:
-            return _completed(args)
-        raise AssertionError(args)
-
-    first = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run_open)
-
-    assert first.outcome == "pending"
-    assert first.next_due_at == 100
-    assert first.state["pr"]["merge_attempted_head_sha"] == HEAD_SHA
-    assert first.state["telemetry"]["green_unmerged_since"] == 100
-    merge_calls = [args for args in calls if args[:3] == ["gh", "pr", "merge"]]
-    assert len(merge_calls) == 1
-    assert merge_calls[0][-2:] == ["--match-head-commit", HEAD_SHA]
-    assert sum(args[:3] == ["gh", "pr", "view"] for args in calls) == 2
-
-    sync_record = tmp_path / "canonical-sync-record.json"
-
-    def run_merged(args, **_kwargs):
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(
-                args,
-                stdout=json.dumps(_pr_payload(state="MERGED", merge_sha=MERGE_SHA)),
-            )
-        raise AssertionError(args)
-
-    def sync(path, branch, sha, *, control):
-        assert control.mutation_allowed()
-        sync_record.write_text(
-            json.dumps([path, branch, sha, os.getpid()]),
-            encoding="utf-8",
-        )
-        return {"state": "synced", "head": sha, "merge_commit": sha}
-
-    second = closeout.reconcile_trusted_closeout(
-        first.state,
-        now=101,
-        run=run_merged,
-        sync_canonical=sync,
-    )
-
-    assert second.outcome == "post_merge_pending"
-    assert second.state["post_merge"]["target_sha"] == MERGE_SHA
-    assert second.state["canonical_sync"] == {"status": "pending"}
-    assert second.state["telemetry"]["green_unmerged_since"] is None
-    assert second.state["telemetry"]["green_unmerged_overdue"] is False
-    assert not sync_record.exists()
-
-    third = closeout.reconcile_trusted_closeout(
-        second.state,
-        now=102,
-        run=run_merged,
-        sync_canonical=sync,
-    )
-
-    assert third.outcome == "post_merge_complete"
-    assert third.terminal is True
-    assert third.state["canonical_sync"] == {
-        "status": "passed",
-        "observed_sha": MERGE_SHA,
-        "checked_at": 102,
-    }
-    path, branch, sha, child_pid = json.loads(
-        sync_record.read_text(encoding="utf-8")
-    )
-    assert (path, branch, sha) == (str(tmp_path / "canonical"), "main", MERGE_SHA)
-    assert child_pid != os.getpid()
 
 
 def test_uncertain_pr_create_rejects_historical_branch_match(
@@ -1528,350 +1464,7 @@ def test_required_visual_pending_forces_initial_draft_publication(
     assert "--draft" in create
 
 
-def test_uncertain_merge_is_reobserved_before_any_duplicate_mutation(
-    monkeypatch,
-    tmp_path,
-):
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    merge_attempts = 0
-
-    def uncertain_run(args, **_kwargs):
-        nonlocal merge_attempts
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(args, stdout=json.dumps(_pr_payload()))
-        if args[:3] == ["gh", "pr", "merge"]:
-            merge_attempts += 1
-            raise closeout.RemoteMutationUncertain(
-                "github_pr_merge",
-                "command timeout",
-            )
-        raise AssertionError(args)
-
-    first = closeout.reconcile_trusted_closeout(
-        _state(tmp_path),
-        now=100,
-        run=uncertain_run,
-    )
-
-    assert first.outcome == "pending"
-    assert first.state["mutation_uncertainty"] == {
-        "status": "uncertain",
-        "operation": "github_pr_merge",
-        "at": 100,
-        "head_sha": HEAD_SHA,
-    }
-    assert merge_attempts == 1
-
-    def observed_run(args, **_kwargs):
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(
-                args,
-                stdout=json.dumps(
-                    _pr_payload(state="MERGED", merge_sha=MERGE_SHA)
-                ),
-            )
-        if args[:3] == ["gh", "pr", "merge"]:
-            raise AssertionError("merge must not be replayed before re-observation")
-        raise AssertionError(args)
-
-    second = closeout.reconcile_trusted_closeout(
-        first.state,
-        now=101,
-        run=observed_run,
-    )
-
-    assert second.outcome == "post_merge_pending"
-    assert second.state["mutation_uncertainty"] == {"status": "none"}
-    assert second.state["post_merge"]["target_sha"] == MERGE_SHA
-    assert merge_attempts == 1
-
-
-def test_premerge_refresh_accepts_concurrent_external_merge(monkeypatch, tmp_path):
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    calls = []
-    views = iter(
-        [
-            _pr_payload(),
-            _pr_payload(state="MERGED", merge_sha=MERGE_SHA),
-        ]
-    )
-
-    def run(args, **_kwargs):
-        calls.append(args)
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(args, stdout=json.dumps(next(views)))
-        raise AssertionError(args)
-
-    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
-
-    assert transition.outcome == "post_merge_pending"
-    assert transition.terminal is False
-    assert transition.wake_immediately is True
-    assert transition.state["pr"]["state"] == "MERGED"
-    assert transition.state["pr"]["merge_sha"] == MERGE_SHA
-    assert transition.state["post_merge"]["target_sha"] == MERGE_SHA
-    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
-
-
-def test_premerge_head_change_invalidates_gates_and_prevents_merge(monkeypatch, tmp_path):
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    calls = []
-    new_sha = "4" * 40
-    views = iter(
-        [
-            _pr_payload(),
-            _pr_payload(head_sha=new_sha),
-        ]
-    )
-
-    def run(args, **_kwargs):
-        calls.append(args)
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(args, stdout=json.dumps(next(views)))
-        raise AssertionError(args)
-
-    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
-
-    assert transition.outcome == "waiting_for_gates"
-    assert transition.state["pr"]["head_sha"] == new_sha
-    for key in ("local_verification", "review", "visual_qa"):
-        assert transition.state[key] == {"status": "stale"}
-    assert transition.state["pr"]["merge_attempted_head_sha"] == ""
-    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
-
-
-@pytest.mark.parametrize(
-    ("change", "expected_outcome"),
-    [
-        ("closed", "blocked"),
-        ("draft", "ready_pending"),
-        ("mergeability", "blocked"),
-        ("review", "blocked"),
-        ("stale_check", "repair_required"),
-        ("startup_failure", "repair_required"),
-    ],
-)
-def test_same_head_premerge_refresh_reapplies_every_gate_and_prevents_merge(
-    monkeypatch,
-    tmp_path,
-    change,
-    expected_outcome,
-):
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    calls = []
-    second = _pr_payload()
-    if change == "closed":
-        second = _pr_payload(state="CLOSED")
-    elif change == "draft":
-        second = _pr_payload(draft=True)
-    elif change == "mergeability":
-        second = _pr_payload(mergeable="CONFLICTING")
-    elif change == "review":
-        second = _pr_payload(review_decision="CHANGES_REQUESTED")
-    elif change == "stale_check":
-        second = _pr_payload(
-            checks=[
-                _check("Basic Tests", "basic", conclusion="STALE", run=8),
-                _check("PR Body Format", "pr body", run=8),
-            ]
-        )
-    elif change == "startup_failure":
-        second = _pr_payload(
-            checks=[
-                _check("Basic Tests", "basic", conclusion="STARTUP_FAILURE", run=9),
-                _check("PR Body Format", "pr body", run=9),
-            ]
-        )
-    views = iter([_pr_payload(), second])
-
-    def run(args, **_kwargs):
-        calls.append(args)
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(args, stdout=json.dumps(next(views)))
-        raise AssertionError(args)
-
-    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
-
-    assert transition.outcome == expected_outcome
-    assert transition.state["pr"]["head_sha"] == HEAD_SHA
-    assert transition.state["pr"]["merge_attempted_head_sha"] == ""
-    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
-    premerge_view = [args for args in calls if args[:3] == ["gh", "pr", "view"]][-1]
-    requested = premerge_view[premerge_view.index("--json") + 1]
-    assert "mergeable" in requested
-    assert "reviewDecision" in requested
-    assert "statusCheckRollup" in requested
-
-
-def test_reobserved_adapter_fence_uncertainty_clears_after_exact_proof(
-    monkeypatch,
-    tmp_path,
-):
-    from hermes_cli import post_merge_receipts
-
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    observed = tmp_path / "deployment-reobserved"
-
-    def adapter(*, target_sha, reobserve_only, **_kwargs):
-        observed.write_text(str(reobserve_only), encoding="utf-8")
-        return {"status": "passed", "observed_sha": target_sha}
-
-    post_merge_receipts.register_deployment_adapter(
-        "trusted-fenced-reobserve",
-        adapter,
-    )
-    state = _state(tmp_path)
-    state["workspace"]["canonical_path"] = ""
-    state["policy"]["post_merge_requirements"] = {"deployment": True}
-    state["post_merge"] = post_merge_receipts.initialize_post_merge_receipts(
-        state,
-        target_sha=MERGE_SHA,
-    )
-    state["mutation_uncertainty"] = {
-        "status": "uncertain",
-        "operation": "post_merge_deployment",
-        "at": 100,
-        "head_sha": MERGE_SHA,
-    }
-
-    def run(args, **_kwargs):
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(
-                args,
-                stdout=json.dumps(
-                    _pr_payload(state="MERGED", merge_sha=MERGE_SHA)
-                ),
-            )
-        raise AssertionError(args)
-
-    transition = closeout.reconcile_trusted_closeout(
-        state,
-        now=101,
-        run=run,
-        post_merge_config={
-            "repositories": {
-                "acme/example": {
-                    "deployment_adapter": "trusted-fenced-reobserve"
-                }
-            }
-        },
-        mutation_started=lambda *_args: (_ for _ in ()).throw(
-            AssertionError("re-observation must not start a new mutation")
-        ),
-    )
-
-    assert observed.exists(), transition
-    assert observed.read_text(encoding="utf-8") == "True"
-    assert transition.state["mutation_uncertainty"] == {"status": "none"}
-    assert transition.state["post_merge"]["deployment"] == {
-        "status": "passed",
-        "checked_at": 101,
-        "observed_sha": MERGE_SHA,
-    }
-
-
-def test_required_post_merge_receipts_return_distinct_pending_outcome(monkeypatch, tmp_path):
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    state = _state(tmp_path)
-    state["policy"]["post_merge_requirements"] = {"ci": True, "deployment": True}
-
-    def run(args, **_kwargs):
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(
-                args,
-                stdout=json.dumps(_pr_payload(state="MERGED", merge_sha=MERGE_SHA)),
-            )
-        raise AssertionError(args)
-
-    transition = closeout.reconcile_trusted_closeout(
-        state,
-        now=100,
-        run=run,
-        sync_canonical=lambda *_a: {"state": "synced"},
-    )
-
-    assert transition.outcome == "post_merge_pending"
-    assert transition.next_due_at == 100
-    assert transition.wake_immediately is True
-    assert closeout.closeout_terminal_eligible(transition.state) is False
-
-
-@pytest.mark.parametrize(
-    ("receipt_status", "expected_outcome", "error_code"),
-    [
-        ("failed", "repair_required", "post_merge_receipt_failed"),
-        ("blocked", "blocked", "post_merge_receipt_blocked"),
-    ],
-)
-def test_terminal_required_post_merge_receipt_does_not_poll_forever(
-    monkeypatch,
-    tmp_path,
-    receipt_status,
-    expected_outcome,
-    error_code,
-):
-    from hermes_cli import post_merge_receipts
-
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    state = _state(tmp_path)
-    state["policy"]["post_merge_requirements"] = {"deployment": True}
-    state["post_merge"] = post_merge_receipts.initialize_post_merge_receipts(
-        state,
-        target_sha=MERGE_SHA,
-    )
-
-    gathered = dict(state["post_merge"])
-    gathered["deployment"] = {
-        "status": receipt_status,
-        "checked_at": 100,
-        "diagnostic_code": f"deployment_{receipt_status}",
-    }
-    monkeypatch.setattr(
-        post_merge_receipts,
-        "collect_post_merge_receipts",
-        lambda *_args, **_kwargs: gathered,
-    )
-
-    def run(args, **_kwargs):
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(
-                args,
-                stdout=json.dumps(_pr_payload(state="MERGED", merge_sha=MERGE_SHA)),
-            )
-        raise AssertionError(args)
-
-    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
-
-    assert transition.outcome == expected_outcome
-    assert transition.next_due_at is None
-    assert transition.terminal is True
-    assert transition.state["errors"][-1]["code"] == error_code
-
-
-def test_manual_merge_policy_allows_terminal_open_pr(monkeypatch, tmp_path):
+def test_legacy_merge_policy_normalizes_to_terminal_published_pr(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
     _patch_identity_passthrough(monkeypatch)
     state = _state(tmp_path)
@@ -1886,52 +1479,12 @@ def test_manual_merge_policy_allows_terminal_open_pr(monkeypatch, tmp_path):
 
     transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
 
-    assert transition.outcome == "pr_open"
+    assert transition.outcome == "pr_published"
     assert transition.terminal is True
+    assert transition.state["policy"]["merge"] == "never"
     assert transition.state["telemetry"]["green_unmerged_since"] is None
     assert transition.state["telemetry"]["green_unmerged_overdue"] is False
     assert closeout.closeout_terminal_eligible(transition.state) is True
-
-
-def test_green_unmerged_telemetry_starts_immediately_and_becomes_overdue(monkeypatch, tmp_path):
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-
-    def run(args, **_kwargs):
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(
-                args,
-                stdout=json.dumps(_pr_payload(merge_state="UNKNOWN")),
-            )
-        raise AssertionError(args)
-
-    first = closeout.reconcile_trusted_closeout(
-        _state(tmp_path),
-        now=100,
-        run=run,
-        green_unmerged_overdue_seconds=60,
-    )
-
-    assert first.outcome == "waiting_for_mergeability"
-    assert first.wake_immediately is True
-    assert first.next_due_at == 100
-    assert first.state["telemetry"]["green_unmerged_since"] == 100
-    assert first.state["telemetry"]["green_unmerged_overdue"] is False
-
-    second = closeout.reconcile_trusted_closeout(
-        first.state,
-        now=161,
-        run=run,
-        green_unmerged_overdue_seconds=60,
-    )
-
-    assert second.outcome == "waiting_for_mergeability"
-    assert second.wake_immediately is False
-    assert second.next_due_at == 191
-    assert second.state["telemetry"]["green_unmerged_since"] == 100
-    assert second.state["telemetry"]["green_unmerged_overdue"] is True
 
 
 def test_draft_and_incomplete_gates_suppress_green_unmerged_telemetry(monkeypatch, tmp_path):
@@ -1955,7 +1508,6 @@ def test_draft_and_incomplete_gates_suppress_green_unmerged_telemetry(monkeypatc
         state,
         now=100,
         run=run,
-        green_unmerged_overdue_seconds=60,
     )
 
     assert transition.outcome == "waiting_for_gates"
@@ -2009,74 +1561,4 @@ def test_closeout_records_sanitized_git_github_and_transition_spans(monkeypatch,
     assert "https://" not in rendered
     assert "--json" not in rendered
     assert "statusCheckRollup" not in rendered
-    assert transition.state["telemetry"]["last_transition"] == "pr_open"
-
-
-def test_shadow_post_merge_finishes_without_mutating_collectors(monkeypatch, tmp_path):
-    from hermes_cli import post_merge_receipts
-
-    _patch_repo_boundary(monkeypatch)
-    _patch_identity_passthrough(monkeypatch)
-    calls = []
-    post_merge_receipts.register_deployment_adapter(
-        "shadow-forbidden",
-        lambda **_kwargs: calls.append("adapter")
-        or {"status": "passed", "observed_sha": MERGE_SHA},
-    )
-    state = _state(tmp_path, mode="shadow")
-    state["policy"]["post_merge_requirements"] = {
-        "canonical_sync": True,
-        "deployment": True,
-    }
-
-    def run(args, **_kwargs):
-        if args[:3] == ["gh", "auth", "status"]:
-            return _completed(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            return _completed(
-                args,
-                stdout=json.dumps(
-                    _pr_payload(state="MERGED", merge_sha=MERGE_SHA)
-                ),
-            )
-        raise AssertionError(args)
-
-    first = closeout.reconcile_trusted_closeout(state, now=100, run=run)
-    assert first.outcome == "post_merge_pending"
-    second = closeout.reconcile_trusted_closeout(
-        first.state,
-        now=101,
-        run=run,
-        sync_canonical=lambda *_args: (_ for _ in ()).throw(
-            AssertionError("shadow canonical sync")
-        ),
-        post_merge_config={
-            "repositories": {
-                "acme/example": {"deployment_adapter": "shadow-forbidden"}
-            }
-        },
-    )
-
-    assert calls == []
-    assert second.outcome == "post_merge_complete"
-    assert second.state["post_merge"]["canonical_sync"]["status"] == "not_configured"
-    assert second.state["post_merge"]["deployment"]["status"] == "not_configured"
-    assert closeout.closeout_terminal_eligible(second.state) is False
-
-
-def test_existing_post_merge_receipts_must_match_exact_target_sha():
-    state = closeout.normalize_closeout_state(
-        {
-            "mode": "enforce",
-            "status": "post_merge_complete",
-            "policy": {"post_merge_requirements": {"ci": True}},
-            "post_merge": {
-                "target_sha": MERGE_SHA,
-                "ci": {"status": "passed", "observed_sha": HEAD_SHA},
-            },
-        }
-    )
-
-    assert closeout.closeout_terminal_eligible(state) is False
-    state["post_merge"]["ci"]["observed_sha"] = MERGE_SHA
-    assert closeout.closeout_terminal_eligible(state) is True
+    assert transition.state["telemetry"]["last_transition"] == "pr_published"

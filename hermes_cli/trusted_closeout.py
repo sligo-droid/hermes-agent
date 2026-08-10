@@ -61,10 +61,9 @@ def _repo_uses_trusted_required_checks(root: Path) -> bool:
 
 
 CLOSEOUT_MODES = frozenset({"off", "shadow", "enforce"})
-MERGE_POLICIES = frozenset({"auto", "manual", "never"})
 PR_OPEN_POLICIES = frozenset({"after_review_approval", "never"})
 SUCCESS_CLOSEOUT_STATUSES = frozenset(
-    {"completed", "not_required", "pr_open", "post_merge_complete"}
+    {"completed", "not_required", "pr_open", "pr_published"}
 )
 TERMINAL_CLOSEOUT_STATUSES = frozenset(
     {*SUCCESS_CLOSEOUT_STATUSES, "blocked", "repair_required"}
@@ -75,9 +74,7 @@ _PENDING_CLOSEOUT_STATUSES = frozenset(
         "pr_pending",
         "waiting_for_gates",
         "waiting_for_ci",
-        "waiting_for_mergeability",
-        "ready_pending",
-        "post_merge_pending",
+        "waiting_for_preview",
     }
 )
 _SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -95,9 +92,6 @@ _CHECK_RUNS_PER_PAGE = 100
 _MAX_CHECK_RUN_PAGES = 2
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
-CanonicalSync = Callable[[str, str, str], Any]
-
-
 @dataclass(frozen=True)
 class CloseoutTransition:
     """Result of one bounded reconciliation pass."""
@@ -250,6 +244,24 @@ def _normalize_post_merge(value: Any) -> dict[str, Any]:
     }
 
 
+def _normalize_preview(value: Any) -> dict[str, Any]:
+    raw = _record(value)
+    observed_sha = str(raw.get("observed_sha") or "").strip().lower()
+    status = _safe_status(raw.get("status"), default="not_checked")
+    url = str(raw.get("url") or "").strip()
+    return {
+        "provider": "vercel",
+        "status": status,
+        "observed_sha": observed_sha if _SHA_RE.fullmatch(observed_sha) else "",
+        "url": url[:1200] if url.startswith("https://") else "",
+        "deployment_id": _bounded_text(raw.get("deployment_id"), limit=40),
+        "diagnostic_code": _safe_status(
+            raw.get("diagnostic_code"),
+            default="",
+        ),
+    }
+
+
 def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
     """Normalize all closeout sources to one bounded additive schema."""
 
@@ -265,9 +277,6 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
     mode = str(raw.get("mode") or "off").strip().lower()
     if mode not in CLOSEOUT_MODES:
         mode = "off"
-    merge_policy = str(policy.get("merge") or "auto").strip().lower()
-    if merge_policy not in MERGE_POLICIES:
-        merge_policy = "auto"
     pr_open_policy = str(policy.get("pr_open") or "after_review_approval").strip().lower()
     if pr_open_policy not in PR_OPEN_POLICIES:
         pr_open_policy = "after_review_approval"
@@ -308,9 +317,12 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
             "base_branch": _bounded_text(workspace.get("base_branch") or "main", limit=240),
         },
         "policy": {
-            "merge": merge_policy,
+            # Discord closeout is publication-only. Legacy persisted auto/manual
+            # values normalize to never so an upgrade cannot merge in-flight PRs.
+            "merge": "never",
             "pr_open": pr_open_policy,
             "early_draft_pr": policy.get("early_draft_pr") is True,
+            "require_preview": policy.get("require_preview") is True,
             "require_local_verification": policy.get("require_local_verification") is True,
             "require_review": policy.get("require_review") is True,
             "require_visual_qa": policy.get("require_visual_qa") is True,
@@ -347,6 +359,7 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
             "wait_state": _safe_status(ci.get("wait_state"), default="queued"),
             "required": required_checks,
         },
+        "preview": _normalize_preview(raw.get("preview")),
         "canonical_sync": _receipt(raw.get("canonical_sync"), default="not_started"),
         "post_merge": _normalize_post_merge(raw.get("post_merge")),
         "mutation_uncertainty": _normalize_mutation_uncertainty(
@@ -928,23 +941,6 @@ def _default_run(
     )
 
 
-def _default_sync(
-    canonical_path: str,
-    branch: str,
-    merge_sha: str,
-    *,
-    control: Any | None = None,
-) -> Any:
-    from hermes_cli.canonical_checkout_sync import sync_protected_canonical_checkout
-
-    return sync_protected_canonical_checkout(
-        canonical_path,
-        branch,
-        merge_sha,
-        control=control,
-    )
-
-
 def _detail(result: subprocess.CompletedProcess[str], fallback: str) -> str:
     return sanitize_closeout_error(result.stderr or result.stdout or fallback)
 
@@ -984,37 +980,18 @@ def _invalidate_head_bound_state(state: dict[str, Any], *, old_head: str, new_he
             for workflow, check in REQUIRED_PR_CHECKS
         ],
     }
+    state["preview"] = {
+        "provider": "vercel",
+        "status": "not_checked",
+        "observed_sha": new_head,
+        "url": "",
+        "deployment_id": "",
+        "diagnostic_code": "",
+    }
     state["pr"]["merge_attempted_head_sha"] = ""
     state["pr"]["ready_at"] = None
     state["telemetry"]["green_unmerged_since"] = None
     state["telemetry"]["green_unmerged_overdue"] = False
-
-
-def _update_green_unmerged_telemetry(
-    state: dict[str, Any],
-    *,
-    eligible: bool,
-    now: float,
-    overdue_seconds: float,
-) -> bool:
-    """Update current-head green/unmerged telemetry and return first-green state."""
-
-    telemetry = state["telemetry"]
-    if not eligible:
-        telemetry["green_unmerged_since"] = None
-        telemetry["green_unmerged_overdue"] = False
-        return False
-    since = _safe_float(telemetry.get("green_unmerged_since"))
-    newly_green = since is None
-    if since is None:
-        since = now
-    raw_threshold = _safe_float(overdue_seconds)
-    threshold = max(0.0, min(30 * 24 * 3600.0, raw_threshold or 0.0))
-    telemetry["green_unmerged_since"] = since
-    telemetry["green_unmerged_overdue"] = bool(
-        threshold > 0 and now - since >= threshold
-    )
-    return newly_green
 
 
 def _pr_ref(state: Mapping[str, Any]) -> str:
@@ -1061,21 +1038,6 @@ def _apply_pr_payload(
             "required": [],
         }
     return new_head
-
-
-def _mergeability_disposition(value: Any) -> str:
-    """Normalize GitHub mergeability to ready, pending, or blocked."""
-
-    if value is True:
-        return "ready"
-    if value is False:
-        return "blocked"
-    normalized = str(value or "").strip().upper()
-    if normalized in {"MERGEABLE", "TRUE"}:
-        return "ready"
-    if normalized in {"CONFLICTING", "FALSE", "NOT_MERGEABLE"}:
-        return "blocked"
-    return "pending"
 
 
 def _transition(
@@ -1138,16 +1100,14 @@ def closeout_terminal_eligible(value: Any) -> bool:
         # Shadow may persist terminal observations, but never authorizes the
         # owning work item to complete or displaces its legacy finalizer.
         return False
-    if state["status"] == "post_merge_complete":
-        target = state["post_merge"]["target_sha"]
-        if not target:
+    if state["status"] in {"pr_open", "pr_published"} and state["policy"]["require_preview"]:
+        preview = state["preview"]
+        if (
+            preview.get("status") != "ready"
+            or not preview.get("url")
+            or preview.get("observed_sha") != state["pr"].get("head_sha")
+        ):
             return False
-        for name, required in state["policy"]["post_merge_requirements"].items():
-            if not required:
-                continue
-            receipt = state["post_merge"][name]
-            if receipt.get("status") != "passed" or receipt.get("observed_sha") != target:
-                return False
     return True
 
 
@@ -1180,9 +1140,6 @@ def _reconcile_trusted_closeout_impl(
     now: float | None = None,
     poll_seconds: float = 30.0,
     run: CommandRunner | None = None,
-    sync_canonical: CanonicalSync | None = None,
-    post_merge_config: Mapping[str, Any] | None = None,
-    green_unmerged_overdue_seconds: float = 0.0,
     max_commands: int = _DEFAULT_MAX_COMMANDS,
     mutation_allowed: Callable[[], bool] | None = None,
     mutation_started: Callable[[str, Mapping[str, Any]], bool] | None = None,
@@ -1194,6 +1151,8 @@ def _reconcile_trusted_closeout_impl(
     """Perform one bounded GitHub closeout reconciliation pass."""
 
     state = normalize_closeout_state(value)
+    state["telemetry"]["green_unmerged_since"] = None
+    state["telemetry"]["green_unmerged_overdue"] = False
     original = copy.deepcopy(state)
     current_time = float(time.time() if now is None else now)
     poll = max(1.0, min(3600.0, float(poll_seconds)))
@@ -1860,152 +1819,47 @@ def _reconcile_trusted_closeout_impl(
             poll_seconds=poll,
         )
 
-    # This authoritative PR snapshot resolves whether a prior ready or merge
-    # request took effect. Only after this observation may either mutation recur.
-    clear_uncertainty("github_pr_ready", "github_pr_merge")
+    if pr["state"] not in {"OPEN", "UNKNOWN", ""}:
+        return _blocked(original, state, code="pr_not_open", message=f"PR state is {pr['state'] or 'unknown'}", now=current_time)
 
-    if pr["state"] == "MERGED":
-        _update_green_unmerged_telemetry(
-            state,
-            eligible=False,
-            now=current_time,
-            overdue_seconds=green_unmerged_overdue_seconds,
-        )
-        merge_sha = pr["merge_sha"]
-        if not merge_sha:
+    if policy["require_preview"]:
+        from hermes_cli.preview_deployments import collect_vercel_preview
+
+        try:
+            preview = collect_vercel_preview(
+                repository=repo,
+                head_sha=new_head,
+                branch=branch,
+                root=root,
+                run=execute,
+            )
+        except Exception as exc:
             return _blocked(
                 original,
                 state,
-                code="merge_sha_missing",
-                message="Merged PR did not report an exact merge SHA",
+                code="preview_lookup_error",
+                message=exc,
                 now=current_time,
                 retry=True,
                 poll_seconds=poll,
             )
-
-        from hermes_cli.post_merge_receipts import (
-            collect_post_merge_receipts,
-            initialize_post_merge_receipts,
-        )
-
-        # The independently reported merge SHA must reach durable state before
-        # any collector starts. A subsequent reconciliation pass performs the
-        # concurrent collection and returns one gathered atomic update.
-        persisted_target = str(original["post_merge"].get("target_sha") or "").strip().lower()
-        if persisted_target != merge_sha:
-            state["post_merge"] = initialize_post_merge_receipts(state, target_sha=merge_sha)
-            state["canonical_sync"] = dict(state["post_merge"]["canonical_sync"])
-            return _transition(
-                original,
-                state,
-                outcome="post_merge_pending",
-                next_due_at=current_time,
-                terminal=False,
-                wake_immediately=True,
-            )
-
-        state["post_merge"] = collect_post_merge_receipts(
-            state,
-            config=post_merge_config,
-            run=execute,
-            sync_canonical=sync_canonical,
-            now=current_time,
-            read_only=state["mode"] != "enforce",
-            mutation_allowed=ownership_allows_mutation,
-            mutation_started=mutation_started,
-            span_recorder=_span_recorder,
-            span_parent_id=_span_parent_id,
-            span_attempt_id=_span_attempt_id,
-        )
-        for receipt_name in ("deployment", "restart"):
-            operation = f"post_merge_{receipt_name}"
-            receipt = state["post_merge"].get(receipt_name)
-            receipt_status = (
-                str(receipt.get("status") or "").strip().lower()
-                if isinstance(receipt, Mapping)
-                else ""
-            )
-            if uncertain_operation() == operation and receipt_status in {
-                "passed",
-                "failed",
-            }:
-                clear_uncertainty(operation)
-        state["canonical_sync"] = dict(state["post_merge"]["canonical_sync"])
-        required_post_merge = policy["post_merge_requirements"]
-        pending_receipts: list[str] = []
-        failed_receipts: list[str] = []
-        blocked_receipts: list[str] = []
-        for name, required in required_post_merge.items():
-            if not required:
-                continue
-            receipt = state["post_merge"][name]
-            receipt_status = str(receipt.get("status") or "").strip().lower()
-            if state["mode"] != "enforce":
-                if receipt_status not in {"passed", "failed", "blocked", "not_configured"}:
-                    pending_receipts.append(name)
-                continue
-            if receipt_status == "passed":
-                if receipt.get("observed_sha") != merge_sha:
-                    failed_receipts.append(name)
-            elif receipt_status == "failed":
-                failed_receipts.append(name)
-            elif receipt_status in {"blocked", "not_configured"}:
-                blocked_receipts.append(name)
-            else:
-                pending_receipts.append(name)
-        if blocked_receipts:
+        state["preview"] = preview.as_dict()
+        if preview.status == "failed":
             _append_error(
                 state,
-                code="post_merge_receipt_blocked",
-                message="Required post-merge receipt is blocked: " + ", ".join(blocked_receipts),
+                code="preview_deployment_failed",
+                message="The exact-head Vercel preview deployment failed",
                 now=current_time,
             )
             return _transition(
                 original,
                 state,
-                outcome="blocked",
-                next_due_at=None,
-                terminal=True,
+                outcome="repair_required" if state["mode"] == "enforce" else "waiting_for_preview",
+                next_due_at=None if state["mode"] == "enforce" else current_time + poll,
+                terminal=state["mode"] == "enforce",
             )
-        if failed_receipts:
-            _append_error(
-                state,
-                code="post_merge_receipt_failed",
-                message="Required post-merge receipt failed: " + ", ".join(failed_receipts),
-                now=current_time,
-            )
-            return _transition(
-                original,
-                state,
-                outcome="repair_required",
-                next_due_at=None,
-                terminal=True,
-            )
-        if pending_receipts:
-            return _transition(
-                original,
-                state,
-                outcome="post_merge_pending",
-                next_due_at=current_time + poll,
-                terminal=False,
-            )
-        return _transition(original, state, outcome="post_merge_complete", next_due_at=None, terminal=True)
 
-    if pr["state"] not in {"OPEN", "UNKNOWN", ""}:
-        _update_green_unmerged_telemetry(
-            state,
-            eligible=False,
-            now=current_time,
-            overdue_seconds=green_unmerged_overdue_seconds,
-        )
-        return _blocked(original, state, code="pr_not_open", message=f"PR state is {pr['state'] or 'unknown'}", now=current_time)
     if pr["review_decision"] == "CHANGES_REQUESTED":
-        _update_green_unmerged_telemetry(
-            state,
-            eligible=False,
-            now=current_time,
-            overdue_seconds=green_unmerged_overdue_seconds,
-        )
         return _blocked(original, state, code="changes_requested", message="PR has requested review changes", now=current_time)
 
     local_ok = _gate_passed(
@@ -2019,12 +1873,6 @@ def _reconcile_trusted_closeout_impl(
     gates_ok = local_ok and review_ok and visual_ok and ci_status == "passed"
 
     if not gates_ok:
-        _update_green_unmerged_telemetry(
-            state,
-            eligible=False,
-            now=current_time,
-            overdue_seconds=green_unmerged_overdue_seconds,
-        )
         if ci_status == "failed":
             _append_error(
                 state,
@@ -2050,344 +1898,29 @@ def _reconcile_trusted_closeout_impl(
         outcome = "waiting_for_gates" if ci_status == "passed" else "waiting_for_ci"
         return _transition(original, state, outcome=outcome, next_due_at=current_time + poll, terminal=False)
 
-    if pr["is_draft"]:
-        _update_green_unmerged_telemetry(
-            state,
-            eligible=False,
-            now=current_time,
-            overdue_seconds=green_unmerged_overdue_seconds,
+    preview_ready = (
+        not policy["require_preview"]
+        or (
+            state["preview"].get("status") == "ready"
+            and state["preview"].get("observed_sha") == new_head
+            and bool(state["preview"].get("url"))
         )
-        if state["mode"] == "shadow":
-            return _transition(
-                original,
-                state,
-                outcome="ready_pending",
-                next_due_at=current_time + poll,
-                terminal=False,
-            )
-        try:
-            readied = execute(
-                ["gh", "pr", "ready", _pr_ref(state), "--repo", repo],
-                cwd=root,
-                timeout=60,
-                github=True,
-            )
-        except RemoteMutationUncertain as exc:
-            return remote_mutation_uncertain(exc)
-        except Exception as exc:
-            return _blocked(original, state, code="pr_ready_error", message=exc, now=current_time, retry=True, poll_seconds=poll)
-        if readied.returncode != 0:
-            return _blocked(
-                original,
-                state,
-                code="pr_ready_failed",
-                message=_detail(readied, "PR ready transition failed"),
-                now=current_time,
-                retry=True,
-                poll_seconds=poll,
-            )
-        pr["is_draft"] = False
-        pr["ready_at"] = current_time
-        return _transition(
-            original,
-            state,
-            outcome="ready_pending",
-            next_due_at=current_time,
-            terminal=False,
-            wake_immediately=True,
-        )
-
-    merge_policy = policy["merge"]
-    if merge_policy in {"manual", "never"}:
-        _update_green_unmerged_telemetry(
-            state,
-            eligible=False,
-            now=current_time,
-            overdue_seconds=green_unmerged_overdue_seconds,
-        )
-        return _transition(original, state, outcome="pr_open", next_due_at=None, terminal=True)
-
-    newly_green = _update_green_unmerged_telemetry(
-        state,
-        eligible=True,
-        now=current_time,
-        overdue_seconds=green_unmerged_overdue_seconds,
     )
-    merge_state = pr["merge_state"]
-    mergeability = _mergeability_disposition(pr.get("mergeable"))
-    if merge_state in {"", "UNKNOWN", "UNSTABLE"} or mergeability == "pending":
+    if not preview_ready:
         return _transition(
             original,
             state,
-            outcome="waiting_for_mergeability",
-            next_due_at=current_time if newly_green else current_time + poll,
-            terminal=False,
-            wake_immediately=newly_green,
-        )
-    if merge_state not in {"CLEAN", "HAS_HOOKS"} or mergeability == "blocked":
-        return _blocked(
-            original,
-            state,
-            code="mergeability_blocked",
-            message=f"PR merge state is {merge_state}; mergeable is {pr.get('mergeable')}",
-            now=current_time,
-            poll_seconds=poll,
-        )
-
-    if state["mode"] == "shadow":
-        return _transition(
-            original,
-            state,
-            outcome="pending",
+            outcome="waiting_for_preview",
             next_due_at=current_time + poll,
             terminal=False,
         )
 
-    # Refresh the authoritative head immediately before the merge mutation. The
-    # exact-head guard below protects the remaining race between this read and
-    # GitHub accepting the merge request.
-    try:
-        premerge = execute(
-            [
-                "gh",
-                "pr",
-                "view",
-                _pr_ref(state),
-                "--repo",
-                repo,
-                "--json",
-                "number,url,state,headRefOid,mergedAt,mergeCommit,mergeStateStatus,mergeable,isDraft,reviewDecision,statusCheckRollup",
-            ],
-            cwd=root,
-            timeout=60,
-            github=True,
-        )
-    except Exception as exc:
-        return _blocked(original, state, code="premerge_refresh_error", message=exc, now=current_time, retry=True, poll_seconds=poll)
-    if premerge.returncode != 0:
-        return _blocked(
-            original,
-            state,
-            code="premerge_refresh_failed",
-            message=_detail(premerge, "Pre-merge PR refresh failed"),
-            now=current_time,
-            retry=True,
-            poll_seconds=poll,
-        )
-    try:
-        premerge_payload = json.loads(premerge.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        return _blocked(original, state, code="premerge_refresh_invalid_json", message=exc, now=current_time, retry=True, poll_seconds=poll)
-    if not isinstance(premerge_payload, Mapping):
-        return _blocked(original, state, code="premerge_refresh_invalid_payload", message="Pre-merge PR refresh returned non-object JSON", now=current_time, retry=True, poll_seconds=poll)
-    if require_trusted_checks:
-        premerge_payload = enrich_required_check_identities(
-            premerge_payload,
-            repo=repo,
-            root=root,
-            run=execute,
-        )
-    identity_error = sanitize_closeout_error(
-        premerge_payload.pop("_required_check_identity_error", "")
-    )
-    if identity_error:
-        return _blocked(
-            original,
-            state,
-            code="premerge_required_check_identity_failed",
-            message=identity_error,
-            now=current_time,
-            retry=True,
-            poll_seconds=poll,
-        )
-    try:
-        refreshed_head = _apply_pr_payload(
-            state,
-            premerge_payload,
-            require_trusted_checks=require_trusted_checks,
-        )
-    except ValueError as exc:
-        return _blocked(
-            original,
-            state,
-            code="invalid_premerge_head",
-            message=exc,
-            now=current_time,
-            retry=True,
-            poll_seconds=poll,
-        )
-
-    # Another actor may merge after the initial OPEN snapshot but before this
-    # authoritative pre-mutation refresh. Treat an exact merge commit as a
-    # successful externally completed merge and enter normal post-merge pickup.
-    if pr["state"] == "MERGED":
-        merge_sha = str(pr.get("merge_sha") or "").strip().lower()
-        if not _SHA_RE.fullmatch(merge_sha):
-            return _blocked(
-                original,
-                state,
-                code="merge_sha_missing",
-                message="Pre-merge refresh reported MERGED without an exact merge SHA",
-                now=current_time,
-                retry=True,
-                poll_seconds=poll,
-            )
-        from hermes_cli.post_merge_receipts import initialize_post_merge_receipts
-
-        state["post_merge"] = initialize_post_merge_receipts(state, target_sha=merge_sha)
-        state["canonical_sync"] = dict(state["post_merge"]["canonical_sync"])
-        _update_green_unmerged_telemetry(
-            state,
-            eligible=False,
-            now=current_time,
-            overdue_seconds=green_unmerged_overdue_seconds,
-        )
-        return _transition(
-            original,
-            state,
-            outcome="post_merge_pending",
-            next_due_at=current_time,
-            terminal=False,
-            wake_immediately=True,
-        )
-
-    # Re-evaluate every gate from the just-applied snapshot. This is required
-    # even when the head SHA did not change because draft/review/check/merge
-    # state can change independently on GitHub.
-    if pr["state"] != "OPEN":
-        return _blocked(
-            original,
-            state,
-            code="premerge_pr_not_open",
-            message=f"Pre-merge PR state is {pr['state'] or 'unknown'}",
-            now=current_time,
-            poll_seconds=poll,
-        )
-    if pr["is_draft"]:
-        return _transition(
-            original,
-            state,
-            outcome="ready_pending",
-            next_due_at=current_time + poll,
-            terminal=False,
-        )
-    if pr["review_decision"] == "CHANGES_REQUESTED":
-        return _blocked(
-            original,
-            state,
-            code="premerge_changes_requested",
-            message="Pre-merge review decision requests changes",
-            now=current_time,
-            poll_seconds=poll,
-        )
-    refreshed_local_ok = _gate_passed(
-        state["local_verification"],
-        required=policy["require_local_verification"],
-        head_sha=refreshed_head,
-    )
-    refreshed_review_ok = _gate_passed(
-        state["review"],
-        required=policy["require_review"],
-        head_sha=refreshed_head,
-    )
-    refreshed_visual_ok = _gate_passed(
-        state["visual_qa"],
-        required=policy["require_visual_qa"],
-        head_sha=refreshed_head,
-    )
-    refreshed_ci_status = state["ci"]["status"]
-    if not (refreshed_local_ok and refreshed_review_ok and refreshed_visual_ok):
-        return _transition(
-            original,
-            state,
-            outcome="waiting_for_gates",
-            next_due_at=current_time + poll,
-            terminal=False,
-        )
-    if refreshed_ci_status == "failed":
-        _append_error(
-            state,
-            code="required_checks_failed",
-            message="Latest pre-merge required CI checks failed and require repair or rerun",
-            now=current_time,
-        )
-        return _transition(
-            original,
-            state,
-            outcome="repair_required",
-            next_due_at=None,
-            terminal=True,
-        )
-    if refreshed_ci_status != "passed":
-        return _transition(
-            original,
-            state,
-            outcome="waiting_for_ci",
-            next_due_at=current_time + poll,
-            terminal=False,
-        )
-    refreshed_mergeability = _mergeability_disposition(pr.get("mergeable"))
-    if pr["merge_state"] in {"", "UNKNOWN", "UNSTABLE"} or refreshed_mergeability == "pending":
-        return _transition(
-            original,
-            state,
-            outcome="waiting_for_mergeability",
-            next_due_at=current_time + poll,
-            terminal=False,
-        )
-    if pr["merge_state"] not in {"CLEAN", "HAS_HOOKS"} or refreshed_mergeability == "blocked":
-        return _blocked(
-            original,
-            state,
-            code="premerge_mergeability_blocked",
-            message=(
-                f"Pre-merge state is {pr['merge_state']}; "
-                f"mergeable is {pr.get('mergeable')}"
-            ),
-            now=current_time,
-            poll_seconds=poll,
-        )
-
-    pr["merge_attempted_head_sha"] = refreshed_head
-    try:
-        merged = execute(
-            [
-                "gh",
-                "pr",
-                "merge",
-                _pr_ref(state),
-                "--repo",
-                repo,
-                "--merge",
-                "--delete-branch",
-                "--match-head-commit",
-                refreshed_head,
-            ],
-            cwd=root,
-            timeout=300,
-            github=True,
-        )
-    except RemoteMutationUncertain as exc:
-        return remote_mutation_uncertain(exc)
-    except Exception as exc:
-        return _blocked(original, state, code="pr_merge_error", message=exc, now=current_time, retry=True, poll_seconds=poll)
-    if merged.returncode != 0:
-        return _blocked(
-            original,
-            state,
-            code="pr_merge_failed",
-            message=_detail(merged, "PR merge failed"),
-            now=current_time,
-            retry=True,
-            poll_seconds=poll,
-        )
     return _transition(
         original,
         state,
-        outcome="pending",
-        next_due_at=current_time,
-        terminal=False,
-        wake_immediately=True,
+        outcome="pr_published",
+        next_due_at=None,
+        terminal=True,
     )
 
 
@@ -2397,9 +1930,6 @@ def reconcile_trusted_closeout(
     now: float | None = None,
     poll_seconds: float = 30.0,
     run: CommandRunner | None = None,
-    sync_canonical: CanonicalSync | None = None,
-    post_merge_config: Mapping[str, Any] | None = None,
-    green_unmerged_overdue_seconds: float = 0.0,
     max_commands: int = _DEFAULT_MAX_COMMANDS,
     mutation_allowed: Callable[[], bool] | None = None,
     mutation_started: Callable[[str, Mapping[str, Any]], bool] | None = None,
@@ -2481,9 +2011,6 @@ def reconcile_trusted_closeout(
             now=now,
             poll_seconds=poll_seconds,
             run=instrumented_run,
-            sync_canonical=sync_canonical,
-            post_merge_config=post_merge_config,
-            green_unmerged_overdue_seconds=green_unmerged_overdue_seconds,
             max_commands=max_commands,
             mutation_allowed=mutation_allowed,
             mutation_started=mutation_started,

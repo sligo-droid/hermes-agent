@@ -160,30 +160,21 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "do not finish with contradictory done/not-verified wording. If code "
     "work in a git worktree is complete and checks pass, do not treat 'ready for "
     "PR' or 'next step: commit/push/open PR' as a terminal handoff; continue "
-    "through the repository's normal PR lifecycle when permitted by the active "
-    "instructions, persisting durable trusted closeout so CI, merge, canonical "
-    "sync, and configured post-merge receipts reconcile outside the agent turn. "
-    "Standard Discord action turns must never run mutable terminal commands against "
-    "the protected canonical checkout after merge. Gateway trusted closeout "
-    "exclusively owns exact-SHA canonical synchronization on this route. Do not "
-    "proactively call sync_canonical_checkout; reserve it for explicit recovery "
-    "after trusted closeout reports a concrete blocker. Run temporary worktree "
+    "through commit, feature-branch push, and draft PR publication when permitted "
+    "by the active instructions. Persist durable trusted closeout so the exact-head "
+    "Vercel preview is posted immediately while CI and visual QA continue outside "
+    "the agent turn. Never mark the PR ready, merge it, or synchronize the protected "
+    "canonical checkout. Run temporary worktree "
     "cleanup from the mutable action worktree, not from the protected canonical "
-    "checkout. Do not report canonical sync as failed or pending unless trusted "
-    "closeout reports a blocker. "
+    "checkout. "
     "Do not load github-pr-workflow for routine closeout; reserve it for diagnosis "
     "or recovery when trusted closeout reports a concrete blocker. For "
-    "runtime/DAG/Airflow/deploy rollout work, full lifecycle means code merged, "
-    "canonical/runtime checkout synced, and live pickup verified; do not hold the "
-    "final Discord response open just to wait for a newly scheduled production DAG "
-    "or long data-writing run to finish unless the user explicitly requested "
-    "first-run completion or the run is safety-critical. After live pickup is "
-    "verified, report started/queued long runtime verification as a background "
-    "watch and use terminal(background=True, notify_on_complete=True) or cron for "
-    "bounded pollers instead of foreground sleep/list-runs loops. Stop before PR "
+    "runtime/DAG/Airflow/deploy rollout work, stop at the draft PR and feature-branch "
+    "preview unless the user separately authorizes a deployment action that does not "
+    "merge the PR. Stop before PR "
     "lifecycle only when the user explicitly requested local-only work or a real "
-    "blocker prevents continuing. Once the requested change is merged and required "
-    "pickup or production verification passes, stop and report; do not open extra "
+    "blocker prevents continuing. Once the draft PR, preview, and required QA are "
+    "published, stop and report; do not open extra "
     "cleanup, credential, discoverability, or follow-up PRs unless they are required "
     "to correct a regression introduced by this task or the user explicitly asks. "
     "Record non-critical follow-ups instead of expanding the active turn. "
@@ -3850,7 +3841,7 @@ def _effective_closeout_repository_config(
         if key != "repositories"
     }
     for key, value in repository_config.items():
-        if key in {"surfaces", "post_merge_requirements", "visual_qa"}:
+        if key in {"surfaces", "preview", "visual_qa"}:
             effective[key] = {
                 **_closeout_mapping(effective.get(key)),
                 **_closeout_mapping(value),
@@ -3970,10 +3961,19 @@ def _gateway_action_closeout_contract(
     from hermes_cli.discord_worker_boards import pr_policy_for_request
 
     pr_lifecycle_policy = pr_policy_for_request(str(request or ""))
+    preview_config = _closeout_mapping(closeout_config.get("preview"))
+    require_preview = (
+        preview_config.get("required") is not False
+        and mode == "enforce"
+        and pr_lifecycle_policy["pr_open_policy"] != "never"
+    )
     policy = {
-        "merge": pr_lifecycle_policy["merge_policy"],
+        "merge": "never",
         "pr_open": pr_lifecycle_policy["pr_open_policy"],
-        "early_draft_pr": closeout_config.get("early_draft_pr") is True,
+        "early_draft_pr": (
+            closeout_config.get("early_draft_pr") is True or require_preview
+        ),
+        "require_preview": require_preview,
         "require_local_verification": True,
         "require_review": False,
         "require_visual_qa": bool(
@@ -3982,14 +3982,11 @@ def _gateway_action_closeout_contract(
             and isinstance(visual_config, dict)
             and visual_config.get("mode") == "enforce_explicit"
         ),
-        "post_merge_requirements": _closeout_mapping(
-            closeout_config.get("post_merge_requirements")
-        ),
     }
     if normalized_source == "fable" and legacy_fable_lifecycle in {"pr", "merge"}:
         policy.update(
             {
-                "merge": "auto" if legacy_fable_lifecycle == "merge" else "never",
+                "merge": "never",
                 "pr_open": "after_review_approval",
                 "early_draft_pr": True,
             }
@@ -4439,6 +4436,7 @@ class _GatewayRunnerCore(
             self.work_ledger,
             config=closeout_config if isinstance(closeout_config, dict) else {},
             is_agent_active=self._work_item_agent_run_active,
+            on_preview=self._on_trusted_closeout_preview,
             on_terminal=self._on_trusted_closeout_terminal,
         )
         self.delivery_router = DeliveryRouter(self.config)
@@ -9073,20 +9071,6 @@ class _GatewayRunnerCore(
             if not work_id:
                 continue
             status = str(item.get("status") or "")
-            gate = item.get("completion_gate")
-            if isinstance(gate, dict) and gate.get("allowed_to_complete") is False:
-                try:
-                    repaired = ledger.repair_successful_closeout_completion(work_id)
-                except Exception:
-                    logger.debug(
-                        "Failed to repair successful Discord closeout gate for %s",
-                        work_id,
-                        exc_info=True,
-                    )
-                else:
-                    if isinstance(repaired, dict):
-                        item = repaired
-                        status = str(item.get("status") or "")
             required_state = ledger.required_async_completion_state(work_id)
             if (
                 isinstance(required_state, dict)
@@ -9131,9 +9115,7 @@ class _GatewayRunnerCore(
                         "Trusted closeout blocked: a deterministic lifecycle gate requires repair."
                         if failed_closeout
                         else (
-                            "Trusted closeout completed: the PR is open and intentionally unmerged under the configured policy."
-                            if normalized_closeout["status"] == "pr_open"
-                            else "Trusted closeout completed: the PR merge and all configured closeout gates passed."
+                            "PR preview QA completed; the draft PR remains open and main is untouched."
                         )
                     )
                     ledger.mark_agent_done(
@@ -10511,6 +10493,95 @@ class _GatewayRunnerCore(
                     "Periodic action worktree cleanup encountered %d error(s)",
                     len(errors),
                 )
+
+    async def _on_trusted_closeout_preview(self, item: Dict[str, Any]) -> None:
+        """Deliver the exact-head preview before background visual QA finishes."""
+
+        work_id = str(item.get("id") or "")
+        if not work_id:
+            return
+        owner = f"gateway-preview:{os.getpid()}:{time.time_ns()}"
+        claimed = await asyncio.to_thread(
+            self._ledger().claim_preview_delivery,
+            work_id,
+            owner=owner,
+        )
+        if claimed is None:
+            return
+        delivery = (
+            claimed.get("preview_delivery")
+            if isinstance(claimed.get("preview_delivery"), dict)
+            else {}
+        )
+        try:
+            event = self._ledger().event_from_item(claimed)
+        except Exception:
+            await asyncio.to_thread(
+                self._ledger().fail_preview_delivery,
+                work_id,
+                owner=owner,
+                uncertain=False,
+            )
+            return
+        adapter = self._adapter_for_source(event.source)
+        if adapter is None:
+            await asyncio.to_thread(
+                self._ledger().fail_preview_delivery,
+                work_id,
+                owner=owner,
+                uncertain=False,
+            )
+            return
+        began = await asyncio.to_thread(
+            self._ledger().begin_preview_send_attempt,
+            work_id,
+            owner=owner,
+        )
+        if not began:
+            return
+        content = (
+            "Preview ready.\n\n"
+            f"- Preview: {delivery.get('preview_url')}\n"
+            f"- Draft PR: {delivery.get('pr_url')}\n"
+            "- Main: untouched\n"
+            "- Visual QA: running in the background; I’ll post the result here."
+        )
+        try:
+            from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
+
+            reply_to = _reply_anchor_for_event(event)
+            metadata = _thread_metadata_for_source(event.source, reply_to) or {}
+            metadata = dict(metadata)
+            metadata["notify"] = True
+            result = await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                self._ledger().fail_preview_delivery,
+                work_id,
+                owner=owner,
+                uncertain=True,
+            )
+            return
+        if not getattr(result, "success", False):
+            await asyncio.to_thread(
+                self._ledger().fail_preview_delivery,
+                work_id,
+                owner=owner,
+                uncertain=not is_logical_send_retry_safe(result),
+            )
+            return
+        await asyncio.to_thread(
+            self._ledger().complete_preview_delivery,
+            work_id,
+            owner=owner,
+            result_message_id=getattr(result, "message_id", None),
+            confirmed_message_ids=get_confirmed_message_ids(result),
+        )
 
     async def _on_trusted_closeout_terminal(self, item: Dict[str, Any]) -> None:
         """Deliver deterministic terminal closeout state through existing paths."""
@@ -20156,33 +20227,6 @@ class _GatewayRunnerCore(
                         str(work_item_id),
                         agent_result,
                     )
-                    current_item = self._ledger().get(str(work_item_id)) or {}
-                    if current_item.get("closeout_authoritative") is not True:
-                        try:
-                            from gateway.direct_closeout_observer import (
-                                observe_merged_direct_closeout,
-                            )
-
-                            observed_closeout = await asyncio.to_thread(
-                                observe_merged_direct_closeout,
-                                current_item,
-                                response,
-                            )
-                            if observed_closeout is not None:
-                                await asyncio.to_thread(
-                                    self._ledger().adopt_observed_direct_closeout,
-                                    str(work_item_id),
-                                    observed_closeout,
-                                    expected_run_state={
-                                        "status": current_item.get("status"),
-                                        "active_run": current_item.get("active_run"),
-                                    },
-                                )
-                        except Exception:
-                            logger.debug(
-                                "Direct closeout observation failed",
-                                exc_info=True,
-                            )
                     title = None
                     if session_entry.session_id and self._session_db and not getattr(event, "feature_summary", None):
                         try:
