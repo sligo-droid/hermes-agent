@@ -1332,8 +1332,9 @@ DEFAULT_CONFIG = {
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
         # Optional operator-owned, secret-safe browser login profiles. Profiles
-        # name an env file under $HERMES_HOME/secrets plus exact origins and
-        # form selectors. The browser_authenticate tool injects credentials
+        # name an env file under $HERMES_HOME/secrets plus exact origins or
+        # narrow HTTPS hostname patterns and form selectors. The
+        # browser_authenticate tool injects credentials
         # directly over the private CDP supervisor and never exposes values to
         # the model, subprocess arguments, tool output, or durable state.
         "auth_profiles": {},

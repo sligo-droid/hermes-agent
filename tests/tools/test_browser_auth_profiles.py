@@ -34,6 +34,16 @@ def _profile_config(env_file):
     }
 
 
+def _preview_profile_config(env_file):
+    config = _profile_config(env_file)
+    profile = config["browser"]["auth_profiles"]["pid_hermes_qa"]
+    profile["origins"] = []
+    profile["origin_patterns"] = [
+        "https://pid-git-*-sligo-labs.vercel.app",
+    ]
+    return config
+
+
 def test_supervisor_prefers_navigated_page_over_initial_blank_target():
     targets = [
         {"targetId": "blank", "type": "page", "url": "about:blank"},
@@ -102,6 +112,73 @@ def test_matching_profiles_returns_only_valid_exact_origin_profiles(
     assert matching_browser_auth_profile_names(
         "https://example.com", config=config
     ) == ()
+
+
+def test_profile_matches_narrow_vercel_preview_origin_pattern(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    secrets = hermes_home / "secrets"
+    secrets.mkdir(parents=True)
+    env_file = secrets / "pid-qa-readonly.env"
+    env_file.write_text(
+        "PID_QA_USERNAME=hermes_qa\nPID_QA_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = _preview_profile_config(env_file)
+
+    preview_origin = (
+        "https://pid-git-discord-action-pid-e3b40e1a059a-"
+        "sligo-labs.vercel.app"
+    )
+    assert matching_browser_auth_profile_names(preview_origin, config=config) == (
+        "pid_hermes_qa",
+    )
+    assert select_browser_auth_profile(preview_origin, config=config).name == (
+        "pid_hermes_qa"
+    )
+    assert matching_browser_auth_profile_names(
+        "https://pid-git-main-other-team.vercel.app", config=config
+    ) == ()
+    assert matching_browser_auth_profile_names(
+        "https://pid-preview-sligo-labs.vercel.app", config=config
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "http://pid-git-*-sligo-labs.vercel.app",
+        "https://*.vercel.app",
+        "https://pid-git-*-example.com:443",
+        "https://pid-git-*-example.com/path",
+        "https://pid-*-*.vercel.app",
+    ],
+)
+def test_profile_rejects_broad_or_invalid_origin_patterns(
+    tmp_path, monkeypatch, pattern
+):
+    hermes_home = tmp_path / ".hermes"
+    secrets = hermes_home / "secrets"
+    secrets.mkdir(parents=True)
+    env_file = secrets / "pid-qa-readonly.env"
+    env_file.write_text(
+        "PID_QA_USERNAME=hermes_qa\nPID_QA_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = _preview_profile_config(env_file)
+    config["browser"]["auth_profiles"]["pid_hermes_qa"]["origin_patterns"] = [
+        pattern
+    ]
+
+    with pytest.raises(BrowserAuthProfileError, match="origin pattern"):
+        select_browser_auth_profile(
+            "https://pid-preview-sligo-labs.vercel.app",
+            requested_name="pid_hermes_qa",
+            config=config,
+        )
 
 
 def test_navigation_auth_hint_is_limited_to_matching_sign_in_pages(monkeypatch):

@@ -25,6 +25,7 @@ class BrowserAuthProfileError(ValueError):
 class BrowserAuthProfile:
     name: str
     origins: tuple[str, ...]
+    origin_patterns: tuple[str, ...]
     env_file: Path
     username_env: str
     password_env: str
@@ -78,7 +79,7 @@ def matching_browser_auth_profile_names(
             profile = _profile_from_config(name, raw)
         except BrowserAuthProfileError:
             continue
-        if normalized_origin in profile.origins:
+        if _profile_matches_origin(profile, normalized_origin):
             matches.append(profile.name)
     return tuple(sorted(matches))
 
@@ -103,6 +104,49 @@ def _normalize_origin(value: Any) -> str:
     return f"{parsed.scheme.lower()}://{host}{port}"
 
 
+def _normalize_origin_pattern(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    parsed = urlsplit(text)
+    host = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or parsed.port is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or host.count("*") != 1
+    ):
+        raise BrowserAuthProfileError(
+            "browser auth profile has an invalid origin pattern"
+        )
+    wildcard_label = next((label for label in host.split(".") if "*" in label), "")
+    prefix, _, suffix = wildcard_label.partition("*")
+    if (
+        len(host.split(".")) < 3
+        or len(prefix.replace("-", "")) < 3
+        or len(suffix.replace("-", "")) < 3
+        or not re.fullmatch(r"[a-z0-9.*-]+", host)
+    ):
+        raise BrowserAuthProfileError(
+            "browser auth origin pattern must be a narrow HTTPS hostname pattern"
+        )
+    return f"https://{host}"
+
+
+def _origin_matches_pattern(origin: str, pattern: str) -> bool:
+    expression = re.escape(pattern).replace(r"\*", r"[a-z0-9-]+")
+    return re.fullmatch(expression, origin) is not None
+
+
+def _profile_matches_origin(profile: BrowserAuthProfile, origin: str) -> bool:
+    return origin in profile.origins or any(
+        _origin_matches_pattern(origin, pattern)
+        for pattern in profile.origin_patterns
+    )
+
+
 def _selector(raw: Any, label: str) -> str:
     value = str(raw or "").strip()
     if not value or len(value) > 200 or any(ord(char) < 32 for char in value):
@@ -113,12 +157,24 @@ def _selector(raw: Any, label: str) -> str:
 def _profile_from_config(name: str, raw: Any) -> BrowserAuthProfile:
     if not _PROFILE_NAME_RE.fullmatch(name) or not isinstance(raw, dict):
         raise BrowserAuthProfileError("browser auth profile is invalid")
-    origins_raw = raw.get("origins")
+    origins_raw = raw.get("origins", [])
     if isinstance(origins_raw, str):
         origins_raw = [origins_raw]
-    if not isinstance(origins_raw, (list, tuple)) or not origins_raw:
-        raise BrowserAuthProfileError("browser auth profile has no origins")
+    if not isinstance(origins_raw, (list, tuple)):
+        raise BrowserAuthProfileError("browser auth profile has invalid origins")
     origins = tuple(dict.fromkeys(_normalize_origin(item) for item in origins_raw))
+    patterns_raw = raw.get("origin_patterns", [])
+    if isinstance(patterns_raw, str):
+        patterns_raw = [patterns_raw]
+    if not isinstance(patterns_raw, (list, tuple)):
+        raise BrowserAuthProfileError(
+            "browser auth profile has invalid origin patterns"
+        )
+    origin_patterns = tuple(
+        dict.fromkeys(_normalize_origin_pattern(item) for item in patterns_raw)
+    )
+    if not origins and not origin_patterns:
+        raise BrowserAuthProfileError("browser auth profile has no origins")
 
     secrets_root = (get_hermes_home() / "secrets").resolve()
     env_value = str(raw.get("env_file") or "").strip()
@@ -160,6 +216,7 @@ def _profile_from_config(name: str, raw: Any) -> BrowserAuthProfile:
     return BrowserAuthProfile(
         name=name,
         origins=origins,
+        origin_patterns=origin_patterns,
         env_file=env_file,
         username_env=username_env,
         password_env=password_env,
@@ -195,7 +252,7 @@ def select_browser_auth_profile(
             if requested:
                 raise
             continue
-        if normalized_origin in profile.origins:
+        if _profile_matches_origin(profile, normalized_origin):
             candidates.append(profile)
     if not candidates:
         raise BrowserAuthProfileError(
