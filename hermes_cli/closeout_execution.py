@@ -108,7 +108,10 @@ def classify_closeout_command(args: Sequence[Any]) -> ClassifiedCommand:
         if group == "pr" and verb in _GH_PR_READ_ONLY:
             return ClassifiedCommand(CommandEffect.READ_ONLY, f"github_pr_{verb}")
         if group == "pr" and verb in _GH_PR_MUTATIONS:
-            return ClassifiedCommand(CommandEffect.REMOTE_MUTATION, f"github_pr_{verb}")
+            operation = f"github_pr_{verb}"
+            if verb == "ready" and "--undo" in tokens[3:]:
+                operation = "github_pr_ready_undo"
+            return ClassifiedCommand(CommandEffect.REMOTE_MUTATION, operation)
         if group == "run" and verb in _GH_RUN_READ_ONLY:
             return ClassifiedCommand(CommandEffect.READ_ONLY, f"github_run_{verb}")
         if group == "api":

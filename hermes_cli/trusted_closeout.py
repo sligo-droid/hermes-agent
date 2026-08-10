@@ -1895,6 +1895,163 @@ def _reconcile_trusted_closeout_impl(
             poll_seconds=poll,
         )
 
+    def restore_pr_draft() -> CloseoutTransition | None:
+        """Compensate a ready mutation that may have touched an unverified head."""
+
+        nonlocal local_branch_head
+        current_head = str(pr.get("head_sha") or "").strip().lower()
+        local_branch_head = current_head
+        state["mutation_uncertainty"] = {
+            "status": "uncertain",
+            "operation": "github_pr_ready_undo",
+            "at": current_time,
+            "head_sha": current_head,
+        }
+        undo_result: subprocess.CompletedProcess[str] | None = None
+        undo_uncertain: RemoteMutationUncertain | None = None
+        try:
+            undo_result = execute(
+                ["gh", "pr", "ready", pr_ref, "--repo", repo, "--undo"],
+                cwd=root,
+                timeout=60,
+                github=True,
+            )
+        except RemoteMutationUncertain as exc:
+            undo_uncertain = exc
+        except Exception as exc:
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_rollback_error",
+                message=exc,
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+
+        try:
+            rollback_view = execute(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_ref,
+                    "--repo",
+                    repo,
+                    "--json",
+                    "number,url,state,headRefOid,isDraft",
+                ],
+                cwd=root,
+                timeout=60,
+                github=True,
+            )
+        except Exception as exc:
+            if undo_uncertain is not None:
+                return remote_mutation_uncertain(undo_uncertain)
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_rollback_refresh_error",
+                message=exc,
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        if rollback_view.returncode != 0:
+            if undo_uncertain is not None:
+                return remote_mutation_uncertain(undo_uncertain)
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_rollback_refresh_failed",
+                message=_detail(rollback_view, "PR draft rollback refresh failed"),
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        try:
+            rollback_payload = json.loads(rollback_view.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            if undo_uncertain is not None:
+                return remote_mutation_uncertain(undo_uncertain)
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_rollback_refresh_invalid_json",
+                message=exc,
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        rollback_head = (
+            str(rollback_payload.get("headRefOid") or "").strip().lower()
+            if isinstance(rollback_payload, Mapping)
+            else ""
+        )
+        if not _SHA_RE.fullmatch(rollback_head):
+            return _blocked(
+                original,
+                state,
+                code="pr_ready_rollback_invalid_head",
+                message="GitHub returned an invalid PR head after draft rollback",
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        if (
+            not isinstance(rollback_payload, Mapping)
+            or rollback_payload.get("isDraft") is not True
+        ):
+            return _blocked(
+                original,
+                state,
+                code=(
+                    "pr_ready_rollback_uncertain"
+                    if undo_uncertain is not None
+                    else "pr_ready_rollback_failed"
+                    if undo_result is not None and undo_result.returncode != 0
+                    else "pr_ready_rollback_unconfirmed"
+                ),
+                message=(
+                    "GitHub did not confirm the PR returned to draft after a head race"
+                ),
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        if str(rollback_payload.get("state") or "").strip().upper() != "OPEN":
+            return _blocked(
+                original,
+                state,
+                code="pr_not_open",
+                message="The PR stopped being open during draft rollback",
+                now=current_time,
+            )
+        _invalidate_head_bound_state(state, old_head=current_head, new_head=rollback_head)
+        pr["head_sha"] = rollback_head
+        pr["state"] = "OPEN"
+        pr["is_draft"] = True
+        pr["ready_at"] = None
+        if rollback_payload.get("url"):
+            pr["url"] = str(rollback_payload.get("url"))[:1200]
+        if rollback_payload.get("number") is not None:
+            pr["number"] = _bounded_text(rollback_payload.get("number"), limit=32)
+        clear_uncertainty("github_pr_ready_undo")
+        return _transition(
+            original,
+            state,
+            outcome="pr_pending",
+            next_due_at=current_time,
+            terminal=False,
+            wake_immediately=True,
+        )
+
+    if uncertain_operation() == "github_pr_ready_undo":
+        if pr["is_draft"]:
+            clear_uncertainty("github_pr_ready_undo")
+        else:
+            return restore_pr_draft()
+
     if pr["state"] not in {"OPEN", "UNKNOWN", ""}:
         return _blocked(original, state, code="pr_not_open", message=f"PR state is {pr['state'] or 'unknown'}", now=current_time)
 
@@ -2087,11 +2244,30 @@ def _reconcile_trusted_closeout_impl(
             else ""
         )
         if observed_head != new_head:
+            if _SHA_RE.fullmatch(observed_head):
+                _invalidate_head_bound_state(
+                    state,
+                    old_head=new_head,
+                    new_head=observed_head,
+                )
+                pr["head_sha"] = observed_head
+                pr["is_draft"] = ready_payload.get("isDraft") is True
+                pr["state"] = str(ready_payload.get("state") or "UNKNOWN").upper()
+                if pr["is_draft"]:
+                    return _transition(
+                        original,
+                        state,
+                        outcome="pr_pending",
+                        next_due_at=current_time,
+                        terminal=False,
+                        wake_immediately=True,
+                    )
+                return restore_pr_draft()
             return _blocked(
                 original,
                 state,
                 code="pr_ready_head_changed",
-                message="The PR head changed while GitHub marked it ready",
+                message="GitHub returned an invalid PR head after marking it ready",
                 now=current_time,
             )
         if not isinstance(ready_payload, Mapping) or ready_payload.get("isDraft") is True:

@@ -1370,6 +1370,47 @@ def test_uncertain_pr_ready_is_reobserved_before_retry(monkeypatch, tmp_path):
     assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
 
 
+def test_pr_ready_head_race_restores_draft_before_reconciling_new_head(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    views = iter(
+        (
+            _pr_payload(draft=True),
+            _pr_payload(head_sha=OLD_SHA, draft=False),
+            _pr_payload(head_sha=OLD_SHA, draft=True),
+        )
+    )
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(next(views)))
+        if args[:3] == ["gh", "pr", "ready"]:
+            return _completed(args)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == "pr_pending"
+    assert transition.terminal is False
+    assert transition.wake_immediately is True
+    assert transition.state["pr"]["head_sha"] == OLD_SHA
+    assert transition.state["pr"]["is_draft"] is True
+    assert transition.state["pr"]["ready_at"] is None
+    assert transition.state["visual_qa"] == {"status": "stale"}
+    assert transition.state["mutation_uncertainty"] == {"status": "none"}
+    ready_calls = [args for args in calls if args[:3] == ["gh", "pr", "ready"]]
+    assert len(ready_calls) == 2
+    assert "--undo" not in ready_calls[0]
+    assert "--undo" in ready_calls[1]
+
+
 def test_external_repo_without_hermes_workflows_does_not_wait_for_impossible_checks(
     monkeypatch,
     tmp_path,
