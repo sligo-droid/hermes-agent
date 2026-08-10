@@ -4455,6 +4455,10 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
+        if getattr(event, "discord_runtime_reason", None) == "dev_merge_reaction":
+            await self._dispatch_command_without_typing(event, "dev-merge")
+            return
+
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
         # cancelled), the lock is stale.  Clear it and fall through to

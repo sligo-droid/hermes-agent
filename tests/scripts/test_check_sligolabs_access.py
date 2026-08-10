@@ -205,7 +205,7 @@ def test_missing_wildcard_is_drift(tmp_path, capsys):
 
 def test_unapproved_exact_override_and_dev_namespace_are_drift(tmp_path, capsys):
     apps = _applications()
-    apps.append(_human_app("pid.sligolabs.com"))
+    apps.append(_human_app("retired.sligolabs.com"))
     apps.append(_bypass_app("other.sligolabs.com"))
     apps.append(_human_app("*.dev.sligolabs.com"))
 

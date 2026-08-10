@@ -60,6 +60,12 @@ def _repo_uses_trusted_required_checks(root: Path) -> bool:
     return any((root / path).is_file() for path in _REQUIRED_PR_CHECK_WORKFLOWS.values())
 
 
+def repo_uses_trusted_required_checks(root: Path) -> bool:
+    """Return whether this checkout requires Hermes' named CI identities."""
+
+    return _repo_uses_trusted_required_checks(root)
+
+
 CLOSEOUT_MODES = frozenset({"off", "shadow", "enforce"})
 PR_OPEN_POLICIES = frozenset({"after_review_approval", "never"})
 SUCCESS_CLOSEOUT_STATUSES = frozenset(
@@ -2138,6 +2144,7 @@ __all__ = [
     "enrich_required_check_identities",
     "latest_logical_checks",
     "normalize_closeout_state",
+    "repo_uses_trusted_required_checks",
     "reconcile_trusted_closeout",
     "sanitize_closeout_error",
     "summarize_required_checks",

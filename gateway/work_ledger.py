@@ -2182,6 +2182,9 @@ class GatewayWorkLedger:
             return False
         if _required_async_completion_state(item).get("owns_recovery"):
             return False
+        dev_merge = item.get("dev_merge")
+        if isinstance(dev_merge, dict) and str(dev_merge.get("status") or "") == "attempting":
+            return False
         delivery_attempt = item.get("delivery_attempt")
         return not (
             isinstance(delivery_attempt, dict)
@@ -2368,6 +2371,112 @@ class GatewayWorkLedger:
     def get(self, work_id: str) -> dict[str, Any] | None:
         item = self._read().get("items", {}).get(work_id)
         return dict(item) if isinstance(item, dict) else None
+
+    @_locked_ledger_mutation
+    def claim_dev_merge_for_message(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        actor_id: str,
+        lease_seconds: float = 300.0,
+    ) -> dict[str, Any] | None:
+        """Claim a merge only for a delivered terminal Discord response."""
+
+        target_chat = str(chat_id or "").strip()
+        target_message = str(message_id or "").strip()
+        if not target_chat or not target_message:
+            return None
+        data = self._read()
+        candidates: list[dict[str, Any]] = []
+        for item in data.get("items", {}).values():
+            if not isinstance(item, dict) or str(item.get("platform") or "") != "discord":
+                continue
+            source = item.get("source") if isinstance(item.get("source"), dict) else {}
+            if str(source.get("chat_id") or "") != target_chat:
+                continue
+            confirmed_ids = _bounded_delivery_message_ids(
+                item.get("confirmed_message_ids"),
+                primary=item.get("result_message_id"),
+            )
+            if target_message not in confirmed_ids:
+                continue
+            closeout = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+            if str(closeout.get("status") or "") != "pr_published":
+                continue
+            candidates.append(item)
+        if not candidates:
+            return None
+
+        item = max(
+            candidates,
+            key=lambda value: float(value.get("updated_at") or value.get("created_at") or 0),
+        )
+        now = self._now()
+        current = item.get("dev_merge") if isinstance(item.get("dev_merge"), dict) else {}
+        current_status = str(current.get("status") or "")
+        result = dict(item)
+        if current_status == "merged":
+            result["_dev_merge_claim"] = "already_merged"
+            return result
+        if current_status == "attempting" and float(current.get("lease_until") or 0) > now:
+            result["_dev_merge_claim"] = "in_progress"
+            return result
+
+        revision = _positive_int(current.get("revision")) + 1
+        attempt_id = f"dev-merge-{revision}"
+        item["dev_merge"] = {
+            "status": "attempting",
+            "revision": revision,
+            "attempt_id": attempt_id,
+            "actor_id": str(actor_id or "")[:160],
+            "message_id": target_message[:_MAX_DELIVERY_MESSAGE_ID_LENGTH],
+            "started_at": now,
+            "lease_until": now + max(1.0, float(lease_seconds)),
+        }
+        item["updated_at"] = now
+        self._write(data)
+        result = dict(item)
+        result["_dev_merge_claim"] = "claimed"
+        result["_dev_merge_attempt_id"] = attempt_id
+        return result
+
+    @_locked_ledger_mutation
+    def finish_dev_merge(
+        self,
+        work_id: str,
+        *,
+        attempt_id: str,
+        outcome: str,
+        message: str,
+        pr_url: str,
+    ) -> bool:
+        data = self._read()
+        item = data.get("items", {}).get(work_id)
+        current = item.get("dev_merge") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or not isinstance(current, dict)
+            or str(current.get("status") or "") != "attempting"
+            or str(current.get("attempt_id") or "") != str(attempt_id or "")
+        ):
+            return False
+        safe_outcome = str(outcome or "blocked").strip().lower()
+        if safe_outcome not in {"merged", "already_merged", "blocked", "uncertain"}:
+            safe_outcome = "blocked"
+        now = self._now()
+        item["dev_merge"] = {
+            **current,
+            "status": "merged" if safe_outcome in {"merged", "already_merged"} else safe_outcome,
+            "outcome": safe_outcome,
+            "message": str(message or "")[:1000],
+            "pr_url": str(pr_url or "")[:1200],
+            "finished_at": now,
+            "lease_until": None,
+        }
+        item["updated_at"] = now
+        self._write(data)
+        return True
 
     def required_async_completion_state(self, work_id: str) -> dict[str, Any] | None:
         item = self._read().get("items", {}).get(work_id)
