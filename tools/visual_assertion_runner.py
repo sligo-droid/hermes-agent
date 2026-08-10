@@ -35,6 +35,18 @@ _MUTATION_GENERATIONS: dict[str, int] = {}
 _ARTIFACT_CLEANUP_LOCK = threading.Lock()
 _LAST_ARTIFACT_CLEANUP = 0.0
 _MAX_SCREENSHOT_EVIDENCE_BYTES = 8 * 1024 * 1024
+_TRANSIENT_RETRY_CODES = frozenset(
+    {
+        "appearance_uncertain",
+        "attempt_timeout",
+        "element_lookup_unavailable",
+        "invalid_assertion_results",
+        "invalid_vision_output",
+        "screenshot_unavailable",
+        "text_check_unavailable",
+        "vision_call_failed",
+    }
+)
 
 
 def record_trusted_visual_mutation(task_id: str) -> int:
@@ -343,7 +355,7 @@ async def _run_attempt(
             artifact_sink.clear()
             images: list[str] = []
             total_image_bytes = 0
-            capture_failed = False
+            captured_execution_artifacts: list[dict[str, Any]] = []
             for index, artifact in enumerate(screenshot_artifacts[:4]):
                 screenshot_kwargs: dict[str, Any] = {}
                 locator = artifact.get("locator")
@@ -410,19 +422,23 @@ async def _run_attempt(
                         aggregate["vision_calls"] = provider_start_count
                         aggregate["code"] = viewport_code
                         return aggregate
-                    capture_failed = True
                     continue
                 raw = screenshot.pop("image_bytes", b"")
                 if not isinstance(raw, bytes) or not raw:
-                    capture_failed = True
                     continue
                 if total_image_bytes + len(raw) > _MAX_SCREENSHOT_EVIDENCE_BYTES:
-                    capture_failed = True
                     raw = b""
                     continue
                 total_image_bytes += len(raw)
                 images.append(
                     "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+                )
+                captured_execution_artifacts.append(
+                    {
+                        key: artifact[key]
+                        for key in ("kind", "description", "viewport")
+                        if key in artifact
+                    }
                 )
                 if index < len(artifact_paths):
                     try:
@@ -441,7 +457,7 @@ async def _run_attempt(
                             }
                         )
                 raw = b""
-            if capture_failed or not images:
+            if not images:
                 results.extend(
                     {"id": item["id"], "status": "blocked", "code": "screenshot_unavailable"}
                     for item in appearance
@@ -474,11 +490,17 @@ async def _run_attempt(
                     "cfg": cfg,
                     "timeout_s": vision_timeout_s,
                 }
-                if execution_context and _declares_keyword(
+                attempt_execution_context = execution_context
+                if execution_context and captured_execution_artifacts:
+                    attempt_execution_context = {
+                        **execution_context,
+                        "artifacts": captured_execution_artifacts,
+                    }
+                if attempt_execution_context and _declares_keyword(
                     vision_evaluator,
                     "execution_context",
                 ):
-                    evaluator_kwargs["execution_context"] = execution_context
+                    evaluator_kwargs["execution_context"] = attempt_execution_context
                 if _declares_keyword(vision_evaluator, "on_provider_start"):
                     evaluator_kwargs["on_provider_start"] = _mark_provider_started
                 else:
@@ -643,7 +665,7 @@ async def run_visual_assertions(
             "assertion_ids": assertion_ids,
             "status": status,
             "attempts": max(0, min(int(attempts_count), 2)),
-            "vision_calls": max(0, min(int(vision_count), 2)),
+            "vision_calls": max(0, min(int(vision_count), 4)),
             "duration_ms": max(
                 0,
                 min(int((time.monotonic() - total_started) * 1000), 60_000),
@@ -835,10 +857,10 @@ async def run_visual_assertions(
             attempt_guard = CooperativeExecutionGuard(
                 min(deadline, time.monotonic() + attempt_timeout)
             )
+            max_vision_calls_per_attempt = visual_config["max_vision_calls"]
             required_vision_calls = 2 if vision_sweeper is not None else 1
             vision_allowed = (
-                vision_calls + required_vision_calls
-                <= visual_config["max_vision_calls"]
+                required_vision_calls <= max_vision_calls_per_attempt
             )
             attempt_vision_calls = 0
 
@@ -846,7 +868,7 @@ async def run_visual_assertions(
                 nonlocal vision_calls, attempt_vision_calls
                 execution_guard.check()
                 attempt_guard.check()
-                if vision_calls >= visual_config["max_vision_calls"]:
+                if attempt_vision_calls >= max_vision_calls_per_attempt:
                     raise ExecutionGuardExpired("vision provider budget exhausted")
                 vision_calls += 1
                 attempt_vision_calls += 1
@@ -932,7 +954,17 @@ async def run_visual_assertions(
                 raise
             mutation_after = trusted_visual_mutation_token(task_id)
             trusted_mutation_changed = mutation_after != mutation_before
-            if not trusted_mutation_changed and fingerprint_after == fingerprint_before:
+            result_codes = {
+                str(item.get("code") or "")
+                for item in final.get("results") or []
+                if isinstance(item, dict)
+            }
+            transient_failure = bool(result_codes & _TRANSIENT_RETRY_CODES)
+            if (
+                not trusted_mutation_changed
+                and fingerprint_after == fingerprint_before
+                and not transient_failure
+            ):
                 break
     finally:
         if viewport_scope is not None and viewport_scope.get("ok"):

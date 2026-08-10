@@ -43,6 +43,41 @@ def test_top_level_file_mutation_error_does_not_count_as_landed():
     assert file_mutation_result_landed("patch", result) is False
 
 
+def test_successful_execute_code_direct_write_counts_as_landed_mutation():
+    result = json.dumps({"status": "success", "exit_code": 0})
+
+    assert file_mutation_result_landed(
+        "execute_code",
+        result,
+        {"code": "from pathlib import Path\nPath('/tmp/theme.css').write_text('fixed')"},
+    ) is True
+
+
+def test_read_only_execute_code_does_not_count_as_landed_mutation():
+    result = json.dumps({"status": "success", "exit_code": 0})
+
+    assert file_mutation_result_landed(
+        "execute_code",
+        result,
+        {"code": "from pathlib import Path\nprint(Path('/tmp/theme.css').read_text())"},
+    ) is False
+
+
+def test_execute_code_open_write_counts_without_comparison_false_positive():
+    result = json.dumps({"status": "success", "exit_code": 0})
+
+    assert file_mutation_result_landed(
+        "execute_code",
+        result,
+        {"code": "with open('/tmp/theme.css', 'w') as handle: handle.write('fixed')"},
+    ) is True
+    assert file_mutation_result_landed(
+        "execute_code",
+        result,
+        {"code": "print(label.replace('old', 'new'), current_width > minimum_width)"},
+    ) is False
+
+
 def test_coding_worker_host_scope_evidence_counts_as_landed_mutation():
     result = json.dumps(
         {
@@ -101,6 +136,38 @@ def test_coding_worker_mutation_promotes_parent_visual_gate_and_order():
     assert agent.visual_qa_requirement["level"] == "surface"
     assert agent._turn_mutation_generation == 1
     assert agent._turn_mutation_boundary == 4
+    assert agent._visual_qa_tool_calls == 0
+    assert agent._visual_qa_total_calls == 0
+    assert agent._visual_qa_followup_turns == 0
+
+
+def test_execute_code_edit_resets_visual_generation_budget():
+    agent = SimpleNamespace(
+        _turn_runtime_stats={"tool_calls": 8},
+        _turn_mutation_generation=1,
+        _turn_mutation_boundary=4,
+        _visual_qa_last_edit_order=4,
+        _visual_qa_tool_calls=3,
+        _visual_qa_total_calls=3,
+        _visual_qa_followup_turns=1,
+        _current_task_id="preview-variants",
+    )
+
+    _record_visual_qa_edit_order(
+        agent,
+        "execute_code",
+        json.dumps({"status": "success", "exit_code": 0}),
+        function_args={
+            "code": (
+                "from pathlib import Path\n"
+                "path = Path('/tmp/app.css')\n"
+                "path.write_text(path.read_text() + '/* divider */')"
+            )
+        },
+        task_id="preview-variants",
+    )
+
+    assert agent._visual_qa_last_edit_order == 9
     assert agent._visual_qa_tool_calls == 0
     assert agent._visual_qa_total_calls == 0
     assert agent._visual_qa_followup_turns == 0

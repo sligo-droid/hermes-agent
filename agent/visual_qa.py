@@ -206,9 +206,10 @@ def normalize_visual_qa_config(config: Any = None) -> dict[str, Any]:
     max_vision_calls = _clamped_int(
         raw.get("max_vision_calls"), default=2, minimum=0, maximum=2
     )
-    # A positive visual-QA budget is the mandatory Luna sweep plus Sonnet
-    # assertion inspection. Preserve zero as an explicit no-vision setting,
-    # but upgrade legacy one-call configuration to the required pair.
+    # This is a per-attempt budget. A positive visual-QA attempt is the
+    # mandatory Luna sweep plus Sonnet assertion inspection. Preserve zero as
+    # an explicit no-vision setting, but upgrade legacy one-call configuration
+    # to the required pair. The runner allows at most two attempts.
     if max_vision_calls == 1:
         max_vision_calls = 2
     return {
@@ -590,7 +591,7 @@ def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, 
         "assertion_ids": normalized_ids,
         "status": status,
         "attempts": _metric("attempts", 2),
-        "vision_calls": _metric("vision_calls", 2),
+        "vision_calls": _metric("vision_calls", 4),
         "duration_ms": _metric("duration_ms", 60_000),
         "diagnostic_codes": diagnostic_codes,
     }
