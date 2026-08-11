@@ -3030,7 +3030,7 @@ def _protected_authentication_hint(url: str, title: str, snapshot: str) -> Optio
         "available": True,
         "tool": "browser_authenticate",
         "instruction": (
-            "This sign-in page has operator-configured read-only QA access. "
+            "This sign-in page has operator-configured QA access. "
             "Call browser_authenticate, then inspect the protected page with browser_snapshot."
         ),
     }
@@ -5339,7 +5339,7 @@ registry.register(
         "name": "browser_authenticate",
         "description": (
             "Authenticate the current task browser with an operator-configured, "
-            "origin-bound read-only QA profile. Navigate to the protected login page "
+            "origin-bound QA profile. Navigate to the protected login page "
             "first, then call this tool before inspecting or visually verifying gated "
             "content. Credentials, cookies, tokens, and storage state are never exposed "
             "to the model or tool output. Omit "

@@ -107,11 +107,8 @@ def classify_preview_failure(result: Any) -> PreviewFailure | None:
     ):
         failure_class = "application_bootstrap"
     elif (
-        "browser login page reloaded before authentication completed" in text
-        or (
-            "vite server connection lost" in text
-            and ("cloudflareaccess.com" in text or "external hmr" in text)
-        )
+        "vite server connection lost" in text
+        and ("cloudflareaccess.com" in text or "external hmr" in text)
     ):
         failure_class = "hmr_origin_mismatch"
     elif any(
