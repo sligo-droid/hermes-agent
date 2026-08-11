@@ -862,10 +862,26 @@ def _pnpm_store_aliases(
     aliases: list[Path] = []
     for link in _iter_pnpm_package_links(node_modules):
         try:
-            suffix = link.resolve(strict=False).relative_to(store)
             raw_target = Path(os.readlink(link))
-        except (OSError, ValueError):
+        except OSError:
             continue
+        try:
+            suffix = link.resolve(strict=False).relative_to(store)
+        except ValueError:
+            suffix = None
+            raw_parts = raw_target.parts
+            for index in range(len(raw_parts) - 1, -1, -1):
+                if raw_parts[index] != ".pnpm":
+                    continue
+                candidate_parts = raw_parts[index + 1 :]
+                if not candidate_parts:
+                    continue
+                candidate = Path(*candidate_parts)
+                if (store / candidate).exists():
+                    suffix = candidate
+                    break
+            if suffix is None:
+                continue
         sandbox_link = sandbox_node_modules / link.relative_to(node_modules)
         if raw_target.is_absolute():
             sandbox_target = raw_target
