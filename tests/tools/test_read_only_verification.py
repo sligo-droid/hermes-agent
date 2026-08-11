@@ -818,6 +818,34 @@ def test_read_only_verify_mounts_nested_dependencies_and_writable_vite_caches(tm
     assert not (package / "mutation.txt").exists()
 
 
+def test_pnpm_store_aliases_relocate_removed_worktree_targets(tmp_path):
+    modules = tmp_path / "node_modules"
+    store = modules / ".pnpm"
+    package_suffix = (
+        Path("fixture@1.0.0") / "node_modules" / "fixture"
+    )
+    (store / package_suffix).mkdir(parents=True)
+    stale_modules = tmp_path / "removed-worktree" / "dashboard" / "node_modules"
+    link = modules / "fixture"
+    link.symlink_to(
+        os.path.relpath(stale_modules / ".pnpm" / package_suffix, link.parent),
+        target_is_directory=True,
+    )
+    sandbox_modules = Path("/tmp/workspace/dashboard/node_modules")
+    raw_target = Path(os.readlink(link))
+    sandbox_target = Path(
+        os.path.normpath(str(sandbox_modules / raw_target))
+    )
+    expected_alias = sandbox_target
+    for _part in package_suffix.parts:
+        expected_alias = expected_alias.parent
+
+    assert verification_tool._pnpm_store_aliases(
+        modules,
+        sandbox_modules,
+    ) == (expected_alias,)
+
+
 def test_read_only_verify_bounds_output(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
