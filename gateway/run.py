@@ -399,8 +399,10 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
     if orchestrated:
         contract_instruction = (
             "Using the full accepted request/thread plus the code you inspect, you own the "
-            "transient semantic contract. After the relevant edit and after preparing the existing "
-            "browser session with one repository-native preview launcher, use `browser_authenticate` "
+            "transient semantic contract. After the relevant edit, prepare the browser on the exact "
+            "current-head Vercel preview URL when the PR lifecycle provides one; a localhost or "
+            "production URL cannot satisfy preview visual QA. Use one repository-native preview "
+            "launcher only when no hosted preview exists; use `browser_authenticate` "
             "if a protected login page is visible and "
             "an operator profile is configured; never type or inspect credentials yourself. Then "
             "call `visual_qa` once with: the smallest relevant target/region (and a "

@@ -200,7 +200,7 @@ def test_navigation_auth_hint_is_limited_to_matching_sign_in_pages(monkeypatch):
         "available": True,
         "tool": "browser_authenticate",
         "instruction": (
-            "This sign-in page has operator-configured read-only QA access. "
+            "This sign-in page has operator-configured QA access. "
             "Call browser_authenticate, then inspect the protected page with browser_snapshot."
         ),
     }
@@ -322,7 +322,7 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
     assert "top-secret-password" not in json.dumps(result)
 
 
-def test_supervisor_authentication_fails_fast_when_login_page_reloads():
+def test_supervisor_authentication_waits_through_login_page_reload():
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
@@ -331,10 +331,10 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
     supervisor._active = True
     supervisor._page_session_id = "page-1"
     submitted = False
-    time_origin = 1000.0
+    checks_after_submit = 0
 
     async def fake_cdp(method, params=None, **kwargs):
-        nonlocal submitted, time_origin
+        nonlocal submitted, checks_after_submit
         if method == "Runtime.evaluate" and params.get("expression") == "globalThis":
             return {"result": {"result": {"objectId": "global-1"}}}
         if method == "Runtime.evaluate":
@@ -349,12 +349,12 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
                 }
             if expression == "document.readyState === 'complete'":
                 value = True
-            elif expression == "performance.timeOrigin":
-                value = time_origin
             elif "aria-invalid" in expression:
                 value = False
-            elif "performance.timeOrigin !==" in expression:
-                value = submitted
+            elif "#header" in expression:
+                if submitted:
+                    checks_after_submit += 1
+                value = submitted and checks_after_submit >= 3
             else:
                 value = False
             return {"result": {"result": {"value": value}}}
@@ -363,7 +363,6 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
                 return {"result": {"result": {"value": "inserted"}}}
             if "requestSubmit" in params["functionDeclaration"]:
                 submitted = True
-                time_origin = 2000.0
             return {"result": {"result": {"value": True}}}
         raise AssertionError(method)
 
@@ -385,11 +384,9 @@ def test_supervisor_authentication_fails_fast_when_login_page_reloads():
         loop.close()
 
     assert result == {
-        "ok": False,
-        "error": (
-            "browser login page reloaded before authentication completed; "
-            "use a stable local preview without external HMR redirects"
-        ),
+        "ok": True,
+        "authenticated": True,
+        "already_authenticated": False,
     }
     assert "hermes_qa" not in json.dumps(result)
     assert "top-secret-password" not in json.dumps(result)

@@ -765,16 +765,6 @@ class CDPSupervisor:
         already = self.evaluate_runtime(success_expression, timeout=min(timeout, 5.0))
         if already.get("ok") and already.get("result") is True:
             return {"ok": True, "authenticated": True, "already_authenticated": True}
-        initial_time_origin = self.evaluate_runtime(
-            "performance.timeOrigin",
-            timeout=min(timeout, 5.0),
-        )
-        initial_time_origin_value = initial_time_origin.get("result")
-        if isinstance(initial_time_origin_value, bool) or not isinstance(
-            initial_time_origin_value, (int, float)
-        ):
-            initial_time_origin_value = None
-
         async def _submit() -> Dict[str, Any]:
             root = await self._cdp(
                 "Runtime.evaluate",
@@ -903,23 +893,6 @@ class CDPSupervisor:
                     "ok": False,
                     "error": "browser login was rejected by the application",
                 }
-            if initial_time_origin_value is not None:
-                reloaded_to_form = self.evaluate_runtime(
-                    "(() => performance.timeOrigin !== "
-                    + repr(float(initial_time_origin_value))
-                    + " && Boolean(document.querySelector("
-                    + json.dumps(submit_selector, ensure_ascii=True)
-                    + ")))()",
-                    timeout=min(3.0, timeout),
-                )
-                if reloaded_to_form.get("ok") and reloaded_to_form.get("result") is True:
-                    return {
-                        "ok": False,
-                        "error": (
-                            "browser login page reloaded before authentication completed; "
-                            "use a stable local preview without external HMR redirects"
-                        ),
-                    }
             time.sleep(0.25)
         return {"ok": False, "error": "browser login did not reach the authenticated page"}
 

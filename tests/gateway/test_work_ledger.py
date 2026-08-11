@@ -716,6 +716,8 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     assert "never type or inspect credentials" in prompt
     assert "smallest relevant target/region" in prompt
     assert "bounded inspector—not your prose—decides pass/fail" in prompt
+    assert "exact current-head Vercel preview URL" in prompt
+    assert "localhost or production URL cannot satisfy preview visual QA" in prompt
     assert "one repository-native preview launcher" in prompt
     assert "call `visual_qa` once" in prompt
     assert "multiple stacked panels to fit in one viewport" in prompt

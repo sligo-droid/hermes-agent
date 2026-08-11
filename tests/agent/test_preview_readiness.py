@@ -62,10 +62,10 @@ def test_preview_failure_classifier_distinguishes_deterministic_and_transient_fa
         "snapshot": 'heading "Internal Error"',
     })
     hmr = classify_preview_failure({
-        "error": (
-            "browser login page reloaded before authentication completed; "
-            "use a stable local preview without external HMR redirects"
-        )
+        "error": "Vite server connection lost after redirect to cloudflareaccess.com"
+    })
+    ordinary_reload = classify_preview_failure({
+        "error": "browser login page reloaded before authentication completed"
     })
     transient = classify_preview_failure({
         "error": "net::ERR_CONNECTION_REFUSED while navigating"
@@ -84,6 +84,7 @@ def test_preview_failure_classifier_distinguishes_deterministic_and_transient_fa
         "hmr_origin_mismatch",
         True,
     )
+    assert ordinary_reload is None
     assert (transient.failure_class, transient.deterministic) == (
         "transient_browser_network",
         False,
