@@ -1000,6 +1000,7 @@ class CDPSupervisor:
                     banner: 'header',
                     contentinfo: 'footer',
                     complementary: 'aside',
+                    region: 'section[aria-label], section[aria-labelledby]',
                 }};
                 const implicitSelector = implicitRoleSelectors[spec.value] || '';
                 if (implicitSelector) {{

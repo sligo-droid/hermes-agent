@@ -109,6 +109,16 @@ def test_role_locator_matches_snapshot_landmarks_and_labelled_names():
     assert "aria-labelledby" in expression
 
 
+def test_role_locator_matches_named_section_regions_from_accessibility_snapshot():
+    supervisor = _supervisor()
+    expression = supervisor._trusted_locator_expression(
+        {"by": "role", "value": "region", "name": "Movement"}
+    )
+
+    assert "region: 'section[aria-label], section[aria-labelledby]'" in expression
+    assert "aria-labelledby" in expression
+
+
 def test_diagnostic_cursor_changes_do_not_trigger_state_retry():
     supervisor = _supervisor()
     with patch.object(
