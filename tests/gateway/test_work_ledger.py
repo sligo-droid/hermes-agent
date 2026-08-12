@@ -2577,6 +2577,36 @@ def test_default_repo_project_pr_opened_but_unmerged_is_blocked(tmp_path):
     assert stored["summary_status"] == "Blocked"
 
 
+def test_passed_enforced_visual_qa_does_not_label_lifecycle_block_as_visual(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Adjust the dashboard panel layout and spacing")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    requirement = item["visual_qa_requirement"]
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="PR opened but not merged; approval is pending.",
+        summary_status="Complete",
+        visual_qa_receipts=[_visual_receipt(requirement, order=3)],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=2,
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["reason"] == "self_declared_delivery_incomplete"
+    assert stored["completion_gate"]["visual_qa"]["status"] == "passed"
+    assert stored["final_response"].startswith(
+        "⚠️ **Completion blocked.** The work ledger did not authorize completion."
+    )
+    assert "Enforced visual QA is active" not in stored["final_response"]
+
+
 def test_full_lifecycle_blocks_unsynced_runtime_and_unverified_live_pickup(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Ship the runtime change")

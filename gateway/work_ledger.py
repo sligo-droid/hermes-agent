@@ -137,7 +137,11 @@ def enforced_visual_qa_block_notice(item: Any) -> str:
     visual = gate.get("visual_qa") if isinstance(gate.get("visual_qa"), dict) else {}
     notice = (
         _ENFORCED_VISUAL_QA_BLOCK_NOTICE
-        if reason.startswith("visual_qa_") or visual.get("enforced") is True
+        if reason.startswith("visual_qa_")
+        or (
+            visual.get("enforced") is True
+            and str(visual.get("status") or "").lower() != "passed"
+        )
         else _GENERAL_COMPLETION_BLOCK_NOTICE
     )
     if reason:
