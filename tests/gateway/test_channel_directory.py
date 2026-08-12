@@ -308,6 +308,27 @@ class TestBuildFromSessions:
         assert "Alice" in names
         assert "Bob" in names
 
+    def test_redacts_sensitive_session_names_before_persisting(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "session_1": {
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "12345",
+                    "chat_name": "QA PASSWORD=hunter2",
+                    "thread_id": "7",
+                    "chat_topic": "API_KEY=secretvalue",
+                },
+                "chat_type": "group",
+            },
+        })
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_from_sessions("telegram")
+
+        assert entries[0]["name"] == "QA [redacted] / [redacted]"
+        assert "hunter2" not in entries[0]["name"]
+        assert "secretvalue" not in entries[0]["name"]
+
     def test_missing_sessions_file(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             entries = _build_from_sessions("telegram")

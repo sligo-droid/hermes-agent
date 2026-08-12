@@ -136,12 +136,16 @@ def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
 
 
 def _session_entry_name(origin: Dict[str, Any]) -> str:
-    base_name = origin.get("chat_name") or origin.get("user_name") or str(origin.get("chat_id"))
+    base_name = _safe_display_text(
+        origin.get("chat_name") or origin.get("user_name") or str(origin.get("chat_id"))
+    )
     thread_id = origin.get("thread_id")
     if not thread_id:
         return base_name
 
-    topic_label = origin.get("chat_topic") or f"topic {thread_id}"
+    topic_label = _safe_display_text(
+        origin.get("chat_topic") or f"topic {thread_id}"
+    )
     return f"{base_name} / {topic_label}"
 
 
