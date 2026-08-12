@@ -1043,6 +1043,46 @@ def test_final_response_downgrade_skips_later_success():
     assert downgraded == text
 
 
+def test_read_only_verify_accepts_success_receipt_before_loop_warning():
+    receipt = {
+        "success": True,
+        "exit_code": 0,
+        "output": "540 passed",
+        "error": None,
+        "verification_evidence": {
+            "status": "passed",
+            "canonical_command": "pnpm run test",
+            "scope": "full",
+            "repository_root": "/tmp/project",
+            "verified_head_sha": "a" * 40,
+        },
+    }
+    result = json.dumps(receipt) + "\n\n[Tool loop warning: repeated_exact_failure_warning]"
+
+    evidence = classify_tool_verification_evidence(
+        "read_only_verify",
+        {"command": "pnpm test"},
+        result,
+        False,
+        order=12,
+    )
+
+    assert evidence == [
+        {
+            "schema_version": 1,
+            "surface": "verification",
+            "check_name": "pnpm test",
+            "status": "success",
+            "order": 12,
+            "detail": "540 passed",
+            "repository_root": "/tmp/project",
+            "canonical_command": "pnpm run test",
+            "scope": "full",
+            "verified_head_sha": "a" * 40,
+        }
+    ]
+
+
 def test_pr_merge_downgrade_line_does_not_create_pr_success_claim():
     evidence = [
         {

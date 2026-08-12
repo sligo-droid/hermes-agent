@@ -1195,7 +1195,7 @@ def classify_tool_verification_evidence(
     name = str(tool_name or "")
     args = tool_args if isinstance(tool_args, dict) else {}
     data = _json_object(result)
-    if name.startswith("browser") and not data:
+    if (name.startswith("browser") or name == "read_only_verify") and not data:
         data = _last_embedded_json_object(result)
     if name.startswith("browser") and data:
         frame_top = (
