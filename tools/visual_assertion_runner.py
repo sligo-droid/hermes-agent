@@ -356,8 +356,14 @@ async def _run_attempt(
             images: list[str] = []
             total_image_bytes = 0
             captured_execution_artifacts: list[dict[str, Any]] = []
+            viewport_fallback_captured = False
+            has_viewport_artifact = any(
+                not isinstance(item.get("locator"), dict)
+                for item in screenshot_artifacts[:4]
+            )
             for index, artifact in enumerate(screenshot_artifacts[:4]):
                 screenshot_kwargs: dict[str, Any] = {}
+                captured_artifact = artifact
                 locator = artifact.get("locator")
                 if not isinstance(locator, dict) and len(screenshot_artifacts) == 1:
                     locator = target_locator
@@ -386,6 +392,34 @@ async def _run_attempt(
                     execution_guard=execution_guard,
                     **screenshot_kwargs,
                 )
+                if (
+                    not screenshot.get("ok")
+                    and "locator" in screenshot_kwargs
+                    and not screenshot.get("viewport_code")
+                    and not viewport_fallback_captured
+                    and not has_viewport_artifact
+                ):
+                    fallback_kwargs = dict(screenshot_kwargs)
+                    fallback_kwargs.pop("locator", None)
+                    screenshot = await _thread_call(
+                        supervisor.capture_screenshot_memory,
+                        execution_guard=execution_guard,
+                        **fallback_kwargs,
+                    )
+                    if screenshot.get("ok"):
+                        viewport_fallback_captured = True
+                        captured_artifact = {
+                            "kind": "context",
+                            "description": (
+                                "Viewport fallback for "
+                                + str(artifact.get("description") or "visual QA evidence")
+                            )[:160],
+                            **(
+                                {"viewport": artifact["viewport"]}
+                                if "viewport" in artifact
+                                else {}
+                            ),
+                        }
                 if viewport_lease and governing_viewport is not None:
                     reapplied = await _thread_call(
                         supervisor.reapply_trusted_viewport_scope,
@@ -435,9 +469,9 @@ async def _run_attempt(
                 )
                 captured_execution_artifacts.append(
                     {
-                        key: artifact[key]
+                        key: captured_artifact[key]
                         for key in ("kind", "description", "viewport")
-                        if key in artifact
+                        if key in captured_artifact
                     }
                 )
                 if index < len(artifact_paths):
@@ -452,7 +486,7 @@ async def _run_attempt(
                     else:
                         artifact_sink.append(
                             {
-                                "kind": str(artifact.get("kind") or "context"),
+                                "kind": str(captured_artifact.get("kind") or "context"),
                                 "screenshot_path": str(artifact_paths[index]),
                             }
                         )
