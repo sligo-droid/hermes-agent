@@ -697,6 +697,79 @@ async def test_partial_screenshot_capture_uses_remaining_trusted_evidence():
 
 
 @pytest.mark.asyncio
+async def test_unsafe_focused_clip_falls_back_to_bounded_viewport_evidence():
+    capture_locators = []
+
+    class OversizedTargetSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self, *, locator=None):
+            capture_locators.append(locator)
+            if locator:
+                return {"ok": False, "error": "target screenshot bounds unavailable"}
+            return {"ok": True, "image_bytes": b"viewport-png"}
+
+    seen_context = {}
+
+    async def sweeper(images, *, on_provider_start, **_kwargs):
+        assert len(images) == 1
+        on_provider_start()
+        return True
+
+    async def evaluator(
+        images,
+        assertions,
+        *,
+        execution_context,
+        on_provider_start,
+        **_kwargs,
+    ):
+        seen_context.update(execution_context)
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {"id": item["id"], "status": "passed", "code": "appearance_satisfied"}
+                for item in assertions
+            ],
+        }
+
+    locator = {"by": "role", "value": "region", "name": "Published News items"}
+    result = await run_visual_assertions(
+        task_id="oversized-focused-target",
+        requirement={"level": "none", "target": "", "assertions": []},
+        contract={
+            "target": {"description": "Published News cards", "locator": locator},
+            "page": {"state": "already_open", "description": "Preview loaded"},
+            "viewport": {"description": "desktop"},
+            "state": ["News cards loaded"],
+            "artifacts": [
+                {
+                    "kind": "focused",
+                    "description": "All published News cards",
+                    "locator": locator,
+                }
+            ],
+            "assertions": [
+                {"kind": "visible", "locator": locator},
+                {"kind": "screenshot_appearance", "expectation": "News cards render normally"},
+            ],
+        },
+        supervisor=OversizedTargetSupervisor(),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "passed"
+    assert capture_locators == [locator, None]
+    assert seen_context["artifacts"] == [
+        {
+            "kind": "context",
+            "description": "Viewport fallback for All published News cards",
+            "viewport": {"description": "desktop"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_missing_browser_is_blocked_and_receipt_contains_no_protected_data():
     result = await run_visual_assertions(
         task_id="task",
