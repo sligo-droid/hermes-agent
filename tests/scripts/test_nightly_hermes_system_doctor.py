@@ -8,6 +8,91 @@ import sys
 from scripts import nightly_hermes_system_doctor as doctor
 
 
+def test_configured_inference_providers_collects_only_explicit_routes():
+    config = {
+        "model": {"provider": "cli-proxy-api", "default": "gpt-5.6-sol"},
+        "fallback_model": {"provider": "cli-proxy-api", "model": "gpt-5.6-luna"},
+        "auxiliary": {
+            "compression": {
+                "provider": "cli-proxy-api",
+                "model": "claude-sonnet-4-6",
+                "fallback_chain": [{"provider": "openai-codex", "model": "gpt-5.6-luna"}],
+            },
+            "title_generation": {"provider": "auto", "model": ""},
+        },
+    }
+
+    assert doctor.configured_inference_providers(config) == {"cli-proxy-api", "openai-codex"}
+
+
+def test_check_auth_list_ignores_unconfigured_unhealthy_provider(monkeypatch):
+    monkeypatch.setattr(
+        doctor,
+        "run",
+        lambda *args, **kwargs: {
+            "exit": 0,
+            "output": (
+                "cli-proxy-api (1 credential):\n"
+                "  #1 proxy api_key configured ←\n\n"
+                "openai-codex (1 credential):\n"
+                "  #1 legacy oauth exhausted (59m left)\n"
+            ),
+        },
+    )
+    facts = {}
+    issues = []
+
+    doctor.check_auth_list(issues, facts, {"cli-proxy-api"})
+
+    assert issues == []
+    assert facts["configured_inference_providers"] == ["cli-proxy-api"]
+
+
+def test_check_auth_list_reports_unhealthy_configured_provider(monkeypatch):
+    monkeypatch.setattr(
+        doctor,
+        "run",
+        lambda *args, **kwargs: {
+            "exit": 0,
+            "output": "openai-codex (1 credential):\n  #1 active oauth auth failed (401)\n",
+        },
+    )
+    facts = {}
+    issues = []
+
+    doctor.check_auth_list(issues, facts, {"openai-codex"})
+
+    assert [issue["name"] for issue in issues] == [
+        "configured provider credential pool has unhealthy credentials"
+    ]
+
+
+def test_check_main_inference_uses_configured_route(monkeypatch):
+    captured = {}
+
+    def fake_smoke(code, timeout=180):
+        captured["code"] = code
+        captured["timeout"] = timeout
+        return {
+            "exit": 0,
+            "output": (
+                '{"provider":"cli-proxy-api","model":"gpt-5.6-sol",'
+                '"text":"HERMES_MAIN_SMOKE_OK"}'
+            ),
+        }
+
+    monkeypatch.setattr(doctor, "python_smoke", fake_smoke)
+    facts = {}
+    issues = []
+
+    doctor.check_main_inference(issues, facts)
+
+    assert issues == []
+    assert "load_config_readonly" in captured["code"]
+    assert 'provider="openai-codex"' not in captured["code"]
+    assert "strict_provider=True" in captured["code"]
+
+
 def test_extract_compression_routes_accepts_warning_prefixed_stdout():
     output = (
         "resolve_provider_client: anthropic requested but no Anthropic credentials found\n"
@@ -597,7 +682,7 @@ def test_live_cron_entrypoint_imports_and_runs_status_without_external_checks(tm
     assert spec.loader is not None
     spec.loader.exec_module(live_doctor)
 
-    def ok_check(_issues, facts):
+    def ok_check(_issues, facts, *_args):
         facts.setdefault("mock_checks", 0)
         facts["mock_checks"] += 1
 
@@ -775,7 +860,7 @@ def test_main_status_persists_provenance_and_normal_healthy_run_is_silent(tmp_pa
     source.write_text("doctor source\n")
     shutil.copy2(source, live)
 
-    def ok_check(_issues, facts):
+    def ok_check(_issues, facts, *_args):
         facts["mock_check_ran"] = True
 
     monkeypatch.setattr(doctor, "REPO", repo)
