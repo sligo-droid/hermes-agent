@@ -543,15 +543,64 @@ def check_hermes_doctor(issues: list[dict[str, str]], facts: dict[str, Any]) -> 
         add_issue(issues, "critical", "hermes doctor reported blocking lines", "\n".join(fatal_lines))
 
 
-def check_auth_list(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
+def configured_inference_providers(config: dict[str, Any]) -> set[str]:
+    """Return providers that the live main/auxiliary routes explicitly require."""
+    providers: set[str] = set()
+
+    def add_route(route: Any) -> None:
+        if not isinstance(route, dict):
+            return
+        provider = str(route.get("provider") or "").strip().lower()
+        if provider and provider != "auto":
+            providers.add(provider)
+        for fallback in route.get("fallback_chain") or []:
+            add_route(fallback)
+
+    add_route(config.get("model"))
+    for route in (config.get("auxiliary") or {}).values():
+        add_route(route)
+    fallback_model = config.get("fallback_model")
+    if isinstance(fallback_model, list):
+        for route in fallback_model:
+            add_route(route)
+    else:
+        add_route(fallback_model)
+    return providers
+
+
+def load_configured_inference_providers() -> set[str]:
+    try:
+        from hermes_cli.config import load_config_readonly
+    except ImportError:
+        from hermes_cli.config import load_config as load_config_readonly
+
+    return configured_inference_providers(load_config_readonly())
+
+
+def check_auth_list(
+    issues: list[dict[str, str]],
+    facts: dict[str, Any],
+    expected_providers: set[str] | None = None,
+) -> None:
     r = run([str(HERMES), "auth", "list"], timeout=120)
     facts["hermes_auth_list_exit"] = r["exit"]
     facts["hermes_auth_list"] = r["output"]
+    facts["configured_inference_providers"] = sorted(expected_providers or [])
     if r["exit"] != 0:
         add_issue(issues, "critical", "hermes auth list failed", r["output"])
-    bad = [line.strip() for line in r["output"].splitlines() if re.search(r"(?i)auth failed|expired|exhausted|invalid|401|403", line)]
+    bad = []
+    current_provider = ""
+    for line in r["output"].splitlines():
+        header = re.match(r"^([^\s(]+)\s+\(\d+\s+credentials?\):\s*$", line.strip())
+        if header:
+            current_provider = header.group(1).lower()
+            continue
+        if not re.search(r"(?i)auth failed|expired|exhausted|invalid|401|403", line):
+            continue
+        if expected_providers is None or current_provider in expected_providers:
+            bad.append(line.strip())
     if bad:
-        add_issue(issues, "critical", "hermes credential pool has unhealthy credentials", "\n".join(bad))
+        add_issue(issues, "critical", "configured provider credential pool has unhealthy credentials", "\n".join(bad))
 
 
 def check_codex_auth_incidents(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
@@ -609,22 +658,42 @@ print(json.dumps(result, sort_keys=True))
 
 def check_main_inference(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
     code = r'''
+import json
 from agent.auxiliary_client import call_llm
+try:
+    from hermes_cli.config import load_config_readonly
+except ImportError:
+    from hermes_cli.config import load_config as load_config_readonly
+
+config = load_config_readonly()
+main = config.get("model") or {}
+provider = str(main.get("provider") or "").strip()
+model = str(main.get("default") or main.get("name") or main.get("model") or "").strip()
+api_mode = str(main.get("api_mode") or "").strip() or None
+if not provider or not model:
+    raise RuntimeError("model.provider and model.default/name must be configured")
 resp = call_llm(
-    provider="openai-codex",
-    model="gpt-5.5",
+    provider=provider,
+    model=model,
+    api_mode=api_mode,
     messages=[{"role":"user","content":"Reply with exactly: HERMES_MAIN_SMOKE_OK"}],
     max_tokens=12,
     timeout=90,
+    strict_provider=True,
 )
 text = (resp.choices[0].message.content or "").strip()
-print(text)
+print(json.dumps({
+    "provider": provider,
+    "model": model,
+    "response_model": getattr(resp, "model", None),
+    "text": text,
+}, sort_keys=True))
 '''
     r = python_smoke(code, timeout=150)
     facts["main_inference_exit"] = r["exit"]
     facts["main_inference_output"] = r["output"]
     if r["exit"] != 0 or "HERMES_MAIN_SMOKE_OK" not in r["output"]:
-        add_issue(issues, "critical", "main openai-codex inference smoke failed", r["output"])
+        add_issue(issues, "critical", "configured main inference smoke failed", r["output"])
 
 
 def check_compression_inference(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
@@ -997,8 +1066,14 @@ def main() -> int:
     }
 
     check_hermes_doctor(issues, facts)
-    check_auth_list(issues, facts)
-    check_codex_auth_incidents(issues, facts)
+    expected_providers = load_configured_inference_providers()
+    check_auth_list(issues, facts, expected_providers)
+    if "openai-codex" in expected_providers:
+        check_codex_auth_incidents(issues, facts)
+    else:
+        facts["codex_auth_evidence_count"] = 0
+        facts["codex_auth_incident"] = None
+        facts["codex_auth_check"] = "skipped; openai-codex is not a configured inference route"
     check_xai_plugin_imports(issues, facts)
     check_main_inference(issues, facts)
     check_compression_inference(issues, facts)
