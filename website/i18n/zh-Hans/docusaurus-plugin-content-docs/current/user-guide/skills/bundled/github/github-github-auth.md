@@ -225,7 +225,7 @@ curl -s -H "Authorization: token $GITHUB_TOKEN" \
 
 ```bash
 # Read from git credential store
-grep "github.com" ~/.git-credentials 2>/dev/null | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|'
+uv run python3 "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/git-credential-token.py"
 ```
 
 ### 辅助函数：检测认证方式
@@ -242,7 +242,7 @@ elif GITHUB_TOKEN="$(python -m hermes_cli.env_loader GITHUB_TOKEN 2>/dev/null)" 
   export GITHUB_TOKEN
   echo "AUTH_METHOD=curl"
 elif grep -q "github.com" ~/.git-credentials 2>/dev/null; then
-  export GITHUB_TOKEN=$(grep "github.com" ~/.git-credentials | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|')
+  export GITHUB_TOKEN=$(uv run python3 "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/git-credential-token.py")
   echo "AUTH_METHOD=curl"
 else
   echo "AUTH_METHOD=none"

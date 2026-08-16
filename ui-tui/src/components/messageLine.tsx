@@ -7,9 +7,9 @@ import { hasLeadGap } from '../domain/blockLayout.js'
 import { sectionMode } from '../domain/details.js'
 import { userDisplay } from '../domain/messages.js'
 import { ROLE } from '../domain/roles.js'
+import { splitSlashSkillRefs } from '../domain/slash.js'
 import { transcriptBodyWidth, transcriptGutterWidth } from '../lib/inputMetrics.js'
 import {
-  boundedHistoryRenderText,
   boundedLiveRenderText,
   compactPreview,
   hasAnsi,
@@ -28,17 +28,39 @@ import { TodoPanel } from './todoPanel.js'
 // Collapse threshold for long system messages (system prompt etc.)
 const SYSTEM_COLLAPSE_CHARS = 400
 
+// `display.timestamps` label — same HH:MM shape the classic CLI's default
+// `display.timestamp_format` ("%H:%M") produces on its message labels, so
+// one config key reads identically across surfaces (#41531).
+export const fmtMsgTimestamp = (createdAt: number | undefined): null | string => {
+  if (typeof createdAt !== 'number' || !Number.isFinite(createdAt) || createdAt <= 0) {
+    return null
+  }
+
+  const date = new Date(createdAt * 1000)
+
+  if (Number.isNaN(date.getTime())) {
+    return null
+  }
+
+  const hh = String(date.getHours()).padStart(2, '0')
+  const mm = String(date.getMinutes()).padStart(2, '0')
+
+  return `[${hh}:${mm}]`
+}
+
 export const MessageLine = memo(function MessageLine({
   cols,
   compact,
   detailsMode = 'collapsed',
   detailsModeCommandOverride = false,
   isStreaming = false,
-  limitHistoryRender = false,
+  liveDetails = false,
   msg,
   prev,
+  reasoningActive = false,
   sections,
   t,
+  timestamps = false,
   tools = []
 }: MessageLineProps) {
   // Per-section overrides win over the global mode, so resolve each section
@@ -48,10 +70,9 @@ export const MessageLine = memo(function MessageLine({
   // feeds Thinking + Tool calls.  Gating on every section would let
   // `thinking` (expanded by default) keep an empty wrapper alive when only
   // `tools` is hidden — exactly the empty-Box bug Copilot caught.
-  const commandOverride = detailsModeCommandOverride || msg.detailsCollapsedByDefault === true
-  const thinkingMode = sectionMode('thinking', detailsMode, sections, commandOverride)
-  const toolsMode = sectionMode('tools', detailsMode, sections, commandOverride)
-  const activityMode = sectionMode('activity', detailsMode, sections, commandOverride)
+  const thinkingMode = sectionMode('thinking', detailsMode, sections, detailsModeCommandOverride)
+  const toolsMode = sectionMode('tools', detailsMode, sections, detailsModeCommandOverride)
+  const activityMode = sectionMode('activity', detailsMode, sections, detailsModeCommandOverride)
   const thinking = msg.thinking?.trim() ?? ''
 
   // One blank line above this block iff it opens a new visual group relative
@@ -65,7 +86,6 @@ export const MessageLine = memo(function MessageLine({
   // Collapse toggle for long system messages
   const systemIsLong = msg.role === 'system' && msg.text.length > SYSTEM_COLLAPSE_CHARS
   const [systemOpen, setSystemOpen] = useState(false)
-  const [toolOpen, setToolOpen] = useState(false)
 
   if (msg.kind === 'trail' && msg.todos?.length) {
     return (
@@ -79,12 +99,15 @@ export const MessageLine = memo(function MessageLine({
   }
 
   if (msg.kind === 'trail' && (msg.tools?.length || tools.length || thinking)) {
-    return thinkingMode !== 'hidden' || toolsMode !== 'hidden' || activityMode !== 'hidden' ? (
+    return shouldShowThinkingTrail(msg, thinkingMode, toolsMode, activityMode) ? (
       <Box flexDirection="column" marginTop={leadGap ? 1 : 0}>
         <ToolTrail
-          commandOverride={commandOverride}
+          commandOverride={detailsModeCommandOverride}
           detailsMode={detailsMode}
+          preferExpandedThinking={liveDetails}
           reasoning={thinking}
+          reasoningActive={reasoningActive}
+          reasoningAlwaysVisible={msg.isMoaReference}
           reasoningTokens={msg.thinkingTokens}
           sections={sections}
           t={t}
@@ -109,29 +132,35 @@ export const MessageLine = memo(function MessageLine({
     const stripped = hasAnsi(msg.text) ? stripAnsi(msg.text) : msg.text
     const safeAnsi = hasAnsi(msg.text) ? sanitizeAnsiForRender(msg.text) : msg.text
     const preview = compactPreview(stripped, maxChars) || '(empty tool result)'
+
     return (
-      <Box
-        alignSelf="flex-start"
-        borderColor={t.color.muted}
-        borderStyle="round"
-        flexDirection="column"
-        marginLeft={3}
-        onClick={() => setToolOpen(v => !v)}
-        paddingX={1}
-      >
-        <Text color={t.color.muted} wrap="truncate-end">
-          <Text color={t.color.accent}>{toolOpen ? '▾ ' : '▸ '}</Text>
-          {toolOpen ? 'Tool result' : preview}
-        </Text>
-        {toolOpen ? (
-          hasAnsi(msg.text) ? (
+      <Box alignSelf="flex-start" borderColor={t.color.muted} borderStyle="round" marginLeft={3} paddingX={1}>
+        {hasAnsi(msg.text) ? (
+          <Text wrap="truncate-end">
             <Ansi>{safeAnsi}</Ansi>
-          ) : (
-            <Text color={t.color.muted} wrap="wrap">
-              {msg.text}
-            </Text>
-          )
-        ) : null}
+          </Text>
+        ) : (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {preview}
+          </Text>
+        )}
+      </Box>
+    )
+  }
+
+  // Timeline events (model switches, delegation completions) render as
+  // dim ◈ markers with no gutter — not as opaque user messages.
+  if (msg.kind === 'event') {
+    const eventGutterWidth = transcriptGutterWidth('system', t.brand.prompt)
+
+    return (
+      <Box marginBottom={1} marginTop={leadGap ? 1 : 0}>
+        <NoSelect flexShrink={0} fromLeftEdge width={eventGutterWidth}>
+          <Text> </Text>
+        </NoSelect>
+        <Text color={t.color.muted} dimColor>
+          ◈ {msg.text}
+        </Text>
       </Box>
     )
   }
@@ -183,7 +212,7 @@ export const MessageLine = memo(function MessageLine({
         // streamingMarkdown.tsx for the cost model.
         <StreamingMd cols={bodyWidth} compact={compact} t={t} text={boundedLiveRenderText(msg.text)} />
       ) : (
-        <Md cols={bodyWidth} compact={compact} t={t} text={limitHistoryRender ? boundedHistoryRenderText(msg.text) : msg.text} />
+        <Md cols={bodyWidth} compact={compact} t={t} text={msg.text} />
       )
     }
 
@@ -201,6 +230,27 @@ export const MessageLine = memo(function MessageLine({
       )
     }
 
+    // A skill the user referenced mid-prose (`clean this up with /clean`)
+    // keeps the accent it wore as a completion in the composer, instead of
+    // flattening back into the body text.
+    if (msg.role === 'user') {
+      const segments = splitSlashSkillRefs(msg.text)
+
+      return (
+        <Text {...(body ? { color: body } : {})}>
+          {segments.map((segment, i) =>
+            segment.ref ? (
+              <Text color={t.color.accent} key={i}>
+                {segment.text}
+              </Text>
+            ) : (
+              segment.text
+            )
+          )}
+        </Text>
+      )
+    }
+
     return <Text {...(body ? { color: body } : {})}>{msg.text}</Text>
   })()
 
@@ -208,6 +258,12 @@ export const MessageLine = memo(function MessageLine({
   // segments) keep a blank line on both sides so the patch doesn't butt up
   // against the prose around it.
   const isDiffSegment = msg.kind === 'diff'
+
+  // `display.timestamps`: dim [HH:MM] beside the gutter glyph on user and
+  // assistant rows only — event/trail/system chrome stays unstamped, matching
+  // the classic CLI which stamps its user/assistant labels (#41531).
+  const stamp =
+    timestamps && (msg.role === 'user' || msg.role === 'assistant') && !msg.kind ? fmtMsgTimestamp(msg.createdAt) : null
 
   return (
     <Box
@@ -218,9 +274,11 @@ export const MessageLine = memo(function MessageLine({
       {showDetails && (
         <Box flexDirection="column" marginBottom={1}>
           <ToolTrail
-            commandOverride={commandOverride}
+            commandOverride={detailsModeCommandOverride}
             detailsMode={detailsMode}
+            preferExpandedThinking={liveDetails}
             reasoning={thinking}
+            reasoningActive={reasoningActive}
             reasoningTokens={msg.thinkingTokens}
             sections={sections}
             t={t}
@@ -241,6 +299,17 @@ export const MessageLine = memo(function MessageLine({
         </Box>
       )}
 
+      {stamp && (
+        <Box>
+          <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
+            <Text> </Text>
+          </NoSelect>
+          <Text color={t.color.muted} dim>
+            {stamp}
+          </Text>
+        </Box>
+      )}
+
       <Box>
         <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
           <Text bold={msg.role === 'user'} color={prefix}>
@@ -257,19 +326,34 @@ export const MessageLine = memo(function MessageLine({
 export const shouldShowResponseSeparator = (msg: Msg, showDetails: boolean): boolean =>
   msg.role === 'assistant' && showDetails && /\S/.test(msg.text)
 
+// A MoA reference block (msg.isMoaReference) is the user-facing
+// mixture-of-agents process the user opted into, not private model
+// reasoning — it must stay visible even when every other trail section is
+// hidden (#64657).
+export const shouldShowThinkingTrail = (
+  msg: Msg,
+  thinkingMode: DetailsMode,
+  toolsMode: DetailsMode,
+  activityMode: DetailsMode
+): boolean =>
+  Boolean(msg.isMoaReference) || thinkingMode !== 'hidden' || toolsMode !== 'hidden' || activityMode !== 'hidden'
+
 interface MessageLineProps {
   cols: number
   compact?: boolean
   detailsMode?: DetailsMode
   detailsModeCommandOverride?: boolean
   isStreaming?: boolean
-  limitHistoryRender?: boolean
+  liveDetails?: boolean
   msg: Msg
   // The block rendered directly above this one. Drives the group-boundary
   // lead gap (see domain/blockLayout.ts::hasLeadGap). Undefined at the top of
   // the transcript or when spacing is irrelevant.
   prev?: Msg
+  reasoningActive?: boolean
   sections?: SectionVisibility
   t: Theme
+  /** `display.timestamps` — dim [HH:MM] label on user/assistant rows. */
+  timestamps?: boolean
   tools?: ActiveTool[]
 }

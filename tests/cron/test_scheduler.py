@@ -2240,7 +2240,7 @@ class TestRunJobSkillBacked:
         assert "blogwatcher" in prompt_arg
         assert "Follow this skill" in prompt_arg
         assert "Check the feeds and summarize anything new." in prompt_arg
-        assert skill_view_mock.call_args.kwargs["full_content"] is False
+        assert skill_view_mock.call_args.kwargs["preprocess"] is False
 
     def test_run_job_loads_multiple_skills_in_order(self, tmp_path):
         job = {
@@ -2281,7 +2281,7 @@ class TestRunJobSkillBacked:
         assert final_response == "ok"
         assert skill_view_mock.call_count == 2
         assert [call.args[0] for call in skill_view_mock.call_args_list] == ["blogwatcher", "maps"]
-        assert [call.kwargs.get("full_content") for call in skill_view_mock.call_args_list] == [False, False]
+        assert [call.kwargs.get("preprocess") for call in skill_view_mock.call_args_list] == [False, False]
 
         prompt_arg = mock_agent.run_conversation.call_args.args[0]
         assert prompt_arg.index("blogwatcher") < prompt_arg.index("maps")

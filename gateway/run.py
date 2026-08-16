@@ -16967,6 +16967,19 @@ class _GatewayRunnerCore(
             logger.exception("Plugin command dispatch failed: /%s", command)
             return True, "Plugin command failed. Check gateway logs for details."
 
+    async def _handle_gateway_platform_event(self, event: dict, source) -> None:
+        """Authorize and publish one normalized adapter event to plugin hooks."""
+        try:
+            from hermes_cli.lifecycle import has_hook, invoke_hook
+
+            if not has_hook("gateway_platform_event"):
+                return
+            if not self._is_user_authorized(source):
+                return
+            invoke_hook("gateway_platform_event", **event)
+        except Exception:
+            logger.debug("gateway_platform_event hook dispatch failed", exc_info=True)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -17102,9 +17115,8 @@ class _GatewayRunnerCore(
         self._hydrate_discord_feature_summary_from_adapter(event)
         _work_item = self._accept_discord_work_item(event, _quick_key)
         if source.platform == Platform.DISCORD and not _work_item:
-            event.discord_pr_generation = self._ledger().discord_pr_generation(
-                _quick_key
-            )
+            generation = getattr(self._ledger(), "discord_pr_generation", None)
+            event.discord_pr_generation = generation(_quick_key) if generation else 1
             event.discord_pr_rollover = False
         if (
             _work_item
@@ -21502,6 +21514,13 @@ class _GatewayRunnerCore(
                     chat_id = str(getattr(source, "chat_id", "") or "")
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
+                    user_id_alt = str(getattr(source, "user_id_alt", "") or "") or None
+                    delivery_metadata = self._thread_metadata_for_source(
+                        source, str(getattr(event, "message_id", "") or "") or None
+                    ) or {}
+                    chat_type = str(getattr(source, "chat_type", "") or "") or None
+                    if chat_type:
+                        delivery_metadata["chat_type"] = chat_type
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
@@ -21512,6 +21531,9 @@ class _GatewayRunnerCore(
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
+                                    user_id_alt=user_id_alt,
+                                    chat_type=chat_type,
+                                    delivery_metadata=delivery_metadata,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                                 )
                             finally:
@@ -29854,7 +29876,7 @@ class _GatewayRunnerCore(
                     session_key,
                     exc_info=True,
                 )
-        self._pending_messages.pop(session_key, None)
+        self.__dict__.get("_pending_messages", {}).pop(session_key, None)
         self.__dict__.setdefault("_queued_events", {}).pop(session_key, None)
         if (
             manage_session_owned_async

@@ -774,6 +774,24 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         config.option.timeout_method = "thread"
 
 
+_OS_MARKS = {
+    "linux_only": (lambda: sys.platform.startswith("linux"), "Linux"),
+    "macos_only": (lambda: sys.platform == "darwin", "macOS"),
+    "windows_only": (lambda: sys.platform == "win32", "native Windows"),
+}
+
+
+def pytest_collection_modifyitems(config, items):  # noqa: ARG001
+    """Run host-specific tests only on the operating system they exercise."""
+    for marker, (is_host, label) in _OS_MARKS.items():
+        if is_host():
+            continue
+        skip = pytest.mark.skip(reason=f"{label}-only test; host is {sys.platform}")
+        for item in items:
+            if item.get_closest_marker(marker) is not None:
+                item.add_marker(skip)
+
+
 @pytest.fixture(autouse=True)
 def _live_system_guard(request, monkeypatch):
     """Block real os.kill / systemctl / gateway-pid scans during tests.

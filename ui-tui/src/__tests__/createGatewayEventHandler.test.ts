@@ -1,11 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
-import { osc777Notify, wrapForMultiplexer } from '../lib/terminalNotification.js'
+import { ZERO } from '../domain/usage.js'
 import { estimateTokensRough } from '../lib/text.js'
 import type { Msg } from '../types.js'
 
@@ -18,7 +18,7 @@ vi.mock('../lib/openExternalUrl.js', () => ({
 
 const ref = <T>(current: T) => ({ current })
 
-const buildCtx = (appended: Msg[], overrides: any = {}) =>
+const buildCtx = (appended: Msg[]) =>
   ({
     composer: {
       dequeue: () => undefined,
@@ -43,16 +43,13 @@ const buildCtx = (appended: Msg[], overrides: any = {}) =>
     },
     system: {
       bellOnComplete: false,
-      terminalNotifyOnComplete: false,
-      sys: vi.fn(),
-      ...(overrides.system ?? {})
+      sys: vi.fn()
     },
     transcript: {
       appendMessage: (msg: Msg) => appended.push(msg),
       panel: (title: string, sections: any[]) =>
         appended.push({ kind: 'panel', panelData: { sections, title }, role: 'system', text: '' }),
-      setHistoryItems: vi.fn(),
-      ...(overrides.transcript ?? {})
+      setHistoryItems: vi.fn()
     },
     voice: {
       setProcessing: vi.fn(),
@@ -63,29 +60,11 @@ const buildCtx = (appended: Msg[], overrides: any = {}) =>
 
 describe('createGatewayEventHandler', () => {
   beforeEach(() => {
-    vi.stubEnv('TMUX', '')
-    vi.stubEnv('STY', '')
-    vi.stubEnv('CMUX_WORKSPACE_ID', '')
-    vi.stubEnv('CMUX_SURFACE_ID', '')
-    vi.stubEnv('CMUX_TAB_ID', '')
-    vi.stubEnv('CMUX_PANEL_ID', '')
-    vi.stubEnv('CMUX_SOCKET_PATH', '')
-    vi.stubEnv('__CFBundleIdentifier', '')
-    vi.stubEnv('SSH_CONNECTION', '')
-    vi.stubEnv('SSH_TTY', '')
-    vi.stubEnv('GHOSTTY_RESOURCES_DIR', '')
-    vi.stubEnv('GHOSTTY_BIN_DIR', '')
-    vi.stubEnv('TERM_PROGRAM', '')
-    vi.stubEnv('TERM', 'xterm-256color')
     resetOverlayState()
     resetUiState()
     resetTurnState()
     turnController.fullReset()
     patchUiState({ showReasoning: true })
-  })
-
-  afterEach(() => {
-    vi.unstubAllEnvs()
   })
 
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {
@@ -116,68 +95,60 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual([])
   })
 
-  it('writes terminal completion notification on completed assistant responses', () => {
+  it('opens a billing confirm dialog routing Nous to /topup', () => {
     const appended: Msg[] = []
-    const stdout = { isTTY: true, write: vi.fn() }
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
 
-    const onEvent = createGatewayEventHandler(
-      buildCtx(appended, { system: { stdout, terminalNotifyOnComplete: true } })
-    )
+    onEvent({
+      payload: {
+        billing: {
+          billing_url: null,
+          is_nous: true,
+          message: 'out of credits',
+          model: 'm',
+          provider: 'nous',
+          provider_label: 'Nous Portal'
+        },
+        text: 'Billing or credits exhausted: ...'
+      },
+      type: 'message.complete'
+    } as any)
 
-    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+    const { confirm } = getOverlayState()
+    expect(confirm?.title).toContain('Nous')
+    expect(confirm?.confirmLabel).toBe('Top up')
 
-    expect(stdout.write).toHaveBeenCalledWith(wrapForMultiplexer(osc777Notify()))
+    confirm!.onConfirm()
+    expect(ctx.submission.submitRef.current).toHaveBeenCalledWith('/topup')
   })
 
-  it('does not emit terminal completion notification inside tmux', () => {
-    vi.stubEnv('TMUX', '/tmp/tmux')
-
+  it('deep-links a third-party provider billing page from the confirm dialog', () => {
     const appended: Msg[] = []
-    const stdout = { isTTY: true, write: vi.fn() }
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+    openExternalUrlMock.mockClear()
 
-    const onEvent = createGatewayEventHandler(
-      buildCtx(appended, { system: { stdout, terminalNotifyOnComplete: true } })
-    )
+    onEvent({
+      payload: {
+        billing: {
+          billing_url: 'https://openrouter.ai/settings/credits',
+          is_nous: false,
+          message: 'out of credits',
+          model: 'm',
+          provider: 'openrouter',
+          provider_label: 'OpenRouter'
+        },
+        text: 'Billing or credits exhausted: ...'
+      },
+      type: 'message.complete'
+    } as any)
 
-    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+    const { confirm } = getOverlayState()
+    expect(confirm?.confirmLabel).toBe('Open billing page')
 
-    expect(stdout.write).not.toHaveBeenCalled()
-  })
-
-  it('requests a tail resnap after completed assistant responses enter history', () => {
-    const appended: Msg[] = []
-    const onAssistantComplete = vi.fn()
-    const onEvent = createGatewayEventHandler(buildCtx(appended, { transcript: { onAssistantComplete } }))
-
-    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
-
-    expect(appended).toContainEqual({ role: 'assistant', text: 'done' })
-    expect(onAssistantComplete).toHaveBeenCalledOnce()
-  })
-
-  it('does not request a tail resnap after interrupted turns', () => {
-    const appended: Msg[] = []
-    const onAssistantComplete = vi.fn()
-    const onEvent = createGatewayEventHandler(buildCtx(appended, { transcript: { onAssistantComplete } }))
-
-    turnController.interrupted = true
-    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
-
-    expect(onAssistantComplete).not.toHaveBeenCalled()
-  })
-
-  it('does not write terminal completion notification after interrupted turns', () => {
-    const appended: Msg[] = []
-    const stdout = { isTTY: true, write: vi.fn() }
-
-    const onEvent = createGatewayEventHandler(
-      buildCtx(appended, { system: { stdout, terminalNotifyOnComplete: true } })
-    )
-
-    turnController.interrupted = true
-    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
-
-    expect(stdout.write).not.toHaveBeenCalled()
+    confirm!.onConfirm()
+    expect(openExternalUrlMock).toHaveBeenCalledWith('https://openrouter.ai/settings/credits')
   })
 
   it('archives completed todos into transcript flow at end of turn', () => {
@@ -565,11 +536,11 @@ describe('createGatewayEventHandler', () => {
     const handler = createGatewayEventHandler(ctx)
 
     handler({
-      payload: { message: 'Chrome launched and listening on port 9222' },
+      payload: { message: 'Chromium-family browser launched and listening on port 9222' },
       type: 'browser.progress'
     } as any)
 
-    expect(ctx.system.sys).toHaveBeenCalledWith('Chrome launched and listening on port 9222')
+    expect(ctx.system.sys).toHaveBeenCalledWith('Chromium-family browser launched and listening on port 9222')
   })
 
   it('annotates gateway.start_timeout with stderr tail lines so users can diagnose without /logs', () => {
@@ -807,6 +778,204 @@ describe('createGatewayEventHandler', () => {
     createGatewayEventHandler(ctx)
 
     expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+  })
+
+  it('picks the polarity-matching paired palette from gateway.ready skins', async () => {
+    const appended: Msg[] = []
+
+    const skin = {
+      colors: { banner_title: '#00FF88', banner_text: '#FFF8DC' },
+      light_colors: { banner_title: '#8B0000', banner_text: '#22201C' }
+    }
+
+    // Dark terminal (clean env): the dark-authored `colors` block wins.
+    vi.stubEnv('HERMES_TUI_BACKGROUND', '')
+    createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
+    expect(getUiState().theme.color.primary).toBe('#00FF88')
+
+    // Light terminal: the hand-tuned light_colors block wins over adaptation.
+    vi.stubEnv('HERMES_TUI_BACKGROUND', '#ffffff')
+    createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
+    expect(getUiState().theme.color.primary).toBe('#8B0000')
+    vi.unstubAllEnvs()
+  })
+
+  it('a skin that owns the background paints BOTH terminal defaults (OSC 11 bg + OSC 10 fg)', () => {
+    // Default-fg tokens (markdown body, borders) render with the TERMINAL's
+    // default foreground. A dark skin on a light terminal repaints the
+    // backdrop black via OSC-11 — without the OSC-10 pair, those tokens stay
+    // the host's near-black: invisible. The invariant is fg == theme text.
+    const writes: string[] = []
+
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(chunk => {
+      writes.push(String(chunk))
+
+      return true
+    })
+
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true })
+
+    try {
+      const handle = createGatewayEventHandler(buildCtx([]))
+      handle({ payload: { colors: { background: '#000000', ui_text: '#ff9f0a' } }, type: 'skin.changed' } as any)
+
+      const joined = writes.join('')
+      expect(joined).toContain('\x1b]11;#000000\x07')
+      expect(joined).toContain(`\x1b]10;${getUiState().theme.color.text}\x07`)
+
+      // Dropping the background releases BOTH defaults back to the terminal.
+      writes.length = 0
+      handle({ payload: { colors: { ui_text: '#ff9f0a' } }, type: 'skin.changed' } as any)
+      expect(writes.join('')).toContain('\x1b]111\x07')
+      expect(writes.join('')).toContain('\x1b]110\x07')
+    } finally {
+      write.mockRestore()
+
+      if (tty) {
+        Object.defineProperty(process.stdout, 'isTTY', tty)
+      }
+    }
+  })
+
+  it('infers polarity from the OSC-10 foreground only when the answer is decisive', async () => {
+    const { polarityBackgroundFromForeground } = await import('../app/createGatewayEventHandler.js')
+
+    // Bright foreground = dark theme; dark foreground = light theme.
+    expect(polarityBackgroundFromForeground('#cccccc')).toBe('#1e1e1e')
+    expect(polarityBackgroundFromForeground('#333333')).toBe('#ffffff')
+
+    // Unset-default fingerprints and ambiguous mid-grays commit nothing.
+    expect(polarityBackgroundFromForeground('#000000')).toBeUndefined()
+    expect(polarityBackgroundFromForeground('#ffffff')).toBeUndefined()
+    expect(polarityBackgroundFromForeground('#808080')).toBeUndefined()
+    expect(polarityBackgroundFromForeground('not-a-color')).toBeUndefined()
+  })
+
+  it('claims wake-word ownership when the gateway becomes ready', () => {
+    const ctx = buildCtx([])
+
+    createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
+
+    expect(ctx.gateway.rpc).toHaveBeenCalledWith('wake.start', { surface: 'tui' })
+  })
+
+  it('ends voice mode on a stop-phrase transcript without submitting a turn', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { stop_phrase: true, text: 'stop' }, type: 'voice.transcript' } as any)
+
+    expect(ctx.voice.setVoiceEnabled).toHaveBeenCalledWith(false)
+    expect(ctx.voice.setRecording).toHaveBeenCalledWith(false)
+    expect(ctx.voice.setProcessing).toHaveBeenCalledWith(false)
+    expect(ctx.system.sys).toHaveBeenCalledWith('voice: stop phrase — voice chat ended')
+    // The stop phrase is user intent to END the chat — never a turn.
+    expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
+  })
+
+  it('ends voice mode on a typed stop phrase consumed server-side', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { stop_phrase: true, typed: true }, type: 'voice.transcript' } as any)
+
+    expect(ctx.voice.setVoiceEnabled).toHaveBeenCalledWith(false)
+    expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
+  })
+
+  it('still submits ordinary voice transcripts as turns', async () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { text: 'stop the docker container' }, type: 'voice.transcript' } as any)
+
+    await vi.waitFor(() => expect(ctx.submission.submitRef.current).toHaveBeenCalledWith('stop the docker container'))
+    expect(ctx.voice.setVoiceEnabled).not.toHaveBeenCalled()
+  })
+
+  it('leaves voice transcripts editable when voice.submit_mode is draft', async () => {
+    const ctx = buildCtx([])
+    let composerInput = 'existing draft'
+
+    ctx.gateway.rpc = vi.fn(async (method: string) =>
+      method === 'config.get' ? { config: { voice: { submit_mode: 'draft' } } } : null
+    )
+    ctx.composer.setInput = vi.fn((next: string | ((current: string) => string)) => {
+      composerInput = typeof next === 'function' ? next(composerInput) : next
+    })
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { text: '  edit this first  ' }, type: 'voice.transcript' } as any)
+
+    await vi.waitFor(() => expect(composerInput).toBe('existing draft edit this first'))
+    expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
+    expect(ctx.gateway.rpc).toHaveBeenCalledWith('config.get', { key: 'full' })
+  })
+
+  it('falls back to direct submit for an invalid voice.submit_mode', async () => {
+    const ctx = buildCtx([])
+
+    ctx.gateway.rpc = vi.fn(async (method: string) =>
+      method === 'config.get' ? { config: { voice: { submit_mode: 'refine' } } } : null
+    )
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { text: 'send safely' }, type: 'voice.transcript' } as any)
+
+    await vi.waitFor(() => expect(ctx.submission.submitRef.current).toHaveBeenCalledWith('send safely'))
+    expect(ctx.composer.setInput).toHaveBeenCalledWith('')
+  })
+
+  it('opens a fresh session before starting voice after wake detection', async () => {
+    const ctx = buildCtx([])
+    ctx.session.newSession = vi.fn(async () => patchUiState({ sid: 'wake-session' }))
+    patchUiState({ sid: 'old-session' })
+
+    createGatewayEventHandler(ctx)({
+      payload: { phrase: 'hey hermes', start_new_session: true },
+      type: 'wake.detected'
+    } as any)
+
+    await vi.waitFor(() =>
+      expect(ctx.gateway.rpc).toHaveBeenCalledWith('voice.record', {
+        action: 'start',
+        session_id: 'wake-session'
+      })
+    )
+    expect(ctx.session.newSession).toHaveBeenCalledOnce()
+    expect(ctx.voice.setVoiceEnabled).toHaveBeenCalledWith(true)
+  })
+
+  it('keeps the current session when wake detection disables session creation', async () => {
+    const ctx = buildCtx([])
+    patchUiState({ sid: 'current-session' })
+
+    createGatewayEventHandler(ctx)({
+      payload: { phrase: 'hey hermes', start_new_session: false },
+      type: 'wake.detected'
+    } as any)
+
+    await vi.waitFor(() =>
+      expect(ctx.gateway.rpc).toHaveBeenCalledWith('voice.record', {
+        action: 'start',
+        session_id: 'current-session'
+      })
+    )
+    expect(ctx.session.newSession).not.toHaveBeenCalled()
+  })
+
+  it('rearms wake detection when no session is available', async () => {
+    const ctx = buildCtx([])
+    patchUiState({ sid: '' })
+
+    createGatewayEventHandler(ctx)({
+      payload: { start_new_session: false },
+      type: 'wake.detected'
+    } as any)
+
+    await vi.waitFor(() => expect(ctx.gateway.rpc).toHaveBeenCalledWith('wake.resume', {}))
+    expect(ctx.gateway.rpc).not.toHaveBeenCalledWith('voice.record', expect.anything())
   })
 
   it('on gateway.ready with no STARTUP_RESUME_ID and auto_resume off, forges a new session', async () => {
@@ -1767,6 +1936,47 @@ describe('createGatewayEventHandler', () => {
       onEvent({ payload: { verification_url: '' }, type: 'billing.step_up.verification' } as any)
 
       expect(openExternalUrlMock).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('session.usage', () => {
+    it('merges a live usage tick into uiState (payload.usage shape, see tui_gateway _start_usage_ticker)', () => {
+      patchUiState({ sid: 'sess-1' })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { calls: 3, context_percent: 42, input: 1200, output: 80, total: 1280 } },
+        session_id: 'sess-1',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toMatchObject({ context_percent: 42, input: 1200, total: 1280 })
+    })
+
+    it('keeps existing usage fields when the tick only carries a subset', () => {
+      patchUiState({ sid: 'sess-1', usage: { calls: 2, input: 500, output: 40, total: 540 } })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { context_percent: 55 } },
+        session_id: 'sess-1',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toMatchObject({ context_percent: 55, input: 500, total: 540 })
+    })
+
+    it('drops a tick for a non-focused session', () => {
+      patchUiState({ sid: 'focused', usage: ZERO })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { input: 9999, total: 9999 } },
+        session_id: 'background',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toEqual(ZERO)
     })
   })
 

@@ -188,6 +188,10 @@ class CodexAppServerClient:
             child_scope = None
         self.child_scope_unit = child_scope.unit if child_scope is not None and child_scope.enabled else ""
 
+        # Hide the console the codex child would otherwise flash on Windows
+        # (#56747). Hide-only — stdio pipes stay intact for the app-server wire.
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -195,6 +199,7 @@ class CodexAppServerClient:
             stderr=subprocess.PIPE,
             bufsize=0,
             env=spawn_env,
+            creationflags=windows_hide_flags(),
         )
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
@@ -463,7 +468,7 @@ def check_codex_binary(
         proc = subprocess.run(
             [codex_bin, "--version"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )

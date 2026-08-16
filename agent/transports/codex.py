@@ -7,10 +7,20 @@ streaming, or the _run_codex_stream() call path.
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
+
+
+_CRON_SESSION_ID_RE = re.compile(r"^(cron_.+)_\d{8}_\d{6}$")
+
+
+def _cache_scope_from_session_id(session_id: Optional[str]) -> str:
+    sid = str(session_id or "")
+    match = _CRON_SESSION_ID_RE.match(sid)
+    return match.group(1) if match else sid
 
 
 def _bounded_prompt_cache_key(value: Any) -> Optional[str]:

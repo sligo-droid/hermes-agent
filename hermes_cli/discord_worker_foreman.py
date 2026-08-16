@@ -1178,9 +1178,11 @@ def detect_green_unmerged_overdue(snapshot: BoardSnapshot) -> list[ForemanIssue]
     ci = state["ci"]
     telemetry = state["telemetry"]
     head_sha = str(pr.get("head_sha") or "").strip().lower()
+    raw_policy = snapshot.closeout.get("policy") or {}
+    merge_policy = raw_policy.get("merge") or policy["merge"]
     if (
         state["mode"] == "off"
-        or policy["merge"] != "auto"
+        or merge_policy != "auto"
         or pr["is_draft"]
         or pr["state"] not in {"OPEN", "UNKNOWN", ""}
         or not head_sha

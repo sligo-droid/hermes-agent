@@ -49,7 +49,7 @@ else
     if GITHUB_TOKEN="$(python -m hermes_cli.env_loader GITHUB_TOKEN 2>/dev/null)" && [ -n "$GITHUB_TOKEN" ]; then
       :
     elif grep -q "github.com" ~/.git-credentials 2>/dev/null; then
-      GITHUB_TOKEN=$(grep "github.com" ~/.git-credentials 2>/dev/null | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|')
+      GITHUB_TOKEN=$(uv run python3 "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/git-credential-token.py")
     fi
   fi
 fi

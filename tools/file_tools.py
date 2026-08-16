@@ -576,7 +576,10 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",
+    "/private/etc/",
+    # macOS temp paths resolve under /private/var/folders; only block the
+    # genuinely sensitive subtrees rather than all of /private/var.
+    "/private/var/db/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
@@ -816,6 +819,8 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
 _READ_HISTORY_CAP = 500       # set; used only by get_read_files_summary
 _DEDUP_CAP = 1000             # dict; skip-identical-reread guard
 _READ_TIMESTAMPS_CAP = 1000   # dict; external-edit detection for write/patch
+_NOT_FOUND_CAP = 500          # dict; per-task negative-result cache
+_NOT_FOUND_TTL_SECONDS = 60.0
 _READ_DEDUP_STATUS_MESSAGE = (
     "File unchanged since last read. The content from "
     "the earlier read_file result in this conversation is "
@@ -872,6 +877,50 @@ def _cap_read_tracker_data(task_data: dict) -> None:
                 ts.pop(next(iter(ts)))
             except (StopIteration, KeyError):
                 break
+
+    not_found = task_data.get("not_found")
+    if not_found is not None and len(not_found) > _NOT_FOUND_CAP:
+        for _ in range(len(not_found) - _NOT_FOUND_CAP):
+            try:
+                not_found.pop(next(iter(not_found)))
+            except (StopIteration, KeyError):
+                break
+
+
+def _check_not_found_cache(op: str, resolved: str, task_id: str) -> str | None:
+    """Return a fresh cached missing-path result, unless the path now exists."""
+    import time
+
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id)
+        cache = task_data.get("not_found") if task_data else None
+        entry = cache.get((op, resolved)) if cache else None
+        if entry is None:
+            return None
+        created_at, result = entry
+        if time.monotonic() - created_at > _NOT_FOUND_TTL_SECONDS:
+            cache.pop((op, resolved), None)
+            return None
+    if os.path.exists(resolved):
+        with _read_tracker_lock:
+            task_data = _read_tracker.get(task_id)
+            cache = task_data.get("not_found") if task_data else None
+            if cache:
+                cache.pop((op, resolved), None)
+        return None
+    return result
+
+
+def _record_not_found(op: str, resolved: str, task_id: str, result: str) -> None:
+    import time
+
+    with _read_tracker_lock:
+        task_data = _read_tracker.setdefault(task_id, {
+            "last_key": None, "consecutive": 0, "read_history": set(),
+            "dedup": {}, "dedup_hits": {}, "read_timestamps": {},
+        })
+        task_data.setdefault("not_found", {})[(op, resolved)] = (time.monotonic(), result)
+        _cap_read_tracker_data(task_data)
 
 
 def _is_internal_file_status_text(content: str) -> bool:
@@ -1129,7 +1178,7 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -1229,6 +1278,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         if block_error:
             return json.dumps({"error": block_error})
 
+        resolved_str_for_neg = str(_resolved)
+        cached_not_found = _check_not_found_cache("read", resolved_str_for_neg, task_id)
+        if cached_not_found is not None:
+            return cached_not_found
+
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
         # file hasn't been modified since, return a lightweight stub
@@ -1293,6 +1347,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
+        error = result_dict.get("error") or ""
+        if isinstance(error, str) and error.startswith("File not found:"):
+            _record_not_found(
+                "read", resolved_str_for_neg, task_id,
+                json.dumps(result_dict, ensure_ascii=False),
+            )
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -1471,6 +1531,9 @@ def notify_other_tool_call(task_id: str = "default"):
             # progress, so clear per-key dedup hit counters too.
             if "dedup_hits" in task_data:
                 task_data["dedup_hits"].clear()
+            not_found = task_data.get("not_found")
+            if not_found:
+                not_found.clear()
 
 
 def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
@@ -1487,7 +1550,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     internally.
     """
     try:
-        resolved = str(_resolve_path(filepath))
+        resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
@@ -1495,12 +1558,13 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
         if task_data is None:
             return
         dedup = task_data.get("dedup")
-        if not dedup:
-            return
-        # Collect keys to remove (can't mutate dict during iteration).
-        stale_keys = [k for k in dedup if k[0] == resolved]
-        for k in stale_keys:
-            del dedup[k]
+        if dedup:
+            for key in [key for key in dedup if key[0] == resolved]:
+                del dedup[key]
+        not_found = task_data.get("not_found")
+        if not_found:
+            not_found.pop(("read", resolved), None)
+            not_found.pop(("search", resolved), None)
 
 
 def _update_read_timestamp(filepath: str, task_id: str) -> None:
@@ -1925,6 +1989,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
 
+        resolved_search_path = str(resolved_path) if resolved_path else path
+        cached_not_found = _check_not_found_cache("search", resolved_search_path, task_id)
+        if cached_not_found is not None:
+            return cached_not_found
+
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
@@ -1941,6 +2010,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             result_dict["_omitted"] = (
                 f"{omitted} result(s) omitted because they target credential, "
                 "token, cache, or secret-bearing environment files."
+            )
+
+        error = result_dict.get("error") or ""
+        if isinstance(error, str) and error.startswith("Path not found:"):
+            _record_not_found(
+                "search", resolved_search_path, task_id,
+                json.dumps(result_dict, ensure_ascii=False),
             )
 
         if count >= 3:
@@ -2035,7 +2111,7 @@ PATCH_SCHEMA = {
             },
             "new_string": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. Replacement text. Pass empty string '' to delete the matched text.",
+                "description": "REQUIRED when mode='replace'. Changed replacement text; it must differ from old_string. Pass empty string '' to delete the matched text.",
             },
             "replace_all": {
                 "type": "boolean",

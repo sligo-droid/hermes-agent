@@ -2190,6 +2190,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
 
+    if "\x00" in str(script_path):
+        return False, f"Blocked: script path contains a NUL byte: {script_path!r}"
+
     raw = Path(script_path).expanduser()
     if raw.is_absolute():
         path = raw.resolve()
@@ -2760,7 +2763,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     def _load_cron_skill_overview(skill_name: str) -> tuple[str | None, str | None]:
         try:
             loaded = json.loads(
-                skill_view(normalize_skill_lookup_name(skill_name), full_content=False)
+                skill_view(normalize_skill_lookup_name(skill_name), preprocess=False)
             )
         except (json.JSONDecodeError, TypeError):
             logger.warning(
@@ -4541,6 +4544,54 @@ def _notify_provider_jobs_changed() -> None:
         resolve_cron_scheduler().on_jobs_changed()
     except Exception as e:
         logger.debug("on_jobs_changed notify failed: %s", e)
+
+
+class CronSchedulerRegistrationError(RuntimeError):
+    """A job was saved but its first external trigger was not registered."""
+
+    def __init__(self, job: dict, cause: Exception) -> None:
+        self.job = job
+        self.cause = cause
+        super().__init__(
+            f"Cron job '{job['id']}' was saved, but its first scheduler "
+            f"registration failed ({type(cause).__name__}). Do not create a "
+            "duplicate. Pause/resume or update the job to retry registration."
+        )
+
+    def user_message(self) -> str:
+        label = self.job.get("name") or self.job["id"]
+        return (
+            f"Saved cron job '{label}', but couldn't register it with the "
+            "external scheduler yet. The job is kept — don't re-create it; "
+            "pause/resume or edit it (e.g. via /cron) to retry registration."
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "error": str(self),
+            "job_id": self.job["id"],
+            "job_saved": True,
+            "scheduler_registered": False,
+            "retry_create": False,
+        }
+
+
+def create_job_with_scheduler_registration(**kwargs) -> dict:
+    """Persist a job and register its first trigger with the active provider."""
+    from cron.jobs import create_job
+    from cron.scheduler_provider import resolve_cron_scheduler
+
+    job = create_job(**kwargs)
+    try:
+        provider = resolve_cron_scheduler()
+        register_job = getattr(provider, "register_job", None)
+        if register_job is not None:
+            register_job(job)
+        else:
+            provider.on_jobs_changed()
+    except Exception as exc:
+        raise CronSchedulerRegistrationError(job, exc) from exc
+    return job
 
 
 def tick(

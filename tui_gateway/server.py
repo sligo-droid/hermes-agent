@@ -12255,6 +12255,8 @@ def _project_tree_row(r: dict) -> dict:
         "tool_call_count": r.get("tool_call_count") or 0,
         "input_tokens": r.get("input_tokens") or 0,
         "output_tokens": r.get("output_tokens") or 0,
+        "estimated_cost_usd": r.get("estimated_cost_usd") or 0,
+        "actual_cost_usd": r.get("actual_cost_usd") or 0,
         "model": r.get("model"),
         "is_active": False,
         "cwd": r.get("cwd"),

@@ -8962,6 +8962,85 @@ def edit_config():
     subprocess.run([editor, str(config_path)])
 
 
+def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read config.yaml without defaults, overlays, expansion, or caching."""
+    path = get_config_path() if config_path is None else config_path
+    try:
+        with open(path, encoding="utf-8") as file:
+            data = fast_safe_load(file) or {}
+    except FileNotFoundError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def cron_model_drift_guard_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return True
+    if not isinstance(config, dict):
+        return True
+    cron_config = config.get("cron")
+    return isinstance(cron_config, dict) and cron_config.get("model_drift_guard", True) is not False
+
+
+def _cron_fleet_default_covers_axis(axis: str, config: Optional[Dict[str, Any]] = None) -> bool:
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return False
+    cron_config = config.get("cron") if isinstance(config, dict) else None
+    key = "model" if axis == "model" else "model_provider"
+    value = cron_config.get(key) if isinstance(cron_config, dict) else None
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _model_assignment_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def resolve_cron_model_drift_defaults(
+    config: Any, *, environ: Optional[Dict[str, str]] = None
+) -> Tuple[str, str]:
+    env = os.environ if environ is None else environ
+    provider = ""
+    model = _model_assignment_text(env.get("HERMES_MODEL", ""))
+    model_config = config.get("model") if isinstance(config, dict) else None
+    if isinstance(model_config, str):
+        model = model_config.strip() or model
+    elif isinstance(model_config, dict):
+        provider = _model_assignment_text(model_config.get("provider"))
+        model = _model_assignment_text(
+            model_config.get("default") or model_config.get("model") or model_config.get("name")
+        ) or model
+    return provider, model
+
+
+def cron_model_drift_axes(
+    job: Any,
+    *,
+    current_provider: Any = "",
+    current_model: Any = "",
+    config: Any = None,
+) -> List[str]:
+    if not isinstance(job, dict) or not cron_model_drift_guard_enabled(config):
+        return []
+    current = {
+        "provider": _model_assignment_text(current_provider).lower(),
+        "model": _model_assignment_text(current_model).lower(),
+    }
+    drifted: List[str] = []
+    for axis in ("provider", "model"):
+        if _cron_fleet_default_covers_axis(axis, config) or _model_assignment_text(job.get(axis)):
+            continue
+        snapshot = _model_assignment_text(job.get(f"{axis}_snapshot")).lower()
+        if snapshot and current[axis] and snapshot != current[axis]:
+            drifted.append(axis)
+    return drifted
+
+
 def _default_value_for_key(dotted_key: str):
     """Return the leaf value declared for *dotted_key* in ``DEFAULT_CONFIG``.
 

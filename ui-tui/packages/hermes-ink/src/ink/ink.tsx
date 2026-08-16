@@ -76,9 +76,9 @@ import {
   updateSelection
 } from './selection.js'
 import {
-  isRuntimeSynchronizedOutputSupported,
   needsAltScreenResizeScrollbackClear,
   supportsExtendedKeys,
+  SYNC_OUTPUT_SUPPORTED,
   type Terminal,
   writeDiffToTerminal
 } from './terminal.js'
@@ -600,6 +600,27 @@ export default class Ink {
     }, 160)
   }
 
+  private handleTerminalFocusChange(isFocused: boolean): void {
+    if (!isFocused || !this.options.stdout.isTTY) {
+      return
+    }
+
+    // Focus-in means the terminal emulator has just made this tab/pane
+    // visible again. Some emulators throttle or coalesce hidden-tab output;
+    // if we continue with the pre-blur virtual cursor/backbuffer, only the
+    // next small dirty region may repaint and stale status/progress rows can
+    // remain visible. Defer one tick so TerminalFocusProvider subscribers
+    // observe the new focus state first, then do the same recovery as /redraw.
+    queueMicrotask(() => {
+      if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
+        return
+      }
+
+      this.reassertTerminalModes(false)
+      this.forceRedraw()
+    })
+  }
+
   resolveExitPromise: () => void = () => {}
   rejectExitPromise: (reason?: Error) => void = () => {}
   unsubscribeExit: () => void = () => {}
@@ -940,8 +961,6 @@ export default class Ink {
 
     const tDiff = performance.now()
 
-    const syncOutputSupported = isRuntimeSynchronizedOutputSupported()
-
     const diff = this.log.render(
       prevFrame,
       frame,
@@ -949,8 +968,8 @@ export default class Ink {
       // DECSTBM needs BSU/ESU atomicity — without it the outer terminal
       // renders the scrolled-but-not-yet-repainted intermediate state.
       // tmux is the main case (re-emits DECSTBM with its own timing and
-      // doesn't implement DEC 2026, so syncOutputSupported is false).
-      syncOutputSupported
+      // doesn't implement DEC 2026, so SYNC_OUTPUT_SUPPORTED is false).
+      SYNC_OUTPUT_SUPPORTED
     )
 
     const diffMs = performance.now() - tDiff
@@ -1136,7 +1155,13 @@ export default class Ink {
     const { bytes: writeBytes, backpressure } = writeDiffToTerminal(
       this.terminal,
       optimized,
-      this.altScreenActive && !syncOutputSupported,
+      // Never emit BSU/ESU (DEC 2026) on terminals that don't support it —
+      // main screen included. Multiplexers like Zellij re-parse and re-chunk
+      // the stream with their own timing, so the markers buy no atomicity and
+      // stale frames get pushed into main-screen scrollback as repeated
+      // chrome (#66490). Supported terminals keep today's behavior on both
+      // screens (skip=false → BSU/ESU wrapped).
+      !SYNC_OUTPUT_SUPPORTED,
       trackDrain
         ? () => {
             // Callback fires once Node has flushed the chunk to the OS.
@@ -1554,16 +1579,9 @@ export default class Ink {
         if (success) {
           return text
         }
-
-        if (process.env.HERMES_TUI_DEBUG_CLIPBOARD) {
-          console.error(
-            '[clipboard] no path reached the clipboard (headless + no tmux?) — set HERMES_TUI_FORCE_OSC52=1 to force the escape sequence'
-          )
-        }
-      } catch (err) {
-        if (process.env.HERMES_TUI_DEBUG_CLIPBOARD) {
-          console.error('[clipboard] error:', err)
-        }
+      } catch {
+        // Clipboard failed across every path — caller sees the empty
+        // return below and surfaces a hint via the slash command.
       }
     }
 
@@ -2407,6 +2425,7 @@ export default class Ink {
         onSelectionChange={this.notifySelectionChange}
         onSelectionDrag={this.handleSelectionDrag}
         onStdinResume={this.reassertTerminalModes}
+        onTerminalFocusChange={this.handleTerminalFocusChange}
         selection={this.selection}
         stderr={this.options.stderr}
         stdin={this.options.stdin}
