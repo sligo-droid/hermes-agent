@@ -2577,7 +2577,7 @@ def test_default_repo_project_pr_opened_but_unmerged_is_blocked(tmp_path):
     assert stored["summary_status"] == "Blocked"
 
 
-def test_passed_enforced_visual_qa_does_not_label_lifecycle_block_as_visual(tmp_path):
+def test_merge_never_policy_allows_unmerged_pr_after_passed_visual_qa(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Adjust the dashboard panel layout and spacing")
     item = ledger.accept_event(
@@ -2588,6 +2588,11 @@ def test_passed_enforced_visual_qa_does_not_label_lifecycle_block_as_visual(tmp_
     )
     assert item is not None
     requirement = item["visual_qa_requirement"]
+    assert ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        policy={"merge": "never"},
+    ) is not None
 
     ledger.mark_agent_done(
         item["id"],
@@ -2599,12 +2604,10 @@ def test_passed_enforced_visual_qa_does_not_label_lifecycle_block_as_visual(tmp_
     )
 
     stored = ledger.get(item["id"])
-    assert stored["completion_gate"]["reason"] == "self_declared_delivery_incomplete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["reason"] == "no_self_declared_delivery_gap"
     assert stored["completion_gate"]["visual_qa"]["status"] == "passed"
-    assert stored["final_response"].startswith(
-        "⚠️ **Completion blocked.** The work ledger did not authorize completion."
-    )
-    assert "Enforced visual QA is active" not in stored["final_response"]
+    assert stored["final_response"] == "PR opened but not merged; approval is pending."
 
 
 def test_full_lifecycle_blocks_unsynced_runtime_and_unverified_live_pickup(tmp_path):

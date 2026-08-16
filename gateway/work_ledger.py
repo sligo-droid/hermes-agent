@@ -1643,6 +1643,12 @@ def _canonical_sync_explicitly_not_required(item: dict[str, Any]) -> bool:
     return requirements.get("canonical_sync") is False
 
 
+def _merge_explicitly_not_allowed(item: dict[str, Any]) -> bool:
+    closeout = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+    policy = closeout.get("policy") if isinstance(closeout.get("policy"), dict) else {}
+    return policy.get("merge") == "never"
+
+
 def _is_canonical_checkout_only_gap(text: str, match: re.Match[str]) -> bool:
     """Return whether a runtime-gap match concerns only the local checkout."""
 
@@ -1671,6 +1677,12 @@ def _incomplete_final_markers(text: str, item: dict[str, Any] | None = None) -> 
             if reason == "runtime_not_synced" and _is_explicitly_healthy_runtime_match(match):
                 continue
             if reason == "runtime_not_synced" and _is_preserved_protected_checkout_gap(text, match):
+                continue
+            if (
+                reason == "not_merged"
+                and isinstance(item, dict)
+                and _merge_explicitly_not_allowed(item)
+            ):
                 continue
             if (
                 reason == "runtime_not_synced"
