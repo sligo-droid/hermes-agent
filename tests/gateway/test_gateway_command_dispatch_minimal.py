@@ -101,7 +101,9 @@ def _make_runner():
     runner._should_send_telegram_lobby_reminder = lambda _source: False
     runner._check_slash_access = lambda _source, _command: None
     runner._begin_session_run_generation = lambda _key: 1
-    runner._release_running_agent_state = lambda key: runner._running_agents.pop(key, None)
+    runner._release_running_agent_state = (
+        lambda key, **_kwargs: runner._running_agents.pop(key, None)
+    )
     return runner, adapter
 
 
@@ -232,6 +234,118 @@ async def test_promoted_action_starts_worktree_before_generation_claim(
     ]
     assert worktree_task.done()
     assert captured["worktree"] == (str(project), None, str(project))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_stage", ["worker_start", "generation_claim"])
+async def test_promoted_action_startup_cancellation_releases_scoped_state(
+    tmp_path,
+    monkeypatch,
+    cancel_stage,
+):
+    runner, adapter = _make_runner()
+    runner.config.platforms = {
+        Platform.DISCORD: PlatformConfig(enabled=True, token="***")
+    }
+    runner.adapters = {Platform.DISCORD: adapter}
+    project = tmp_path / "project"
+    project.mkdir()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="u1",
+        chat_id="thread-1",
+        user_name="tester",
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="parent-1",
+        guild_id="guild-1",
+        project_path=str(project),
+    )
+    session_key = build_session_key(source)
+    event = MessageEvent(
+        text="build it",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+        discord_runtime_mode="action",
+        participates_in_work_lifecycle=True,
+        feature_summary={"initial_request": "build it"},
+    )
+    event._discord_promotion_origin_session_key = session_key
+    event._discord_promotion_origin_generation = 1
+    runner._consume_promoted_replay_fence = AsyncMock(return_value=True)
+    runner._hydrate_discord_feature_summary_from_adapter = lambda _event: None
+    runner._claim_active_session_slot = lambda *_args: (MagicMock(), None)
+    runner._begin_session_run_generation = lambda _key: 7
+    runner._open_start_user_followups = lambda *_args: None
+    runner._refresh_active_agent_runtime_status = lambda: None
+    runner._release_turn_lease = MagicMock()
+    runner._release_running_agent_state = MagicMock(return_value=True)
+    runner._handle_message_with_agent = AsyncMock()
+
+    def accept_item(accepted_event, _session_key):
+        accepted_event.work_item_id = "work-1"
+        accepted_event.discord_pr_generation = 1
+        accepted_event._discord_work_item_gateway_config = {}
+        return {"id": "work-1", "status": "claimed"}
+
+    runner._accept_discord_work_item = accept_item
+    stage_entered = asyncio.Event()
+    claim_release = threading.Event()
+
+    def resolve_worktree(*_args, **_kwargs):
+        return str(project), None, str(project)
+
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_turn_cwd", resolve_worktree)
+    if cancel_stage == "worker_start":
+        async def wait_for_worker(_started):
+            stage_entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_wait_for_action_worktree_worker",
+            wait_for_worker,
+        )
+    else:
+        original_to_thread = asyncio.to_thread
+        to_thread_calls = 0
+
+        async def controlled_to_thread(func, /, *args, **kwargs):
+            nonlocal to_thread_calls
+            to_thread_calls += 1
+            if to_thread_calls == 3:
+                stage_entered.set()
+                await asyncio.Event().wait()
+            return await original_to_thread(func, *args, **kwargs)
+
+        monkeypatch.setattr(gateway_run.asyncio, "to_thread", controlled_to_thread)
+
+    class Ledger:
+        def normalize_discord_pr_generation(self, value):
+            return int(value)
+
+        def discord_pr_generation(self, _session_key):
+            return 1
+
+        def claim(self, *_args, **_kwargs):
+            claim_release.wait(timeout=2)
+
+    ledger = Ledger()
+    runner._ledger = lambda: ledger
+    task = asyncio.create_task(runner._handle_message(event))
+    await asyncio.wait_for(stage_entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    claim_release.set()
+
+    runner._handle_message_with_agent.assert_not_awaited()
+    runner._release_running_agent_state.assert_called_once_with(
+        session_key,
+        run_generation=7,
+    )
+    runner._release_turn_lease.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -2397,6 +2397,41 @@ async def test_action_turn_joins_prefetched_worktree_before_agent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True])
+async def test_non_mapping_privacy_config_does_not_fail_agent_start(
+    tmp_path,
+    monkeypatch,
+    cached,
+):
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    source = _source(tmp_path)
+    event = MessageEvent(
+        text="do a no-op change end-to-end",
+        source=source,
+        message_id=f"privacy-config-{cached}",
+        discord_runtime_mode="action",
+    )
+    if cached:
+        event._discord_work_item_gateway_config = {"privacy": True}
+    else:
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"privacy": True},
+        )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:discord:thread:thread-123",
+        1,
+    )
+
+    assert response.startswith("done")
+
+
+@pytest.mark.asyncio
 async def test_action_running_ledger_updates_are_ordered_off_event_loop(tmp_path):
     captured: dict = {}
     runner = _runner_for_action_turn(tmp_path, captured)
