@@ -134,6 +134,7 @@ async def test_read_only_task_requests_use_read_only_runtime(adapter, message):
         "what is the status of the security audit?",
         "what do you recommend?",
         "did the review finish?",
+        "give me an explanation of the change",
     ],
 )
 def test_explanation_status_and_short_factual_questions_remain_intake(adapter, message):
@@ -168,6 +169,8 @@ def test_heuristic_defers_ambiguous_messages(adapter, message):
         "we need to fix the flaky test",
         "okay, run the entire pipeline?",
         "can you get the tests passing?",
+        "gimme a test no-op change to a comment file in the UI",
+        "give me a test no-op change to a comment file in the UI",
     ],
 )
 def test_heuristic_aggressively_routes_mutation_requests(adapter, message):

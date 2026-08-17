@@ -3961,6 +3961,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 r"update\s+(?:a|an|the|this|that|our|my|your)\b|"
                 r"change\s+(?:a|an|the|this|that|our|my|your)\b|"
                 r"make\s+(?:a|an|the|this|that|our|my|your|sure)\b|"
+                r"(?:gimme|give\s+me)\s+"
+                r"(?!(?:(?:a|an|the|some)\s+)?(?:analysis|assessment|audit|"
+                r"examples?|explanation|plan|recommendations?|report|review|status)\b)"
+                r"(?:(?:a|an|the|some)\s+)?"
+                r"(?:[\w-]+\s+){0,4}(?:change|fix|implementation|migration|"
+                r"refactor|update)\b|"
                 r"run\s+(?:a|an|the|this|that|our|my|your|all|tests?|suite|"
                 r"pipeline|workflow|job|command|scraper)\b"
                 r")",
