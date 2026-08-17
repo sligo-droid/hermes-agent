@@ -28,6 +28,12 @@ def _runner_for(repo: Path, worktrees: str, *, dirty: bool = False):
             return _result("origin/feature/head\n")
         if key == ("rev-list", "--left-right", "--count", "@{u}...HEAD"):
             return _result("2 3\n")
+        if key == ("rev-parse", "--verify", "refs/remotes/origin/main^{commit}"):
+            return _result("abc123\n")
+        if key == ("rev-list", "--left-right", "--count", "origin/main...HEAD"):
+            return _result("1 4\n")
+        if key == ("log", "-3", "--format=%h%x09%s"):
+            return _result("abc123\tLatest change\ndef456\tEarlier change\n")
         if key == ("remote", "-v"):
             return _result(
                 "origin https://user:secret@example.test/repo.git (fetch)\n"
@@ -70,12 +76,49 @@ def test_collects_relevant_worktrees_and_redacts_remote_credentials(tmp_path):
         "upstream": "origin/feature/head",
         "ahead": 3,
         "behind": 2,
+        "base_ref": "origin/main",
+        "base_ahead": 4,
+        "base_behind": 1,
     }
+    assert summary["recent_commits"][0]["subject"] == "Latest change"
     assert summary["default_branch"] == "main"
     assert summary["remotes"][0]["fetch"] == "https://<redacted>@example.test/repo.git"
     assert "secret" not in summary["output"]
     assert "base worktree" in summary["output"]
     assert "head worktree" in summary["output"]
+
+
+def test_optional_pr_snapshot_groups_merge_gates_with_git_state(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    worktrees = f"worktree {repo}\nHEAD abc\nbranch refs/heads/feature/head\n"
+
+    def run_gh(args, **kwargs):
+        assert args[:3] == ["pr", "view", "42"]
+        return _result(
+            '{"number":42,"url":"https://github.com/acme/repo/pull/42",'
+            '"state":"OPEN","isDraft":false,"headRefOid":"' + "a" * 40 + '",'
+            '"headRefName":"feature/head","baseRefName":"main",'
+            '"mergeStateStatus":"CLEAN","mergeable":"MERGEABLE",'
+            '"reviewDecision":"APPROVED","statusCheckRollup":['
+            '{"name":"tests","conclusion":"SUCCESS"}]}'
+        )
+
+    summary = collect_pr_workflow_preflight(
+        repo,
+        base_branch="main",
+        head_branch="feature/head",
+        pr_ref="42",
+        run_git=_runner_for(repo, worktrees),
+        run_gh=run_gh,
+    )
+
+    assert summary["success"] is True
+    assert summary["pr"]["head_sha"] == "a" * 40
+    assert summary["pr"]["checks"] == [{"name": "tests", "status": "SUCCESS"}]
+    assert "mergeable=MERGEABLE" in summary["output"]
+    assert "checks: tests=SUCCESS" in summary["output"]
+    assert "clean" in summary["output"]
 
 
 def test_find_worktree_for_branch_handles_spaces_and_reuses_runner(tmp_path):

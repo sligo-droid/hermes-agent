@@ -152,17 +152,29 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "focused syntax/unit check plus one rendered visual/browser check of the "
     "changed path. If a staging/verification command fails, immediately inspect "
     "the real repo state and either fix/retry the exact step or report the blocker; "
-    "do not finish with contradictory done/not-verified wording. If code "
-    "work in a git worktree is complete and checks pass, do not treat 'ready for "
-    "PR' or 'next step: commit/push/open PR' as a terminal handoff; continue "
-    "through commit, feature-branch push, and draft PR publication when permitted "
+    "do not finish with contradictory done/not-verified wording. Run independent "
+    "final checks as separate tool calls or a non-short-circuit shell block that "
+    "records every exit status; never use an && chain that hides later outcomes. "
+    "In the same closeout phase, use one bounded pr_workflow_preflight snapshot for "
+    "Git cleanliness/divergence and PR state rather than rediscovering them piecemeal. "
+    "If code work in a git worktree is complete and checks pass, do not treat 'ready for "
+    "PR' or 'next step: commit/push/open PR' as a terminal handoff. Stage only owned "
+    "files, commit, and perform the first feature-branch push as one recoverable "
+    "checkpoint; keep PR creation, preview waiting, QA, and merge outside that checkpoint. "
+    "Then continue through draft PR publication when permitted "
     "by the active instructions. Persist durable trusted closeout. Do not announce a "
     "draft PR alone; its first lifecycle update must come from trusted closeout, include "
     "the preview and PR URLs, and omit commit hashes while QA continues. For sandbox "
     "EFBIG or resource-limit failures, rerun the same package script in the mutable "
-    "worktree before reporting a repository failure. Never mark the PR ready, merge "
-    "it, or synchronize the protected "
-    "canonical checkout. Run temporary worktree "
+    "worktree before reporting a repository failure. Never mark the PR ready or merge "
+    "without a separate explicit user authorization, and never synchronize the protected "
+    "canonical checkout. On an authorized merge turn, run exactly one bounded read-only "
+    "pr_workflow_preflight --pr snapshot containing the PR head SHA, checks, mergeability/"
+    "review state, and worktree cleanliness. Keep the actual merge as a separate mutation "
+    "with exact-head protection, required checks, no force/bypass, then run one bounded "
+    "post-merge snapshot. Use the project-established merge strategy without inspecting "
+    "recent PR history or repository settings unless the workflow leaves it genuinely "
+    "undefined. Run temporary worktree "
     "cleanup from the mutable action worktree, not from the protected canonical "
     "checkout. "
     "Do not load github-pr-workflow for routine closeout; reserve it for diagnosis "
@@ -3551,6 +3563,34 @@ def _discord_action_worktree_target(
     )
 
 
+def _discord_action_worktree_preflight_prompt(worktree_cwd: str) -> str:
+    """Return one bounded deterministic Git snapshot for the action model."""
+
+    try:
+        from hermes_cli.pr_workflow_preflight import collect_pr_workflow_preflight
+
+        summary = collect_pr_workflow_preflight(
+            worktree_cwd,
+            base_branch="origin/main",
+            max_output_chars=3_200,
+        )
+        output = str(summary.get("output") or "").strip()
+    except Exception as exc:
+        logger.warning(
+            "Discord action worktree preflight unavailable for %s: %s",
+            worktree_cwd,
+            exc,
+        )
+        return ""
+    if not output:
+        return ""
+    return (
+        "Discord action worktree preflight (deterministic, bounded; do not repeat "
+        "status/log/branches/diff/rebase discovery unless this snapshot shows a "
+        "specific issue):\n" + output
+    )
+
+
 def _path_within(path: Path, root: Path) -> bool:
     try:
         path.resolve(strict=False).relative_to(root.resolve(strict=False))
@@ -3680,45 +3720,67 @@ def _discord_action_worktree_cwd(
         generation,
     )
 
-    rollover_start_point = "HEAD"
-    rollover_base_refreshed = False
+    base_start_point = "HEAD"
+    base_resolved = False
 
-    def _refresh_rollover_base() -> tuple[Optional[str], Optional[str]]:
-        nonlocal rollover_base_refreshed, rollover_start_point
-        if generation <= 1 or rollover_base_refreshed:
-            return rollover_start_point, None
-        rollover_base_refreshed = True
+    def _resolve_fresh_base() -> tuple[Optional[str], Optional[str]]:
+        nonlocal base_resolved, base_start_point
+        if base_resolved:
+            return base_start_point, None
+        base_resolved = True
         branch_result = _git(
             ["symbolic-ref", "--quiet", "--short", "HEAD"],
             timeout=10.0,
         )
         base_name = str(branch_result.stdout or "").strip()
         if branch_result.returncode != 0 or not base_name:
+            if generation <= 1:
+                return base_start_point, None
             return None, (
                 "the protected canonical checkout has no branch to refresh for "
                 f"Discord PR generation {generation}"
             )
-        remote_ref = f"refs/remotes/origin/{base_name}"
+
+        upstream_result = _git(
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            timeout=10.0,
+        )
+        upstream = str(upstream_result.stdout or "").strip()
+        remote, separator, remote_branch = upstream.partition("/")
+        if upstream_result.returncode != 0 or not separator:
+            remote, remote_branch = "origin", base_name
+        remote_ref = f"refs/remotes/{remote}/{remote_branch}"
         fetched = _git(
             [
                 "fetch",
                 "--no-tags",
-                "origin",
-                f"refs/heads/{base_name}:{remote_ref}",
+                remote,
+                f"refs/heads/{remote_branch}:{remote_ref}",
             ],
             timeout=120.0,
         )
-        if fetched.returncode != 0:
-            detail = " ".join((fetched.stderr or fetched.stdout or "").split())[:600]
-            return None, (
-                "Git could not refresh the merged base before starting the next PR"
-                + (f": {detail}" if detail else ".")
+        verified = _git(
+            ["rev-parse", "--verify", f"{remote_ref}^{{commit}}"],
+            timeout=10.0,
+        )
+        if verified.returncode == 0:
+            base_start_point = remote_ref
+            if fetched.returncode != 0:
+                logger.warning(
+                    "Discord action worktree base refresh failed; using cached %s",
+                    remote_ref,
+                )
+            return base_start_point, None
+        if generation <= 1:
+            logger.warning(
+                "Discord action worktree base refresh unavailable; using canonical HEAD"
             )
-        verified = _git(["rev-parse", "--verify", f"{remote_ref}^{{commit}}"], timeout=10.0)
-        if verified.returncode != 0:
-            return None, "Git did not expose the refreshed remote base commit"
-        rollover_start_point = remote_ref
-        return rollover_start_point, None
+            return base_start_point, None
+        detail = " ".join((fetched.stderr or fetched.stdout or "").split())[:600]
+        return None, (
+            "Git could not refresh the merged base before starting the next PR"
+            + (f": {detail}" if detail else ".")
+        )
 
     def _resolved_record_path(record: dict[str, str]) -> Optional[Path]:
         raw = str(record.get("path") or "").strip()
@@ -3782,7 +3844,7 @@ def _discord_action_worktree_cwd(
             if branch_exists:
                 add_args = ["worktree", "add", str(target_path), branch]
             else:
-                start_point, refresh_error = _refresh_rollover_base()
+                start_point, refresh_error = _resolve_fresh_base()
                 if refresh_error:
                     return None, refresh_error
                 add_args = [
@@ -19260,6 +19322,7 @@ class _GatewayRunnerCore(
             "opus" if _opus_implementation_turn else "fable"
             if _fable_implementation_turn else "direct"
         )
+        action_preflight_prompt = ""
         discord_runtime_mode = (
             RuntimeMode.ACTION
             if _premium_implementation_turn
@@ -19333,6 +19396,11 @@ class _GatewayRunnerCore(
             except Exception:
                 pass
             self._cache_session_source(session_key, source)
+            if discord_runtime_mode is RuntimeMode.ACTION:
+                action_preflight_prompt = await asyncio.to_thread(
+                    _discord_action_worktree_preflight_prompt,
+                    action_worktree_cwd,
+                )
 
         # Build session context
         context = build_session_context(source, self.config, session_entry)
@@ -19367,6 +19435,8 @@ class _GatewayRunnerCore(
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key
         )
+        if action_preflight_prompt:
+            context_prompt = f"{context_prompt}\n\n{action_preflight_prompt}".strip()
         if default_kanban_intake:
             context_prompt = (
                 context_prompt

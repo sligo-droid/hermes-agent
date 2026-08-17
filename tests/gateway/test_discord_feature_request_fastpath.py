@@ -184,7 +184,19 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "include the preview and PR URLs" in init["ephemeral_system_prompt"]
     assert "omit commit hashes" in init["ephemeral_system_prompt"]
     assert "rerun the same package script" in init["ephemeral_system_prompt"]
-    assert "cleanup from the mutable action worktree" in init["ephemeral_system_prompt"]
+    lifecycle_prompt = init["ephemeral_system_prompt"]
+    assert "non-short-circuit" in lifecycle_prompt
+    assert "records every exit status" in lifecycle_prompt
+    assert "one bounded pr_workflow_preflight snapshot" in lifecycle_prompt
+    assert "Stage only owned files" in lifecycle_prompt
+    assert "first feature-branch push as one recoverable" in lifecycle_prompt
+    assert lifecycle_prompt.index("first feature-branch push") < lifecycle_prompt.index("PR creation")
+    assert "separate explicit user authorization" in lifecycle_prompt
+    assert "exact-head protection" in lifecycle_prompt
+    assert "actual merge as a separate mutation" in lifecycle_prompt
+    assert "one bounded post-merge snapshot" in lifecycle_prompt
+    assert "without inspecting recent PR history" in lifecycle_prompt
+    assert "cleanup from the mutable action worktree" in lifecycle_prompt
     assert "Do not load github-pr-workflow for routine closeout" in init["ephemeral_system_prompt"]
     assert "diagnosis or recovery" in init["ephemeral_system_prompt"]
     assert "terminal(background=True, notify_on_complete=True)" in init["ephemeral_system_prompt"]

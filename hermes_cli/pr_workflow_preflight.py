@@ -12,6 +12,7 @@ Run it with ``python -m hermes_cli.pr_workflow_preflight``.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -28,6 +29,11 @@ _SENSITIVE_QUERY_RE = re.compile(
 
 GitRunner = Callable[..., subprocess.CompletedProcess[str]]
 
+_PR_FIELDS = (
+    "number,url,state,isDraft,headRefOid,baseRefName,headRefName,mergedAt,"
+    "mergeCommit,mergeStateStatus,mergeable,reviewDecision,statusCheckRollup"
+)
+
 
 def _default_git_runner(
     args: list[str],
@@ -37,6 +43,21 @@ def _default_git_runner(
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _default_gh_runner(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["gh", *args],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -196,8 +217,10 @@ def collect_pr_workflow_preflight(
     *,
     base_branch: str | None = None,
     head_branch: str | None = None,
+    pr_ref: str | None = None,
     max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
     run_git: GitRunner | None = None,
+    run_gh: GitRunner | None = None,
 ) -> dict[str, Any]:
     """Collect bounded PR/worktree facts from a local checkout."""
     runner = run_git or _default_git_runner
@@ -247,6 +270,33 @@ def collect_pr_workflow_preflight(
         fields = divergence.split()
         if len(fields) >= 2 and all(field.isdigit() for field in fields[:2]):
             behind, ahead = int(fields[0]), int(fields[1])
+
+    base_ref = str(base_branch or "").strip()
+    if base_ref and "/" not in base_ref:
+        remote_base = git_text(
+            ["rev-parse", "--verify", f"refs/remotes/origin/{base_ref}^{{commit}}"],
+            "remote base",
+        )
+        if remote_base:
+            base_ref = f"origin/{base_ref}"
+    base_ahead = base_behind = None
+    if base_ref:
+        base_divergence = git_text(
+            ["rev-list", "--left-right", "--count", f"{base_ref}...HEAD"],
+            "base divergence",
+        )
+        fields = base_divergence.split()
+        if len(fields) >= 2 and all(field.isdigit() for field in fields[:2]):
+            base_behind, base_ahead = int(fields[0]), int(fields[1])
+
+    recent_commits = []
+    for line in git_text(
+        ["log", "-3", "--format=%h%x09%s"],
+        "recent commits",
+    ).splitlines():
+        sha, separator, subject = line.partition("\t")
+        if separator and sha:
+            recent_commits.append({"sha": _clip(sha, 16), "subject": _clip(subject, 180)})
 
     remote_output = git_text(["remote", "-v"], "remotes")
     remotes: dict[str, dict[str, str]] = {}
@@ -343,6 +393,74 @@ def collect_pr_workflow_preflight(
         "warning_samples_omitted": max(0, len(warning_records) - _MAX_WARNING_SAMPLES),
     }
 
+    pr: dict[str, Any] | None = None
+    normalized_pr_ref = str(pr_ref or "").strip()
+    if normalized_pr_ref:
+        gh_runner = run_gh or _default_gh_runner
+        try:
+            viewed = gh_runner(
+                ["pr", "view", normalized_pr_ref, "--json", _PR_FIELDS],
+                cwd=requested_path,
+                timeout=30,
+            )
+        except Exception as exc:
+            errors.append(f"PR snapshot: {_redact_text(exc)}")
+        else:
+            if viewed.returncode != 0:
+                errors.append(
+                    f"PR snapshot: {_redact_text(viewed.stderr or viewed.stdout or 'command failed')}"
+                )
+            else:
+                try:
+                    payload = json.loads(viewed.stdout or "{}")
+                except json.JSONDecodeError as exc:
+                    errors.append(f"PR snapshot: {_redact_text(exc)}")
+                else:
+                    if not isinstance(payload, dict):
+                        errors.append("PR snapshot: GitHub returned a non-object payload")
+                    else:
+                        checks = []
+                        for item in payload.get("statusCheckRollup") or []:
+                            if not isinstance(item, dict):
+                                continue
+                            checks.append(
+                                {
+                                    "name": _clip(
+                                        item.get("name") or item.get("context") or "check",
+                                        120,
+                                    ),
+                                    "status": _clip(
+                                        item.get("conclusion") or item.get("state") or item.get("status") or "unknown",
+                                        40,
+                                    ).upper(),
+                                }
+                            )
+                            if len(checks) >= 12:
+                                break
+                        merge_commit = payload.get("mergeCommit")
+                        pr = {
+                            "number": payload.get("number"),
+                            "url": _redact_url(str(payload.get("url") or "")),
+                            "state": _clip(payload.get("state"), 32).upper(),
+                            "is_draft": payload.get("isDraft") is True,
+                            "head_sha": _clip(payload.get("headRefOid"), 64),
+                            "head_ref": _clip(payload.get("headRefName"), 160),
+                            "base_ref": _clip(payload.get("baseRefName"), 160),
+                            "merge_state": _clip(payload.get("mergeStateStatus"), 48).upper(),
+                            "mergeable": _clip(payload.get("mergeable"), 48).upper(),
+                            "review_decision": _clip(payload.get("reviewDecision") or "none", 48).upper(),
+                            "merged_at": _clip(payload.get("mergedAt"), 80),
+                            "merge_sha": _clip(
+                                merge_commit.get("oid") if isinstance(merge_commit, dict) else "",
+                                64,
+                            ),
+                            "checks": checks,
+                            "checks_omitted": max(
+                                0,
+                                len(payload.get("statusCheckRollup") or []) - len(checks),
+                            ),
+                        }
+
     result = {
         "success": not errors,
         "canonical_path": canonical_path,
@@ -353,7 +471,12 @@ def collect_pr_workflow_preflight(
             "upstream": upstream or None,
             "ahead": ahead,
             "behind": behind,
+            "base_ref": base_ref or None,
+            "base_ahead": base_ahead,
+            "base_behind": base_behind,
         },
+        "recent_commits": recent_commits,
+        "pr": pr,
         "default_branch": default_branch,
         "remotes": [
             {"name": name, **values}
@@ -394,6 +517,24 @@ def render_pr_workflow_preflight(
         f"checkout: branch={_clip(branch, 160)}; {clean}; upstream={_clip(upstream, 180)}; {divergence}",
         f"default branch: {_clip(summary.get('default_branch') or 'unknown', 120)}",
     ]
+    if current.get("base_ref"):
+        base_divergence = "unknown"
+        if current.get("base_ahead") is not None and current.get("base_behind") is not None:
+            base_divergence = (
+                f"ahead {current['base_ahead']}, behind {current['base_behind']}"
+            )
+        lines.append(
+            f"base comparison: {_clip(current.get('base_ref'), 180)}; {base_divergence}"
+        )
+    recent = summary.get("recent_commits") or []
+    if recent:
+        lines.append(
+            "recent commits: "
+            + " | ".join(
+                f"{_clip(item.get('sha'), 16)} {_clip(item.get('subject'), 180)}"
+                for item in recent[:3]
+            )
+        )
 
     remotes = summary.get("remotes") or []
     if remotes:
@@ -423,6 +564,35 @@ def render_pr_workflow_preflight(
     omitted_warnings = counts.get("warning_samples_omitted", 0)
     if omitted_warnings:
         lines.append(f"warning samples omitted: {omitted_warnings}")
+
+    pr = summary.get("pr") or {}
+    if pr:
+        draft = "draft" if pr.get("is_draft") else "ready"
+        lines.append(
+            "PR: "
+            f"#{_clip(pr.get('number'), 24)} {draft}; state={_clip(pr.get('state'), 32)}; "
+            f"head={_clip(pr.get('head_sha'), 16)}; mergeable={_clip(pr.get('mergeable'), 48)}; "
+            f"merge-state={_clip(pr.get('merge_state'), 48)}; review={_clip(pr.get('review_decision'), 48)}"
+        )
+        checks = pr.get("checks") or []
+        if checks:
+            lines.append(
+                "checks: "
+                + ", ".join(
+                    f"{_clip(item.get('name'), 120)}={_clip(item.get('status'), 40)}"
+                    for item in checks
+                )
+            )
+        if pr.get("checks_omitted"):
+            lines.append(f"checks omitted: {pr['checks_omitted']}")
+        if pr.get("merged_at") or pr.get("merge_sha"):
+            lines.append(
+                f"merge: at={_clip(pr.get('merged_at') or 'unknown', 80)}; "
+                f"sha={_clip(pr.get('merge_sha') or 'unknown', 64)}"
+            )
+        if pr.get("url"):
+            lines.append(f"PR URL: {_clip(pr.get('url'), 420)}")
+
     errors = summary.get("errors") or []
     for error in errors:
         lines.append(f"error: {_clip(error, 420)}")
@@ -441,6 +611,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--repo", default=".", help="Repository/worktree path (default: current directory)")
     parser.add_argument("--base", dest="base_branch", help="PR base branch to include")
     parser.add_argument("--head", dest="head_branch", help="PR head branch to include")
+    parser.add_argument("--pr", dest="pr_ref", help="Optional PR number or URL to snapshot")
     parser.add_argument(
         "--max-chars",
         type=int,
@@ -452,6 +623,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.repo,
         base_branch=args.base_branch,
         head_branch=args.head_branch,
+        pr_ref=args.pr_ref,
         max_output_chars=args.max_chars,
     )
     print(summary["output"])
