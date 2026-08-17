@@ -18572,9 +18572,10 @@ class _GatewayRunnerCore(
             # not linger or the session would be permanently locked out.
             if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(_quick_key)
-            else:
+            elif _quick_key not in self._running_agents:
                 # Agent path already cleaned _running_agents; make sure
-                # the paired metadata dicts are gone too.
+                # the paired metadata dicts are gone too. A restored older
+                # run still owns them and remains steerable.
                 self._running_agents_ts.pop(_quick_key, None)
                 if hasattr(self, "_busy_ack_ts"):
                     self._busy_ack_ts.pop(_quick_key, None)
@@ -29531,9 +29532,44 @@ class _GatewayRunnerCore(
         if run_generation is not None:
             self._release_turn_lease(session_key, run_generation)
         self._discard_start_user_followups(session_key, run_generation)
+
+        tracked_runs = self.__dict__.get("_running_agents_by_generation")
+        fallback_agent = None
+        fallback_started_at = None
+        released_agent = None
+        if isinstance(tracked_runs, dict):
+            if run_generation is None:
+                for key in [key for key in tracked_runs if key[0] == session_key]:
+                    tracked_runs.pop(key, None)
+            else:
+                released = tracked_runs.pop((session_key, run_generation), None)
+                if released is not None:
+                    released_agent = released[0]
+                    remaining = [
+                        (generation, value)
+                        for (key, generation), value in tracked_runs.items()
+                        if key == session_key
+                    ]
+                    if remaining:
+                        _, (fallback_agent, fallback_started_at) = max(
+                            remaining, key=lambda item: item[0]
+                        )
+
+        had_running_agent = session_key in self._running_agents
+        current_agent = self._running_agents.get(session_key)
+        if released_agent is not None and current_agent is released_agent:
+            if fallback_agent is not None:
+                self._running_agents[session_key] = fallback_agent
+                self._running_agents_ts[session_key] = fallback_started_at
+            else:
+                self._running_agents.pop(session_key, None)
+                self._running_agents_ts.pop(session_key, None)
+
         if run_generation is not None and not self._is_session_run_current(
             session_key, run_generation
         ):
+            if released_agent is not None and current_agent is released_agent:
+                self._refresh_active_agent_runtime_status()
             return False
         lease = getattr(self, "_active_session_leases", {}).pop(session_key, None)
         if lease is not None:
@@ -29541,9 +29577,9 @@ class _GatewayRunnerCore(
                 lease.release()
             except Exception:
                 logger.debug("Failed to release active session slot", exc_info=True)
-        had_running_agent = session_key in self._running_agents
-        self._running_agents.pop(session_key, None)
-        self._running_agents_ts.pop(session_key, None)
+        if fallback_agent is None:
+            self._running_agents.pop(session_key, None)
+            self._running_agents_ts.pop(session_key, None)
         running_pr_generations = self.__dict__.get(
             "_running_discord_pr_generations"
         )
@@ -33194,6 +33230,10 @@ class _GatewayRunnerCore(
             # current.  If /stop or /new bumped the generation while we were
             # spinning up, leave the newer run's slot alone — we'll be
             # discarded by the stale-result check in _handle_message_with_agent.
+            if run_generation is not None:
+                self.__dict__.setdefault("_running_agents_by_generation", {})[
+                    (session_key, run_generation)
+                ] = (agent_holder[0], time.time())
             if run_generation is not None and not self._is_session_run_current(
                 session_key, run_generation
             ):
