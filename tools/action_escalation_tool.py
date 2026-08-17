@@ -68,4 +68,5 @@ registry.register(
     handler=lambda args, **_kw: escalate_to_action(reason=args.get("reason", "")),
     emoji="↗️",
     effect="read_only",
+    runtime_modes={"read_only"},
 )

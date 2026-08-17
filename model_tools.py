@@ -40,6 +40,15 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _is_dispatcher_owned_worker() -> bool:
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -325,7 +334,7 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(os.environ.get("HERMES_KANBAN_TASK")) and _is_dispatcher_owned_worker(),
             _default_kanban_intake,
             bool(skip_tool_search_assembly),
             str(runtime_mode or ""),
@@ -379,7 +388,11 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and _is_dispatcher_owned_worker()
+            and "kanban" not in effective_enabled_toolsets
+        ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
@@ -631,28 +644,63 @@ def _compute_tool_definitions(
 
 
 def _resolve_active_context_length() -> int:
-    """Look up the active model's context length for the tool-search gate.
-
-    Returns 0 when the model can't be resolved — ``should_activate`` falls
-    back to a fixed token cutoff in that case.
-    """
+    """Look up the active model's context length for the tool-search gate."""
     try:
         from hermes_cli.config import load_config as _load
+
         cfg = _load() or {}
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         if not isinstance(model_cfg, dict):
             model_cfg = {}
-        model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
+        raw_model_id = model_cfg.get("model") or model_cfg.get("default") or ""
+        if isinstance(raw_model_id, dict):
+            from hermes_cli.config import split_model_config_default
+
+            raw_model_id, _ = split_model_config_default(raw_model_id)
+        model_id = str(raw_model_id).strip()
         if not model_id:
             return 0
+
         from agent.model_metadata import get_model_context_length
-        # Honor explicit `model.context_length` in config.yaml — short-circuits
-        # the OpenRouter /models probe at get_model_context_length step 0, so
-        # non-OpenRouter providers don't pay the ~2-3s OpenRouter fetch at every
-        # CLI startup.  See issue #46620.
+
         raw_ctx = model_cfg.get("context_length")
         config_ctx = raw_ctx if isinstance(raw_ctx, int) and raw_ctx > 0 else None
-        return int(get_model_context_length(model_id, config_context_length=config_ctx) or 0)
+        provider = str(model_cfg.get("provider") or "").strip()
+        base_url = str(model_cfg.get("base_url") or "").strip()
+        api_key = ""
+        if provider:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                runtime = resolve_runtime_provider(
+                    requested=provider, target_model=model_id
+                ) or {}
+                base_url = str(runtime.get("base_url") or base_url or "").strip()
+                api_key = str(runtime.get("api_key") or "").strip()
+            except Exception as exc:
+                logger.debug(
+                    "Runtime provider resolution failed for tool-search context gate: %s",
+                    exc,
+                )
+        if config_ctx is None and base_url:
+            try:
+                from agent.model_metadata import get_cached_context_length
+
+                cached = get_cached_context_length(model_id, base_url)
+                if isinstance(cached, int) and cached > 0:
+                    return cached
+            except Exception:
+                pass
+        return int(
+            get_model_context_length(
+                model_id,
+                base_url=base_url,
+                api_key=api_key,
+                config_context_length=config_ctx,
+                provider=provider,
+            )
+            or 0
+        )
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0

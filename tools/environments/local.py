@@ -1208,6 +1208,30 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     return prelude + cmd_string
 
 
+def build_subprocess_env(
+    base: dict[str, str] | None = None,
+    *,
+    inherit_profile_home: bool = True,
+    scrub_secrets: bool = True,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a subprocess environment through the existing safety helpers."""
+    if scrub_secrets:
+        return _sanitize_subprocess_env(
+            dict(base) if base is not None else os.environ.copy(),
+            dict(extra) if extra else None,
+        )
+    env = dict(base) if base is not None else os.environ.copy()
+    if inherit_profile_home:
+        _inject_context_hermes_home(env)
+        from hermes_constants import apply_subprocess_home_env
+
+        apply_subprocess_home_env(env)
+    if extra:
+        env.update(extra)
+    return env
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host machine.
 

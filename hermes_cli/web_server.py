@@ -4592,6 +4592,8 @@ def get_profiles_sessions_sidebar(
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
     recents_scope = (recents_profile or "all").strip() or "all"
+    if recents_scope != "all":
+        targets = [(name, home) for name, home in targets if name == recents_scope]
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
 
@@ -4604,6 +4606,7 @@ def get_profiles_sessions_sidebar(
     messaging_rows: List[Dict[str, Any]] = []
     recents_total = 0
     recents_profile_totals: Dict[str, int] = {}
+    profiles_usage: Dict[str, Dict[str, float | int]] = {}
     errors: List[Dict[str, str]] = []
     now = time.time()
 
@@ -4645,6 +4648,14 @@ def get_profiles_sessions_sidebar(
                 recents_rows.extend(
                     _tag(_slice(db, exclude=recents_exclude_list, cap=recents_cap), name)
                 )
+                usage = db._conn.execute(
+                    "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens, "
+                    "COALESCE(SUM(estimated_cost_usd), 0) AS cost_usd FROM sessions"
+                ).fetchone()
+                profiles_usage[name] = {
+                    "tokens": int(usage["tokens"] or 0),
+                    "cost_usd": float(usage["cost_usd"] or 0),
+                }
                 rtotal = db.session_count(
                     exclude_sources=recents_exclude_list or None,
                     min_message_count=1,
@@ -4674,12 +4685,75 @@ def get_profiles_sessions_sidebar(
             "sessions": _window(recents_rows, recents_cap),
             "total": recents_total,
             "profile_totals": recents_profile_totals,
+            "profiles_usage": profiles_usage,
         },
         "cron": {"sessions": _window(cron_rows, cron_cap)},
         "messaging": {
             "sessions": _window(messaging_rows, messaging_cap),
             "total": len(messaging_rows),
         },
+        "errors": errors,
+    }
+
+
+@app.get("/api/profiles/projects/tree")
+def get_profiles_projects_tree():
+    """Build and merge each profile's project tree in that profile's scope."""
+    from hermes_cli import profiles as profiles_mod
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+    from tui_gateway import server as gateway_server
+
+    try:
+        targets = [(info.name, info.path) for info in profiles_mod.list_profiles()]
+    except Exception:
+        targets = []
+    if not targets:
+        targets = [("default", profiles_mod.get_profile_dir("default"))]
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    scoped_ids: set[str] = set()
+    errors: List[Dict[str, str]] = []
+    for name, home in targets:
+        db_path = Path(home) / "state.db"
+        if not db_path.exists():
+            continue
+        token = set_hermes_home_override(str(home))
+        db = None
+        try:
+            db = SessionDB(db_path=db_path, read_only=True)
+            tree, _active_id = gateway_server._build_project_tree(
+                db,
+                preview_limit=3,
+                hydrate=False,
+                session_limit=2000,
+                include_discovered=True,
+            )
+            scoped_ids.update(str(value) for value in tree.get("scoped_session_ids", []))
+            for project in tree.get("projects", []):
+                key = "__home__" if project.get("isNoProject") else str(project.get("path") or project.get("id"))
+                existing = merged.get(key)
+                if existing is None:
+                    merged[key] = dict(project)
+                    continue
+                existing["sessionCount"] = int(existing.get("sessionCount") or 0) + int(project.get("sessionCount") or 0)
+                existing["totalTokens"] = int(existing.get("totalTokens") or 0) + int(project.get("totalTokens") or 0)
+                existing["totalCostUsd"] = float(existing.get("totalCostUsd") or 0) + float(project.get("totalCostUsd") or 0)
+                existing["lastActive"] = max(float(existing.get("lastActive") or 0), float(project.get("lastActive") or 0))
+                existing.setdefault("repos", []).extend(project.get("repos") or [])
+                existing.setdefault("previewSessions", []).extend(project.get("previewSessions") or [])
+        except Exception as exc:
+            errors.append({"profile": name, "error": str(exc)})
+        finally:
+            if db is not None:
+                db.close()
+            reset_hermes_home_override(token)
+
+    projects = sorted(merged.values(), key=lambda item: float(item.get("lastActive") or 0), reverse=True)
+    return {
+        "projects": projects,
+        "active_id": None,
+        "scoped_session_ids": sorted(scoped_ids),
         "errors": errors,
     }
 

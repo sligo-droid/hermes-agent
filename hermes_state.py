@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import shutil
@@ -509,6 +510,52 @@ def _backup_db_file(db_path: Path) -> Path:
                 backup_path.with_name(backup_path.name + suffix),
             )
     return backup_path
+
+
+def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> None:
+    raw = str(db_path)
+    if raw == ":memory:" or raw.startswith("file:"):
+        return
+
+    try:
+        home: Optional[Path] = Path(get_hermes_home()).resolve()
+    except Exception:
+        home = None
+
+    def ensure_writable(path: Path, *, is_dir: bool = False) -> None:
+        import stat
+
+        if os.access(path, os.R_OK | os.W_OK):
+            return
+        try:
+            in_home = home is not None and path.resolve().is_relative_to(home)
+        except (OSError, ValueError):
+            in_home = False
+        if in_home:
+            try:
+                mode = stat.S_IRUSR | stat.S_IWUSR | (stat.S_IXUSR if is_dir else 0)
+                os.chmod(path, path.stat().st_mode | mode)
+            except OSError:
+                pass
+            if os.access(path, os.R_OK | os.W_OK):
+                return
+        kind = "directory" if is_dir else "file"
+        wal_note = (
+            " Do NOT delete the -wal file — it contains committed data."
+            if path.name.endswith("-wal")
+            else ""
+        )
+        raise sqlite3.OperationalError(
+            f"{db_label} is not writable: {kind} {path} is read-only for this user. "
+            f"Fix with: chmod u+rw{'x' if is_dir else ''} '{path}'.{wal_note}"
+        )
+
+    if db_path.parent.is_dir():
+        ensure_writable(db_path.parent, is_dir=True)
+    for suffix in ("", "-wal", "-shm"):
+        path = db_path.with_name(db_path.name + suffix) if suffix else db_path
+        if path.is_file():
+            ensure_writable(path)
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:

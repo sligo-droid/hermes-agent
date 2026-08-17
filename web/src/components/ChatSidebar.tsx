@@ -4,19 +4,22 @@
  *
  * Two WebSockets, one per concern:
  *
- *   1. **JSON-RPC sidecar** (`GatewayClient` → /api/ws) — drives the
- *      sidebar's own slot of the dashboard's in-process gateway.  Owns
- *      option loading / connection state / error banner. It is not the
- *      visible PTY session; slash commands that should affect the visible
- *      chat are injected into /api/pty as terminal input.
+ *   1. **JSON-RPC sidecar** (`GatewayClient` → /api/ws) — a lightweight
+ *      session used only for connection state (the "live" badge) and
+ *      credential warnings. Independent of the PTY pane's session by
+ *      design. The model badge does NOT come from here: it reads the
+ *      effective config model over REST (`/api/model/info`), and the model
+ *      picker writes config over REST (`/api/model/set`) then offers a
+ *      dashboard reload so the running chat adopts the new model.
  *
  *   2. **Event subscriber** (/api/events?channel=…) — passive, receives
  *      every dispatcher emit from the PTY-side `tui_gateway.entry` that
- *      the dashboard fanned out.  This is how `tool.start/progress/
- *      complete` from the agent loop reach the sidebar even though the
- *      PTY child runs three processes deep from us.  The `channel` id
- *      ties this listener to the same chat tab's PTY child — see
- *      `ChatPage.tsx` for where the id is generated.
+ *      the dashboard fanned out.  The sidebar uses it for `session.info`
+ *      (live chat title) and `dashboard.new_session_requested`.  The
+ *      `channel` id ties this listener to the same chat tab's PTY child —
+ *      see `ChatPage.tsx` for where the id is generated.  Transient drops
+ *      (gateway restart, network blip) auto-reconnect with exponential
+ *      backoff; auth rejections are terminal.  See `lib/events-reconnect`.
  *
  * Best-effort throughout: WS failures show in the badge / banner, the
  * terminal pane keeps working unimpaired.
@@ -31,6 +34,19 @@ import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, buildWsUrl } from "@/lib/api";
+import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
+import {
+  EVENTS_CONNECT_TIMEOUT_MS,
+  EVENTS_DISCONNECTED_MESSAGE,
+  EVENTS_MAX_RECONNECT_ATTEMPTS,
+  eventsGaveUpMessage,
+  eventsReconnectDelayMs,
+  eventsReconnectingMessage,
+  eventsRejectedMessage,
+  isEventsAuthRejection,
+  isEventsFeedMessage,
+  shouldRetryEventsClose,
+} from "@/lib/events-reconnect";
 import { titleFromSessionInfoPayload } from "@/lib/chat-title";
 
 import { cn } from "@/lib/utils";
@@ -192,7 +208,10 @@ export function ChatSidebar({
       }
     });
 
-    // Create a lightweight, close-on-disconnect sidecar for status signals.
+    // Create the sidecar session so the gateway surfaces session-scoped
+    // signals (connection state, credential warnings). It's independent of the
+    // PTY pane's session by design. The model picker no longer rides this
+    // session — it writes config.yaml over REST — so we don't track its id.
     gw.connect()
       .then(() => {
         if (cancelled) {
@@ -232,36 +251,147 @@ export function ChatSidebar({
       return;
     }
     // In loopback mode the legacy ?token=<session> path is fine; in gated
-    // mode we have to mint a single-use ticket from the cookie. The IIFE
-    // keeps the outer effect synchronous so its ``return cleanup`` stays
-    // at the top level; the local ``ws`` is hoisted to a closed-over
-    // binding the cleanup reads via ``wsRef``.
+    // mode we have to mint a single-use ticket from the cookie. `connect`
+    // keeps the outer effect synchronous so its ``return cleanup`` stays at
+    // the top level; `ws` is a closed-over binding the cleanup reads.
     let unmounting = false;
     let ws: WebSocket | null = null;
-    void (async () => {
-      const url = await buildWsUrl("/api/events", { channel });
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let connectTimer: ReturnType<typeof setTimeout> | null = null;
+    let connectGeneration = 0;
+    let attempt = 0;
+
+    const clearConnectTimer = () => {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+    };
+
+    // The banner is shared with `info.credential_warning` and the JSON-RPC
+    // sidecar, and `error` is those messages' only home — the sidecar does
+    // not re-emit. So the events feed may only write over an empty banner
+    // or one of its own messages, and may only clear its own.
+    const surface = (msg: string) =>
+      !unmounting &&
+      setError((current) =>
+        isEventsFeedMessage(current) ? msg : (current ?? msg),
+      );
+
+    const clearEventsBanner = () =>
+      !unmounting &&
+      setError((current) => (isEventsFeedMessage(current) ? null : current));
+
+    // Single scheduling path. `close` always follows `error` for a failed
+    // socket, so scheduling from `error` too would queue two timers and
+    // leak the first — only the latest is tracked for cleanup.
+    const scheduleReconnect = () => {
+      if (unmounting || reconnectTimer) {
+        return;
+      }
+      if (attempt >= EVENTS_MAX_RECONNECT_ATTEMPTS) {
+        surface(eventsGaveUpMessage());
+        return;
+      }
+
+      const delay = eventsReconnectDelayMs(attempt);
+      attempt += 1;
+      surface(eventsReconnectingMessage(delay));
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        void connect();
+      }, delay);
+    };
+
+    const connect = async () => {
       if (unmounting) {
         return;
       }
-      ws = new WebSocket(url);
+
+      const generation = ++connectGeneration;
+      let socket: WebSocket | null = null;
+
+      // Cover the whole connection attempt, including gated-mode ticket
+      // minting. A failed or hanging pre-socket request otherwise emits no
+      // WebSocket close event and permanently strands the retry loop at its
+      // last "reconnecting in ..." banner.
+      clearConnectTimer();
+      connectTimer = setTimeout(() => {
+        connectTimer = null;
+        if (unmounting || generation !== connectGeneration) {
+          return;
+        }
+
+        // Invalidate any late ticket result or socket event from this attempt
+        // before scheduling its replacement.
+        connectGeneration += 1;
+        if (socket && ws === socket) {
+          ws = null;
+          socket.close();
+        }
+        scheduleReconnect();
+      }, EVENTS_CONNECT_TIMEOUT_MS);
+
+      try {
+        // Re-minted every attempt: tickets are single-use with a short TTL,
+        // so a reconnect cannot replay the URL from the first connection.
+        const url = await buildWsUrl("/api/events", { channel });
+        if (unmounting || generation !== connectGeneration) {
+          return;
+        }
+        socket = new WebSocket(url);
+        ws = socket;
+      } catch {
+        if (unmounting || generation !== connectGeneration) {
+          return;
+        }
+        clearConnectTimer();
+        connectGeneration += 1;
+        scheduleReconnect();
+        return;
+      }
+
+      // A superseded socket's late close must not schedule a retry on top
+      // of the one that replaced it.
+      const isCurrent = () => ws === socket;
+
+      socket.addEventListener("open", () => {
+        if (!isCurrent()) {
+          return;
+        }
+        clearConnectTimer();
+        attempt = 0;
+        clearEventsBanner();
+      });
 
       // `unmounting` suppresses the banner during cleanup — `ws.close()`
       // from the effect's return fires a close event with code 1005 that
       // would otherwise look like an unexpected drop.
-      const DISCONNECTED = "events feed disconnected — tool calls may not appear";
-      const surface = (msg: string) => !unmounting && setError(msg);
-
-      ws.addEventListener("error", () => surface(DISCONNECTED));
-
-      ws.addEventListener("close", (ev) => {
-        if (ev.code === 4401 || ev.code === 4403) {
-          surface(`events feed rejected (${ev.code}) — reload the page`);
-        } else if (ev.code !== 1000) {
-          surface(DISCONNECTED);
+      socket.addEventListener("error", () => {
+        if (isCurrent()) {
+          surface(EVENTS_DISCONNECTED_MESSAGE);
         }
       });
 
-      ws.addEventListener("message", (ev) => {
+      socket.addEventListener("close", (ev) => {
+        if (!isCurrent()) {
+          return;
+        }
+        clearConnectTimer();
+        if (maybeReloadForLoopbackWsAuthFailure(ev.code)) {
+          return;
+        }
+        if (isEventsAuthRejection(ev.code)) {
+          surface(eventsRejectedMessage(ev.code));
+          return;
+        }
+        if (shouldRetryEventsClose(ev.code)) {
+          scheduleReconnect();
+        }
+      });
+
+      socket.addEventListener("message", (ev) => {
         let frame: RpcEnvelope;
 
         try {
@@ -285,14 +415,24 @@ export function ChatSidebar({
           onDashboardNewSessionRequest?.();
         }
       });
-    })();
+    };
+
+    void connect();
 
     return () => {
       unmounting = true;
+      connectGeneration += 1;
+      clearConnectTimer();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       ws?.close();
     };
   }, [channel, onDashboardNewSessionRequest, onSessionTitleChange, version]);
 
+  // Seed the badge on mount and re-read it whenever the sockets are rebuilt
+  // (a profile/channel switch bumps `version`).
   useEffect(() => {
     refreshEffectiveModel();
   }, [refreshEffectiveModel, version]);
@@ -304,6 +444,8 @@ export function ChatSidebar({
     setVersion((v) => v + 1);
   }, []);
 
+  // The picker writes config.yaml over REST and reloads — it doesn't ride the
+  // sidecar gateway session, so it's available whenever the sidebar is mounted.
   const modelName = effectiveModel || info.model || "—";
   const modelLabel = modelName.split("/").slice(-1)[0] ?? "—";
   const banner = error ?? info.credential_warning ?? null;
@@ -334,6 +476,7 @@ export function ChatSidebar({
           >
             <span className="flex min-w-0 max-w-full items-center gap-1">
               <span className="truncate">{modelLabel}</span>
+
               <ChevronDown className="size-3.5 shrink-0 text-text-secondary" />
             </span>
           </Button>
@@ -368,6 +511,7 @@ export function ChatSidebar({
           </div>
         </Card>
       )}
+
       {banner && (
         <Card className="flex items-start gap-2 border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
@@ -383,7 +527,7 @@ export function ChatSidebar({
                 onClick={reconnect}
                 prefix={<RefreshCw />}
               >
-                reconnect tools feed
+                reconnect events feed
               </Button>
             )}
           </div>

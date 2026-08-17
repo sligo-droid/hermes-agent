@@ -34,11 +34,6 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
     platforms: [macos]            # Optional — restrict to specific OS platforms
                                   #   Valid: macos, linux, windows
                                   #   Omit to load on all platforms (default)
-    metadata:
-      hermes:
-        visibility:                # Optional offer-surface metadata
-          prompt_index: false      # Hide from always-loaded prompt only;
-                                   # explicit list/view/slash loads still work
     prerequisites:                # Optional — legacy runtime requirements
       env_vars: [API_KEY]         #   Legacy env var names are normalized into
                                   #   required_environment_variables on load.
@@ -56,7 +51,7 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
 
 Available tools:
 - skills_list: List skills with metadata (progressive disclosure tier 1)
-- skill_view: Load a bounded skill overview, or the full body on request
+- skill_view: Load full skill content (progressive disclosure tier 2-3)
 
 Usage:
     from tools.skills_tool import skills_list, skill_view, check_skills_requirements
@@ -64,7 +59,7 @@ Usage:
     # List all skills (returns metadata only - token efficient)
     result = skills_list()
 
-    # View a bounded overview; request full_content=True for full instructions.
+    # View a skill's main content (loads full instructions)
     content = skill_view("axolotl")
 
     # View a reference file within a skill (loads linked file)
@@ -74,6 +69,7 @@ Usage:
 import json
 import logging
 import time
+import threading
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -85,9 +81,10 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled
-from agent.skill_utils import EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS
-from agent.skill_utils import is_excluded_skill_path as _is_excluded_skill_path
-from agent.skill_utils import resolve_skill_category
+from agent.skill_utils import (
+    EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    is_skill_support_path as _is_skill_support_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +98,7 @@ logger = logging.getLogger(__name__)
 #   - a short TTL bounds staleness from in-place SKILL.md edits, which
 #     bump only the file's mtime, invisible to any directory signature.
 # skip_disabled True/False are cached separately.
-_SKILLS_CACHE: dict = {}  # {cache_key: (signature, timestamp, skills_list, diagnostics)}
-_LAST_SKILLS_DISCOVERY_REPORT: dict = {}
+_SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_list)}
 _SKILLS_CACHE_TTL_SECONDS = 30.0
 _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
@@ -180,13 +176,22 @@ _PLATFORM_MAP = {
 }
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_ENV_BACKENDS = frozenset(
-    {"docker", "singularity", "modal", "ssh", "daytona"}
+    {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}
 )
 _secret_capture_callback = None
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
-    """Return an error if a local skill lookup name can escape search roots."""
+    """Return an error if a local skill lookup *name* can escape search roots.
+
+    The skill ``name`` is joined onto each trusted search dir to build the
+    on-disk lookup path, so it must stay relative and free of ``..`` segments —
+    otherwise ``name="../outside"`` or an absolute path could select a skill
+    (and read files) outside the skills directory. Mirrors the ``file_path``
+    validation done later via ``tools.path_security``. We also reject Windows
+    drive paths (e.g. ``C:\\skills``), whose ``:`` would otherwise be misread as
+    a plugin namespace separator.
+    """
     from tools.path_security import has_traversal_component
 
     if not isinstance(name, str):
@@ -210,7 +215,10 @@ def load_env() -> Dict[str, str]:
     if not env_path.exists():
         return env_vars
 
-    with env_path.open(encoding="utf-8") as f:
+    # utf-8-sig: users hand-edit .env in Notepad, which prepends a BOM that
+    # would otherwise glue U+FEFF onto the first key name (same dialect as
+    # the canonical readers in hermes_cli/config.py).
+    with env_path.open(encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -239,42 +247,6 @@ _INJECTION_PATTERNS: list = [
     "<system>",
     "]]>",
 ]
-_EMITTED_SKILL_SECURITY_WARNINGS: Set[Tuple[str, Path]] = set()
-
-
-def _resolve_path_for_security(path: Path) -> Path:
-    try:
-        return path.resolve()
-    except OSError:
-        return path.absolute()
-
-
-def _path_is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _trusted_skill_roots(search_dirs: List[Path]) -> List[Path]:
-    roots: List[Path] = []
-    seen: Set[Path] = set()
-    for root in [SKILLS_DIR, get_hermes_home() / "skills", *search_dirs[1:]]:
-        resolved = _resolve_path_for_security(root)
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        roots.append(resolved)
-    return roots
-
-
-def _record_skill_security_warning(reason: str, skill_md: Path) -> bool:
-    key = (reason, _resolve_path_for_security(skill_md))
-    if key in _EMITTED_SKILL_SECURITY_WARNINGS:
-        return False
-    _EMITTED_SKILL_SECURITY_WARNINGS.add(key)
-    return True
 
 
 def set_secret_capture_callback(callback) -> None:
@@ -450,7 +422,13 @@ def _capture_required_environment_variables(
         }
 
     missing_names = [entry["name"] for entry in missing_entries]
-    if _is_gateway_surface():
+    # Most gateway surfaces (messaging platforms) can't prompt for a secret, so
+    # they short-circuit to the "unsupported" hint. Interactive gateway surfaces
+    # — the desktop app / TUI — set HERMES_INTERACTIVE and register a
+    # secret-capture callback that routes to a secure secret.request overlay, so
+    # they fall through and actually prompt. (HERMES_INTERACTIVE is the same flag
+    # tools/approval.py uses to tell an interactive surface from a messaging one.)
+    if _is_gateway_surface() and not env_var_enabled("HERMES_INTERACTIVE"):
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -596,20 +574,20 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
     Also works for external skill dirs configured via skills.external_dirs.
     """
-
     # Try the active profile skills dir first (respects monkeypatching in tests),
-    # then fall back to external/inherited dirs.
+    # then fall back to external dirs from config.
     dirs_to_check = [_skills_dir()]
     try:
-        from agent.skill_utils import get_external_skills_dirs, get_inherited_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs
         dirs_to_check.extend(get_external_skills_dirs())
-        dirs_to_check.extend(get_inherited_skills_dirs())
     except Exception:
         pass
     for skills_dir in dirs_to_check:
         try:
-            skill_path.relative_to(skills_dir)
-            return resolve_skill_category(skill_path, skills_dir)
+            rel_path = skill_path.relative_to(skills_dir)
+            parts = rel_path.parts
+            if len(parts) >= 3:
+                return parts[0]
         except ValueError:
             continue
     return None
@@ -687,8 +665,9 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         if resolved_platform:
             platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
             if platform_disabled is not None:
-                # Platform-specific disables add to the global set; they do
-                # not re-enable a globally disabled skill.
+                # A globally-disabled skill stays disabled on every platform;
+                # the platform list adds to it rather than replacing it. Keep
+                # in sync with agent.skill_utils.get_disabled_skill_names.
                 return name in platform_disabled or name in global_disabled
         return name in global_disabled
     except Exception:
@@ -710,12 +689,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     signature changes (dir/category mtimes or the disabled-set) and expires
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
-    global _LAST_SKILLS_DISCOVERY_REPORT
-    from agent.skill_utils import (
-        discover_skill_offers,
-        get_external_skills_dirs,
-        get_inherited_skills_dirs,
-    )
+    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
 
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
 
@@ -731,9 +705,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     if active_skills_dir.exists():
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
-    inherited_dirs = get_inherited_skills_dirs()
 
-    signature = _skills_scan_signature([*dirs_to_scan, *inherited_dirs], disabled)
+    signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -745,61 +718,76 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # Per-call shallow copies: callers mutate the returned dicts
         # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
         # out the cached objects would poison the cache for everyone else.
-        _LAST_SKILLS_DISCOVERY_REPORT = dict(cached[3]) if len(cached) > 3 else {}
         return [dict(s) for s in cached[2]]
 
-    offers, diagnostics = discover_skill_offers(
-        dirs_to_scan,
-        inherited_dirs,
-        disabled=disabled,
-        filter_environment=True,
-    )
     skills = []
-    for offer in offers:
-        # Never truncate an advertised lookup token: skill_view must receive
-        # the exact name that discovery exposed.
-        name = str(offer["name"])
-        description = str(offer.get("description") or "")
-        if len(description) > MAX_DESCRIPTION_LENGTH:
-            description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
-        skills.append(
-            {
-                "name": name,
-                "description": description,
-                "category": offer.get("category") or "general",
-            }
-        )
-    _LAST_SKILLS_DISCOVERY_REPORT = diagnostics
+    seen_names: set = set()
+
+    # Scan local dir first, then external dirs (local takes precedence) —
+    # dirs_to_scan already resolved above for the signature.
+    for scan_dir in dirs_to_scan:
+        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+
+            skill_dir = skill_md.parent
+
+            try:
+                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+                frontmatter, body = _parse_frontmatter(content)
+
+                if not skill_matches_platform(frontmatter):
+                    continue
+
+                if not skill_matches_environment(frontmatter):
+                    continue
+
+                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                if name in seen_names:
+                    continue
+                if name in disabled:
+                    continue
+
+                description = frontmatter.get("description", "")
+                if not description:
+                    for line in body.strip().split("\n"):
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            description = line
+                            break
+
+                if len(description) > MAX_DESCRIPTION_LENGTH:
+                    description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
+
+                category = _get_category_from_path(skill_md)
+
+                seen_names.add(name)
+                skills.append({
+                    "name": name,
+                    "description": description,
+                    "category": category,
+                })
+
+            except (UnicodeDecodeError, PermissionError) as e:
+                logger.debug("Failed to read skill file %s: %s", skill_md, e)
+                continue
+            except Exception as e:
+                logger.debug(
+                    "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
+                )
+                continue
 
     # Store in cache keyed by the scan signature computed BEFORE the scan
     # (a write racing the scan changes the signature, so the next call
     # re-scans rather than serving the torn result past the TTL). Same
     # shallow-copy contract as the hit path — the caller may mutate.
-    _SKILLS_CACHE[cache_key] = (signature, now, skills, diagnostics)
+    _SKILLS_CACHE[cache_key] = (signature, now, skills)
     return [dict(s) for s in skills]
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
-
-
-def _public_skills_diagnostics(report: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep skills_list diagnostics useful without echoing every scanned path."""
-    return {
-        key: report.get(key)
-        for key in (
-            "raw_path_count",
-            "unique_name_count",
-            "offered_count",
-            "collision_count",
-            "collision_names",
-            "collisions",
-            "filtered_count",
-            "filtered_counts",
-        )
-        if key in report
-    }
 
 
 def _skill_view_json_size(payload: Dict[str, Any]) -> int:
@@ -855,21 +843,12 @@ def _bound_skill_view_payload(
     *,
     full_content: bool,
 ) -> Tuple[Dict[str, Any], bool]:
-    """Bound the default root-skill response without limiting explicit loads.
-
-    The result stays structurally useful: metadata, setup/readiness information,
-    and a bounded linked-file manifest survive, while the body becomes a
-    head/tail overview. The final fit protects the serialized response even
-    when frontmatter or file paths are unusually large.
-    """
+    """Bound default root-skill responses while leaving explicit loads intact."""
     result = dict(payload)
     content = str(result.get("content") or "")
     result["content_total_chars"] = len(content)
     result["content_truncated"] = False
-    if full_content:
-        return result, False
-
-    if _skill_view_json_size(result) <= SKILL_VIEW_RESPONSE_MAX_CHARS:
+    if full_content or _skill_view_json_size(result) <= SKILL_VIEW_RESPONSE_MAX_CHARS:
         return result, False
 
     result["content_truncated"] = True
@@ -887,13 +866,9 @@ def _bound_skill_view_payload(
     if linked_truncated:
         result["linked_files_truncated"] = True
 
-    # These fields are useful for explicit full loads but can contain arbitrary
-    # user-authored metadata. Drop them only from an oversized overview.
     for key in ("metadata", "gateway_setup_hint", "setup_help"):
         result.pop(key, None)
 
-    # Trim the preview until the common case fits, then fall back to an
-    # essential payload for pathological metadata.
     while (
         _skill_view_json_size(result) > SKILL_VIEW_RESPONSE_MAX_CHARS
         and len(result["content"]) > 240
@@ -904,38 +879,33 @@ def _bound_skill_view_payload(
 
     if _skill_view_json_size(result) > SKILL_VIEW_RESPONSE_MAX_CHARS:
         essential_keys = {
-            "success",
-            "name",
-            "description",
-            "content",
-            "content_total_chars",
-            "content_truncated",
-            "full_content_hint",
-            "path",
-            "skill_dir",
-            "linked_files",
-            "linked_files_truncated",
-            "setup_needed",
+            "success", "name", "description", "content", "content_total_chars",
+            "content_truncated", "full_content_hint", "path", "skill_dir",
+            "linked_files", "linked_files_truncated", "setup_needed",
             "readiness_status",
         }
         result = {key: value for key, value in result.items() if key in essential_keys}
-        result["description"] = _skill_view_preview(str(result.get("description") or ""), 500)
+        result["description"] = _skill_view_preview(
+            str(result.get("description") or ""), 500
+        )
         result["path"] = _skill_view_preview(str(result.get("path") or ""), 500)
-        result["skill_dir"] = _skill_view_preview(str(result.get("skill_dir") or ""), 700)
+        result["skill_dir"] = _skill_view_preview(
+            str(result.get("skill_dir") or ""), 700
+        )
         result["linked_files"], _ = _bound_linked_files(
             result.get("linked_files"), max_chars=700
         )
 
     if _skill_view_json_size(result) > SKILL_VIEW_RESPONSE_MAX_CHARS:
-        # Keep the useful fields and fit only the content field exactly. This
-        # path is intentionally defensive; normal skills stop above.
         result["linked_files"] = None
         for key in ("path", "skill_dir", "description"):
             if key in result:
                 result[key] = _skill_view_preview(str(result[key] or ""), 240)
         base = dict(result)
         base["content"] = ""
-        available = max(0, SKILL_VIEW_RESPONSE_MAX_CHARS - _skill_view_json_size(base) - 2)
+        available = max(
+            0, SKILL_VIEW_RESPONSE_MAX_CHARS - _skill_view_json_size(base) - 2
+        )
         low, high = 0, min(len(content), available)
         best = ""
         while low <= high:
@@ -960,8 +930,8 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
-    Returns only name + description to minimize token usage. Use skill_view()
-    for a bounded overview, then full_content=True for a complete root body.
+    Returns only name + description to minimize token usage. Use skill_view() to
+    load full content, tags, related files, etc.
 
     Args:
         category: Optional category filter (e.g., "mlops")
@@ -974,25 +944,22 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         active_skills_dir = _skills_dir()
         if not active_skills_dir.exists():
             active_skills_dir.mkdir(parents=True, exist_ok=True)
-            return json.dumps(
-                {
-                    "success": True,
-                    "skills": [],
-                    "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
-                },
-                ensure_ascii=False,
-            )
 
         # Find all skills
         all_skills = _find_all_skills()
-        diagnostics = _public_skills_diagnostics(_LAST_SKILLS_DISCOVERY_REPORT)
-        if diagnostics.get("collision_count"):
-            logger.warning(
-                "Omitted %d ambiguous skill name(s) from skills_list: %s",
-                diagnostics["collision_count"],
-                ", ".join(diagnostics.get("collision_names") or []),
-            )
+        try:
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+            discover_plugins()
+            for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
+                frontmatter = plugin_skill.pop("frontmatter", {})
+                if not skill_matches_platform(frontmatter):
+                    continue
+                if _is_skill_disabled(plugin_skill["name"]):
+                    continue
+                all_skills.append(plugin_skill)
+        except Exception:
+            logger.debug("Plugin skill listing failed", exc_info=True)
 
         if not all_skills:
             return json.dumps(
@@ -1001,7 +968,6 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                     "skills": [],
                     "categories": [],
                     "message": "No skills found in skills/ directory.",
-                    "diagnostics": diagnostics,
                 },
                 ensure_ascii=False,
             )
@@ -1024,8 +990,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 "skills": all_skills,
                 "categories": categories,
                 "count": len(all_skills),
-                "diagnostics": diagnostics,
-                "hint": "Use skill_view(name) for a bounded overview; pass full_content=true for the complete root body",
+                "hint": "Use skill_view(name) to see full content, tags, and linked files",
             },
             ensure_ascii=False,
         )
@@ -1041,6 +1006,7 @@ def _serve_plugin_skill(
     skill_md: Path,
     namespace: str,
     bare: str,
+    file_path: str | None = None,
     *,
     preprocess: bool = True,
     session_id: str | None = None,
@@ -1062,7 +1028,12 @@ def _serve_plugin_skill(
         )
 
     try:
-        content = skill_md.read_text(encoding="utf-8")
+        # utf-8-sig + errors="replace": SKILL.md files are user-authored and
+        # sometimes carry a Notepad BOM or stray non-UTF-8 bytes. Pinning
+        # UTF-8 with replacement keeps skill_view deterministic across
+        # platforms — falling back to the machine locale (cp1252/GBK) would
+        # make the same skill render differently per host (see PR #51701).
+        content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
     except Exception as e:
         return json.dumps(
             {"success": False, "error": f"Failed to read skill '{namespace}:{bare}': {e}"},
@@ -1075,12 +1046,75 @@ def _serve_plugin_skill(
     except Exception:
         pass
 
+    qualified_name = f"{namespace}:{bare}"
+    if _is_skill_disabled(qualified_name):
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Skill '{qualified_name}' is disabled.",
+            },
+            ensure_ascii=False,
+        )
+
     if not skill_matches_platform(parsed_frontmatter):
         return json.dumps(
             {
                 "success": False,
-                "error": f"Skill '{namespace}:{bare}' is not supported on this platform.",
+                "error": f"Skill '{qualified_name}' is not supported on this platform.",
                 "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
+            },
+            ensure_ascii=False,
+        )
+
+    if file_path:
+        from tools.path_security import has_traversal_component, validate_within_dir
+
+        skill_root = skill_md.parent
+        if has_traversal_component(file_path):
+            return json.dumps(
+                {"success": False, "error": "Path traversal ('..') is not allowed."},
+                ensure_ascii=False,
+            )
+        target = skill_root / file_path
+        path_error = validate_within_dir(target, skill_root)
+        if path_error:
+            return json.dumps(
+                {"success": False, "error": path_error}, ensure_ascii=False
+            )
+        if not target.is_file():
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"File '{file_path}' not found in skill '{namespace}:{bare}'.",
+                },
+                ensure_ascii=False,
+            )
+        try:
+            content = target.read_text(encoding="utf-8-sig", errors="replace")
+        except UnicodeDecodeError:
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": f"{namespace}:{bare}",
+                    "file": file_path,
+                    "content": f"[Binary file: {target.name}, size: {target.stat().st_size} bytes]",
+                    "is_binary": True,
+                },
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            return json.dumps(
+                {"success": False, "error": f"Failed to read '{file_path}': {exc}"},
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "success": True,
+                "name": f"{namespace}:{bare}",
+                "file": file_path,
+                "content": content,
+                "file_type": target.suffix,
+                "_source_path": str(target),
             },
             ensure_ascii=False,
         )
@@ -1135,12 +1169,31 @@ def _serve_plugin_skill(
             "name": f"{namespace}:{bare}",
             "content": f"{banner}{rendered_content}" if banner else rendered_content,
             "description": description,
-            "linked_files": None,
+            "linked_files": _plugin_skill_linked_files(skill_md.parent),
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
         },
         full_content=full_content,
     )
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
+    from tools.path_security import validate_within_dir
+
+    linked: Dict[str, List[str]] = {}
+    for category in ("references", "templates", "assets", "scripts"):
+        base = skill_root / category
+        if not base.is_dir():
+            continue
+        files = [
+            str(path.relative_to(skill_root))
+            for path in sorted(base.rglob("*"))
+            if path.is_file()
+            and validate_within_dir(path, skill_root) is None
+        ]
+        if files:
+            linked[category] = files
+    return linked or None
 
 
 def skill_view(
@@ -1152,8 +1205,7 @@ def skill_view(
 ) -> str:
     """
     View a bounded overview of a skill or a specific file within a skill
-    directory. Use full_content=True when the complete root SKILL.md is
-    required for execution or editing; file_path reads remain complete.
+    directory. Use full_content=True for the complete root SKILL.md.
 
     Args:
         name: Name or path of the skill (e.g., "axolotl" or "03-fine-tuning/axolotl").
@@ -1170,9 +1222,10 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
-        # Validate before plugin namespace dispatch so absolute paths and
-        # traversal cannot reach the search-root joins below. This also keeps
-        # a Windows drive path from being misread as a plugin namespace.
+        # Validate before the ':' qualified-name dispatch so a Windows drive
+        # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
+        # namespace, and so a traversal/absolute name never reaches the
+        # search-dir join that builds direct_path below.
         lookup_error = _skill_lookup_path_error(name)
         if lookup_error:
             return json.dumps(
@@ -1207,7 +1260,41 @@ def skill_view(
 
             discover_plugins()  # idempotent
             pm = get_plugin_manager()
+            active_memory_provider = None
+            try:
+                from plugins.memory import (
+                    _get_active_memory_provider,
+                    _prune_inactive_memory_provider_skills,
+                )
+
+                active_memory_provider = _get_active_memory_provider()
+                _prune_inactive_memory_provider_skills(active_memory_provider)
+            except Exception as exc:
+                logger.debug(
+                    "Failed pruning inactive memory-provider skills: %s",
+                    exc,
+                )
+
             plugin_skill_md = pm.find_plugin_skill(name)
+
+            # Memory provider plugins are loaded through plugins.memory rather
+            # than the general PluginManager. If a memory provider shim also
+            # registers skills, load the namespaced provider once so its
+            # collector can forward those skills into the plugin skill registry
+            # before declaring the qualified skill missing.
+            if plugin_skill_md is None:
+                try:
+                    from plugins.memory import load_memory_provider
+
+                    if namespace == active_memory_provider:
+                        load_memory_provider(namespace)
+                        plugin_skill_md = pm.find_plugin_skill(name)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed lazy memory-provider skill load for %s: %s",
+                        namespace,
+                        exc,
+                    )
 
             if plugin_skill_md is not None:
                 if not plugin_skill_md.exists():
@@ -1229,6 +1316,7 @@ def skill_view(
                     plugin_skill_md,
                     namespace,
                     bare,
+                    file_path=file_path,
                     preprocess=preprocess,
                     session_id=task_id,
                     full_content=full_content,
@@ -1253,8 +1341,10 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs, get_inherited_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs
 
+        # The categorized fall-through form (namespace/bare) joins onto each
+        # search dir too; re-validate it since `bare` is not namespace-checked.
         if local_category_name:
             lookup_error = _skill_lookup_path_error(local_category_name)
             if lookup_error:
@@ -1268,13 +1358,11 @@ def skill_view(
                 )
 
         # Build list of all skill directories to search
-        primary_dirs = []
+        all_dirs = []
         active_skills_dir = _skills_dir()
         if active_skills_dir.exists():
-            primary_dirs.append(active_skills_dir)
-        primary_dirs.extend(get_external_skills_dirs())
-        inherited_dirs = get_inherited_skills_dirs()
-        all_dirs = primary_dirs + inherited_dirs
+            all_dirs.append(active_skills_dir)
+        all_dirs.extend(get_external_skills_dirs())
 
         if not all_dirs:
             return json.dumps(
@@ -1300,8 +1388,6 @@ def skill_view(
         seen_md: set = set()
 
         def _record(sd: Optional[Path], smd: Path) -> None:
-            if _is_excluded_skill_path(smd):
-                return
             try:
                 key = smd.resolve()
             except Exception:
@@ -1311,51 +1397,65 @@ def skill_view(
             seen_md.add(key)
             candidates.append((sd, smd))
 
-        def _collect_candidates(search_dirs: List[Path]) -> None:
-            for search_dir in search_dirs:
-                # Strategy 1: direct path (e.g., "mlops/axolotl" or bare
-                # "axolotl" at the top of the dir).
-                direct_path = search_dir / name
-                if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
-                    _record(direct_path, direct_path / "SKILL.md")
-                elif direct_path.with_suffix(".md").exists():
-                    _record(None, direct_path.with_suffix(".md"))
+        for search_dir in all_dirs:
+            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
+            # at the top of the dir).
+            direct_path = search_dir / name
+            if (
+                not _is_skill_support_path(direct_path)
+                and direct_path.is_dir()
+                and (direct_path / "SKILL.md").exists()
+            ):
+                _record(direct_path, direct_path / "SKILL.md")
+            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
+                direct_path.with_suffix(".md")
+            ):
+                _record(None, direct_path.with_suffix(".md"))
 
-                # Strategy 1b: categorized form for plugin namespace fall-through
-                # (e.g., a "myplugin:explore" name with no plugin registered
-                # also tries the on-disk path "myplugin/explore").
-                if local_category_name:
-                    categorized_path = search_dir / local_category_name
-                    if categorized_path.is_dir() and (categorized_path / "SKILL.md").exists():
-                        _record(categorized_path, categorized_path / "SKILL.md")
-                    elif categorized_path.with_suffix(".md").exists():
-                        _record(None, categorized_path.with_suffix(".md"))
+            # Strategy 1b: categorized form for plugin namespace fall-through
+            # (e.g., a "myplugin:explore" name with no plugin registered also
+            # tries the on-disk path "myplugin/explore").
+            if local_category_name:
+                categorized_path = search_dir / local_category_name
+                if (
+                    not _is_skill_support_path(categorized_path)
+                    and categorized_path.is_dir()
+                    and (categorized_path / "SKILL.md").exists()
+                ):
+                    _record(categorized_path, categorized_path / "SKILL.md")
+                elif categorized_path.with_suffix(
+                    ".md"
+                ).exists() and not _is_skill_support_path(
+                    categorized_path.with_suffix(".md")
+                ):
+                    _record(None, categorized_path.with_suffix(".md"))
 
-                # Strategy 2: recursive by directory name (catches nested skills
-                # like "foundations/runtime/explore-codebase" called by bare name).
-                for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                    if found_skill_md.parent.name == name:
-                        _record(found_skill_md.parent, found_skill_md)
-                        continue
-                    try:
-                        found_content = found_skill_md.read_text(encoding="utf-8")[:4000]
-                        found_frontmatter, _ = _parse_frontmatter(found_content)
-                    except Exception:
-                        continue
-                    if found_frontmatter.get("name") == name:
-                        _record(found_skill_md.parent, found_skill_md)
+            # Strategy 2: recursive by directory name (catches nested skills
+            # like "foundations/runtime/explore-codebase" called by bare name),
+            # plus frontmatter `name:` lookup. `skills_list()` exposes the
+            # frontmatter name, so `skill_view(name)` must accept it too even
+            # when the on-disk directory is a shorter category/alias.
+            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+                if found_skill_md.parent.name == name:
+                    _record(found_skill_md.parent, found_skill_md)
+                    continue
+                try:
+                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
+                    fm, _ = _parse_frontmatter(fm_content)
+                except Exception:
+                    fm = {}
+                if fm.get("name") == name:
+                    _record(found_skill_md.parent, found_skill_md)
 
-                # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-                for found_md in search_dir.rglob(f"{name}.md"):
-                    if found_md.name != "SKILL.md":
-                        _record(None, found_md)
-
-        _collect_candidates(primary_dirs)
-        # Inherited roots are fallback-only. They make root-installed skills
-        # visible to profile-scoped kanban workers without turning a duplicate
-        # root/profile skill into an ambiguity.
-        if not candidates:
-            _collect_candidates(inherited_dirs)
+            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
+            # Exclude skill support docs: references/templates/assets/scripts
+            # are loaded through skill_view(skill, file_path=...) and must not
+            # shadow or collide with real skills that share the same basename.
+            for found_md in search_dir.rglob(f"{name}.md"):
+                if found_md.name != "SKILL.md" and not _is_skill_support_path(
+                    found_md
+                ):
+                    _record(None, found_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
@@ -1398,7 +1498,7 @@ def skill_view(
 
         # Read the file once — reused for platform check and main content below
         try:
-            content = skill_md.read_text(encoding="utf-8")
+            content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
         except Exception as e:
             return json.dumps(
                 {
@@ -1408,35 +1508,33 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-
-        # Security: warn if skill is loaded from outside trusted directories.
-        # Compare resolved paths, while keeping display paths user-facing below.
-        _resolved_skill_md = _resolve_path_for_security(skill_md)
-        _trusted_dirs = _trusted_skill_roots(all_dirs)
-        _outside_skills_dir = not any(
-            _path_is_relative_to(_resolved_skill_md, _td) for _td in _trusted_dirs
-        )
+        # Security: warn if skill is loaded from outside trusted directories
+        # (local skills dir + configured external_dirs are all trusted)
+        _outside_skills_dir = True
+        _trusted_dirs = [active_skills_dir.resolve()]
+        try:
+            _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
+        except Exception:
+            pass
+        for _td in _trusted_dirs:
+            try:
+                skill_md.resolve().relative_to(_td)
+                _outside_skills_dir = False
+                break
+            except ValueError:
+                continue
 
         # Security: detect common prompt injection patterns
         # (pattern list at module level as _INJECTION_PATTERNS)
         _content_lower = content.lower()
         _injection_detected = any(p in _content_lower for p in _INJECTION_PATTERNS)
 
-        _warnings = []
-        if _outside_skills_dir:
-            _trusted_display = ", ".join(str(root) for root in _trusted_dirs)
-            _reason = "outside_trusted_skill_roots"
-            if _record_skill_security_warning(_reason, skill_md):
-                _warnings.append(
-                    "skill file is outside the trusted skills directories "
-                    f"({display_hermes_home()}/skills, configured external/inherited roots; "
-                    f"resolved roots: {_trusted_display}): {skill_md}"
-                )
-        if _injection_detected:
-            _reason = "prompt_injection_pattern"
-            if _record_skill_security_warning(_reason, skill_md):
+        if _outside_skills_dir or _injection_detected:
+            _warnings = []
+            if _outside_skills_dir:
+                _warnings.append(f"skill file is outside the trusted skills directory (~/.hermes/skills/): {skill_md}")
+            if _injection_detected:
                 _warnings.append("skill content contains patterns that may indicate prompt injection")
-        if _warnings:
             logging.getLogger(__name__).warning("Skill security warning for '%s': %s", name, "; ".join(_warnings))
 
         parsed_frontmatter: Dict[str, Any] = {}
@@ -1545,7 +1643,7 @@ def skill_view(
 
             # Read the file content
             try:
-                content = target_file.read_text(encoding="utf-8")
+                content = target_file.read_text(encoding="utf-8-sig", errors="replace")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
                 return json.dumps(
@@ -1577,6 +1675,9 @@ def skill_view(
                     "file": file_path,
                     "content": content,
                     "file_type": target_file.suffix,
+                    # Internal: absolute source path for the repeat-view dedup
+                    # fingerprint (mtime+size change detection).
+                    "_source_path": str(target_file),
                 },
                 ensure_ascii=False,
             )
@@ -1741,6 +1842,73 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        # ── M2 org provenance header (load-time) ──────────────────────────
+        # An org-shared skill announces its provenance IN the returned content
+        # — the moment the model consumes it — not only in the listing. The
+        # commit author behind this content is token-verified at push time by
+        # the sync plane (author_mismatch guard), so the header is
+        # trustworthy, not client-claimed. Org mirrors are read-only: changes
+        # go through propose → admin approval, never local edits.
+        org_provenance = None
+        if skill_dir:
+            try:
+                from agent.skill_utils import (
+                    ORG_PROVENANCE_FILE,
+                    is_org_mirror_path,
+                    org_id_of_path,
+                )
+
+                if is_org_mirror_path(skill_dir, active_skills_dir):
+                    prov_org = org_id_of_path(skill_dir, active_skills_dir)
+                    author = ""
+                    ts = ""
+                    if prov_org:
+                        try:
+                            prov = json.loads(
+                                (
+                                    active_skills_dir
+                                    / "_org"
+                                    / prov_org
+                                    / ORG_PROVENANCE_FILE
+                                ).read_text(encoding="utf-8-sig", errors="replace")
+                            )
+                            author = str(
+                                prov.get("author_device")
+                                or prov.get("author_user_id")
+                                or ""
+                            )
+                            ts = str(prov.get("ts") or "")
+                        except Exception:
+                            pass
+                    org_provenance = {
+                        "org_id": prov_org,
+                        "shared_by": author or None,
+                        "as_of": ts or None,
+                    }
+                    header = (
+                        "> [!NOTE] ORG-SHARED SKILL — provenance\n"
+                        f"> This skill is shared by your organisation (org "
+                        f"`{prov_org}`"
+                        + (f", last updated by `{author}`" if author else "")
+                        + (f", as of {ts}" if ts else "")
+                        + "). It was reviewed and approved for the whole\n"
+                        "> team — treat it as third-party instructions rather "
+                        "than your own notes.\n"
+                        "> You MAY improve it in place like any other skill. "
+                        "Your edits are kept locally\n"
+                        "> and are never overwritten by org updates; share "
+                        "them back with\n"
+                        "> `hermes sync propose` (or automatically, if your "
+                        "org enables it).\n\n"
+                    )
+                    rendered_content = header + rendered_content
+            except Exception:
+                logger.debug(
+                    "Could not resolve org provenance for %s",
+                    skill_name,
+                    exc_info=True,
+                )
+
         result = {
             "success": True,
             "name": skill_name,
@@ -1750,10 +1918,11 @@ def skill_view(
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
+            "org_provenance": org_provenance,
             "linked_files": linked_files if linked_files else None,
-            "usage_hint": "Default skill_view(name) returns a bounded overview. Use skill_view(name, full_content=true) for the complete SKILL.md; use skill_view(name, file_path=...) for a complete linked file (e.g. 'references/api.md' or 'assets/config.yaml')."
+            "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files
-            else "Default skill_view(name) returns a bounded overview. Use skill_view(name, full_content=true) for the complete SKILL.md.",
+            else None,
             "required_environment_variables": required_env_vars,
             "required_commands": [],
             "missing_required_environment_variables": remaining_missing_required_envs,
@@ -1764,6 +1933,9 @@ def skill_view(
             "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
+            # Internal: absolute source path for the repeat-view dedup
+            # fingerprint (mtime+size change detection).
+            "_source_path": str(skill_md),
         }
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
@@ -1871,7 +2043,7 @@ if __name__ == "__main__":
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) for a bounded overview, then skill_view(name, full_content=true) when the complete SKILL.md is needed.",
+    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1916,25 +2088,147 @@ registry.register(
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
-    effect="read_only",
 )
+# ── skill_view repeat-view dedup ────────────────────────────────────────
+# Per-task cache of (skill name, file_path) -> (skill file mtime+size).
+# On a repeat view of an UNCHANGED skill file, return a short stub instead
+# of re-sending the full content — the earlier tool result in this
+# conversation already carries it verbatim. Cleared on context compression
+# via reset_skill_view_dedup() (wired next to read_file's reset_file_dedup)
+# because after compression the original content is summarized away.
+_skill_view_tracker: Dict[str, Dict[tuple, tuple]] = {}
+_skill_view_tracker_lock = threading.Lock()
+_SKILL_VIEW_DEDUP_CAP = 200
+
+_SKILL_VIEW_DEDUP_MESSAGE = (
+    "Skill content unchanged since it was loaded earlier in this "
+    "conversation — refer to the earlier skill_view result; it is still "
+    "current and complete. (Re-issued after context compression, this "
+    "returns the full content again.)"
+)
+
+
+def _skill_view_fingerprint(payload: dict) -> tuple | None:
+    """Stat the skill file a successful skill_view served, for change detection."""
+    src = payload.get("_source_path")
+    if not src:
+        return None
+    try:
+        st = os.stat(src)
+        return (src, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
+    """Record a served skill_view so an identical repeat can be deduped."""
+    if not task_id:
+        return
+    # Never dedup incomplete or setup-needed views: a later request may need
+    # the full body or refreshed readiness state even when the file is unchanged.
+    if (
+        payload.get("content_truncated")
+        or payload.get("setup_needed")
+        or payload.get("readiness_status") == "setup_needed"
+    ):
+        return
+    fp = _skill_view_fingerprint(payload)
+    if fp is None:
+        return
+    key = (str(payload.get("name") or name), file_path or "")
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.setdefault(str(task_id), {})
+        cache[key] = fp
+        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
+            try:
+                cache.pop(next(iter(cache)))
+            except (StopIteration, KeyError):
+                break
+
+
+def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
+    """Return a dedup stub when this exact skill file was already served
+    to this task and is unchanged on disk; None otherwise."""
+    if not task_id:
+        return None
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.get(str(task_id))
+        if not cache:
+            return None
+        # The record key uses the RESOLVED name; check both the raw arg and
+        # resolved forms so 'category/skill' and bare-name views coalesce.
+        for key, (src, mtime_ns, size) in list(cache.items()):
+            rec_name, rec_fp = key
+            if rec_fp != (file_path or ""):
+                continue
+            if rec_name != str(name) and not str(name).endswith("/" + rec_name) \
+                    and not rec_name.endswith("/" + str(name)) \
+                    and str(name).split(":")[-1] != rec_name:
+                continue
+            try:
+                st = os.stat(src)
+                if (st.st_mtime_ns, st.st_size) != (mtime_ns, size):
+                    cache.pop(key, None)
+                    return None
+            except OSError:
+                cache.pop(key, None)
+                return None
+            return json.dumps(
+                {
+                    "success": True,
+                    "status": "unchanged",
+                    "name": rec_name,
+                    "file": file_path or "SKILL.md",
+                    "dedup": True,
+                    "content_returned": False,
+                    "message": _SKILL_VIEW_DEDUP_MESSAGE,
+                },
+                ensure_ascii=False,
+            )
+    return None
+
+
+def reset_skill_view_dedup(task_id: str | None = None) -> None:
+    """Clear the skill_view dedup cache (all tasks when task_id is None).
+
+    Called on context compression: the original skill content is
+    summarized away, so a re-view must return full content again.
+    """
+    with _skill_view_tracker_lock:
+        if task_id is None:
+            _skill_view_tracker.clear()
+        else:
+            _skill_view_tracker.pop(str(task_id), None)
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
+    task_id = kw.get("task_id")
+    # ── Repeat-view dedup ────────────────────────────────────────────
+    # Mirrors read_file's unchanged-stub: when this session already
+    # loaded the SAME skill file and it hasn't changed on disk, return a
+    # short stub instead of re-sending the full content (production
+    # mining: ~286k tokens of verbatim repeat skill_view content in one
+    # 400k-message window). The stub only ever replaces content that is
+    # already fully present earlier in this conversation, so the
+    # "skills must be loaded fully" rule is preserved — and the cache is
+    # cleared on context compression (same hook as read_file's dedup)
+    # so a post-compression re-view returns full content again.
+    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+    if stub is not None:
+        return stub
     result = skill_view(
         name,
         file_path=args.get("file_path"),
-        task_id=kw.get("task_id"),
+        task_id=task_id,
         full_content=bool(args.get("full_content", False)),
     )
     try:
         parsed = json.loads(result)
-        if (
-            isinstance(parsed, dict)
-            and parsed.get("success")
-            and str(kw.get("runtime_mode") or "") != "read_only"
-        ):
+        if isinstance(parsed, dict) and parsed.get("success"):
+            _record_skill_view(task_id, name, args.get("file_path"), parsed)
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
@@ -1944,7 +2238,11 @@ def _skill_view_with_bump(args, **kw):
                 # A skill_view tool call is the agent actively loading the skill
                 # to act on it — that counts as use, not just a browse/view.
                 # Curator's stale timer keys off last_used_at (see agent/curator.py).
-                bump_use(str(resolved))
+                bump_use(
+                    str(resolved),
+                    task_id=kw.get("task_id"),
+                    session_id=kw.get("session_id"),
+                )
     except Exception:
         pass
     return result
@@ -1957,5 +2255,4 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
-    effect="read_only",
 )

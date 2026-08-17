@@ -63,10 +63,6 @@ export function isProgressReportingAvailable(): boolean {
   return false
 }
 
-/**
- * Checks if the terminal supports DEC mode 2026 (synchronized output).
- * When supported, BSU/ESU sequences prevent visible flicker during redraws.
- */
 export function isCmuxSession(env: NodeJS.ProcessEnv = process.env): boolean {
   return Boolean(
     env.CMUX_WORKSPACE_ID ||
@@ -78,18 +74,28 @@ export function isCmuxSession(env: NodeJS.ProcessEnv = process.env): boolean {
   )
 }
 
-export function isSynchronizedOutputUnsafeSession(env: NodeJS.ProcessEnv = process.env): boolean {
-  // tmux/screen/cmux/SSH are intermediate transport layers between Hermes and
-  // the physical terminal. A positive DEC 2026 reply from the outer emulator
-  // only proves that the ENDPOINT knows synchronized updates; it does not prove
-  // that the layer in the middle preserves BSU/ESU atomicity around DECSTBM
-  // scroll-region shifts. When that assumption is wrong, the ScrollBox fast
-  // path can leave the bottom of the transcript blank after final-answer
-  // tail-follow. Prefer the slower full-row rewrite path in these sessions.
-  return Boolean(isTmuxSession(env) || env.STY || isCmuxSession(env) || env.SSH_CONNECTION || env.SSH_TTY)
+export function isTmuxSession(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.TMUX || env.TERM_PROGRAM === 'tmux')
 }
 
+export function isSynchronizedOutputUnsafeSession(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(
+    isTmuxSession(env) ||
+      env.STY ||
+      env.ZELLIJ !== undefined ||
+      isCmuxSession(env) ||
+      env.SSH_CONNECTION ||
+      env.SSH_TTY
+  )
+}
+
+/**
+ * Checks if the terminal supports DEC mode 2026 (synchronized output).
+ * When supported, BSU/ESU sequences prevent visible flicker during redraws.
+ */
 export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.env): boolean {
+  // Multiplexers and remote transports can advertise the outer terminal's
+  // support while chunking the stream before it arrives there.
   if (isSynchronizedOutputUnsafeSession(env)) {
     return false
   }
@@ -111,7 +117,7 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
   }
 
   // kitty sets TERM=xterm-kitty or KITTY_WINDOW_ID
-  if (term?.includes('kitty') || process.env.KITTY_WINDOW_ID) {
+  if (term?.includes('kitty') || env.KITTY_WINDOW_ID) {
     return true
   }
 
@@ -131,17 +137,17 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
   }
 
   // Zed uses the alacritty_terminal crate which supports DEC 2026
-  if (process.env.ZED_TERM) {
+  if (env.ZED_TERM) {
     return true
   }
 
   // Windows Terminal
-  if (process.env.WT_SESSION) {
+  if (env.WT_SESSION) {
     return true
   }
 
   // VTE-based terminals (GNOME Terminal, Tilix, etc.) since VTE 0.68
-  const vteVersion = process.env.VTE_VERSION
+  const vteVersion = env.VTE_VERSION
 
   if (vteVersion) {
     const version = parseInt(vteVersion, 10)
@@ -152,10 +158,6 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
   }
 
   return false
-}
-
-export function isTmuxSession(env: NodeJS.ProcessEnv = process.env): boolean {
-  return Boolean(env.TMUX || env.TERM_PROGRAM === 'tmux')
 }
 
 // -- XTVERSION-detected terminal name (populated async at startup) --
@@ -195,6 +197,134 @@ export function needsAltScreenResizeScrollbackClear(env: NodeJS.ProcessEnv = pro
   return (env.TERM_PROGRAM ?? '').trim() === 'Apple_Terminal'
 }
 
+// -- OSC-detected terminal colors (populated async at startup) --
+//
+// Env heuristics (COLORFGBG, TERM_PROGRAM allow-lists) can't see the actual
+// terminal colors — xterm.js hosts (VS Code / Cursor) set neither, so a
+// light-themed editor terminal reads as "dark" and gets an unreadable
+// palette. OSC 11 (background) and OSC 10 (foreground) ask the terminal
+// directly; App.tsx fires both in the same startup batch as XTVERSION.
+// The foreground matters because transparent profiles LIE about the
+// background (xterm reports the unset default, pure black) while reporting
+// the theme's real foreground — its luminance is the only trustworthy
+// polarity signal on such hosts. Readers treat undefined as "not yet
+// known / unsupported".
+
+interface ReportedColorSlot {
+  set(hex: string): void
+  get(): string | undefined
+  on(listener: (hex: string) => void): void
+}
+
+function reportedColorSlot(): ReportedColorSlot {
+  let value: string | undefined
+  const listeners = new Set<(hex: string) => void>()
+
+  return {
+    // First writer wins (defend against re-probe).
+    set(hex) {
+      if (value !== undefined) {
+        return
+      }
+
+      value = hex
+
+      for (const listener of listeners) {
+        listener(hex)
+      }
+
+      listeners.clear()
+    },
+    get: () => value,
+    // Fires immediately when already known, otherwise once on the reply.
+    on(listener) {
+      if (value !== undefined) {
+        listener(value)
+
+        return
+      }
+
+      listeners.add(listener)
+    }
+  }
+}
+
+const background = reportedColorSlot()
+const foreground = reportedColorSlot()
+
+/** Record the OSC 11 response. */
+export const setTerminalBackgroundHex = (hex: string): void => background.set(hex)
+
+/** The terminal's reported background as `#rrggbb`, or undefined if the
+ *  reply hasn't arrived (or the terminal ignored the query). */
+export const terminalBackgroundHex = (): string | undefined => background.get()
+
+/** Subscribe to the background color. */
+export const onTerminalBackground = (listener: (hex: string) => void): void => background.on(listener)
+
+/** Record the OSC 10 response. */
+export const setTerminalForegroundHex = (hex: string): void => foreground.set(hex)
+
+/** The terminal's reported foreground as `#rrggbb`, or undefined if the
+ *  reply hasn't arrived (or the terminal ignored the query). */
+export const terminalForegroundHex = (): string | undefined => foreground.get()
+
+/** Subscribe to the foreground color. */
+export const onTerminalForeground = (listener: (hex: string) => void): void => foreground.on(listener)
+
+/**
+ * Parse an OSC color reply payload into `#rrggbb`.
+ *
+ * Terminals answer OSC 10/11 queries with X11 color specs: most commonly
+ * `rgb:RRRR/GGGG/BBBB` (1-4 hex digits per channel, scaled to the channel
+ * max), sometimes `rgba:...` (alpha ignored) or a plain `#hex` form.
+ * Returns undefined for anything unrecognized.
+ */
+export function parseOscColor(data: string): string | undefined {
+  const value = data.trim().toLowerCase()
+
+  const scaled = (component: string): null | number => {
+    if (!/^[0-9a-f]{1,4}$/.test(component)) {
+      return null
+    }
+
+    const max = 16 ** component.length - 1
+
+    return Math.round((parseInt(component, 16) / max) * 255)
+  }
+
+  const rgbMatch = /^rgba?:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})(?:\/[0-9a-f]{1,4})?$/.exec(value)
+
+  if (rgbMatch) {
+    const channels = [rgbMatch[1]!, rgbMatch[2]!, rgbMatch[3]!].map(scaled)
+
+    if (channels.every(c => c !== null)) {
+      return '#' + channels.map(c => c!.toString(16).padStart(2, '0')).join('')
+    }
+
+    return undefined
+  }
+
+  const hexMatch = /^#?([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{12})$/.exec(value)
+
+  if (!hexMatch) {
+    return undefined
+  }
+
+  const hex = hexMatch[1]!
+
+  if (hex.length === 6) {
+    return `#${hex}`
+  }
+
+  if (hex.length === 3) {
+    return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`
+  }
+
+  // 12-digit form: 4 digits per channel, take the top byte of each.
+  return `#${hex.slice(0, 2)}${hex.slice(4, 6)}${hex.slice(8, 10)}`
+}
+
 // Terminals known to correctly implement the Kitty keyboard protocol
 // (CSI >1u) and/or xterm modifyOtherKeys (CSI >4;2m) for ctrl+shift+<letter>
 // disambiguation. We previously enabled unconditionally (#23350), assuming
@@ -221,26 +351,10 @@ export function hasCursorUpViewportYankBug(): boolean {
   return process.platform === 'win32' || !!process.env.WT_SESSION
 }
 
-// Initial env-based capability. Remote SSH sessions can strip terminal
-// identity (TERM_PROGRAM/CMUX_*) down to TERM=xterm-256color, so the live
-// render path reads the mutable runtime value below after terminal probing.
+// Computed once at module load — terminal capabilities don't change mid-session.
+// Exported so callers can pass a sync-skip hint gated to specific modes.
+export const isRuntimeSynchronizedOutputSupported = isSynchronizedOutputSupported
 export const SYNC_OUTPUT_SUPPORTED = isSynchronizedOutputSupported()
-
-let runtimeSyncOutputSupported = SYNC_OUTPUT_SUPPORTED
-
-export function isRuntimeSynchronizedOutputSupported(): boolean {
-  return runtimeSyncOutputSupported
-}
-
-export function enableSynchronizedOutputFromTerminalQuery(env: NodeJS.ProcessEnv = process.env): void {
-  if (!isSynchronizedOutputUnsafeSession(env)) {
-    runtimeSyncOutputSupported = true
-  }
-}
-
-export function resetSynchronizedOutputSupportForTest(supported = SYNC_OUTPUT_SUPPORTED): void {
-  runtimeSyncOutputSupported = supported
-}
 
 export type Terminal = {
   stdout: Writable

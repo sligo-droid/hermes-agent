@@ -2,7 +2,6 @@ import { TERMUX_TUI_MODE } from '../config/env.js'
 import type { Msg } from '../types.js'
 
 import { transcriptBodyWidth } from './inputMetrics.js'
-import { boundedHistoryRenderText } from './text.js'
 
 const hashText = (text: string) => {
   let h = 5381
@@ -74,8 +73,8 @@ export const estimatedMsgHeight = (
     compact,
     details,
     leadGap = false,
-    limitHistory = false,
     thinkingVisible = details,
+    thinkingExpanded = thinkingVisible,
     toolsVisible = details,
     userPrompt = '',
     withSeparator = false
@@ -83,7 +82,7 @@ export const estimatedMsgHeight = (
     compact: boolean
     details: boolean
     leadGap?: boolean
-    limitHistory?: boolean
+    thinkingExpanded?: boolean
     thinkingVisible?: boolean
     toolsVisible?: boolean
     userPrompt?: string
@@ -107,7 +106,7 @@ export const estimatedMsgHeight = (
   }
 
   const bodyWidth = transcriptBodyWidth(cols, msg.role, userPrompt, TERMUX_TUI_MODE)
-  const text = msg.role === 'assistant' && limitHistory ? boundedHistoryRenderText(msg.text) : msg.text
+  const text = msg.text
   let h = wrappedLines(text || ' ', bodyWidth)
 
   if (!compact && msg.role === 'assistant') {
@@ -127,7 +126,7 @@ export const estimatedMsgHeight = (
     if (hasVisibleDetails) {
       h +=
         (hasVisibleTools ? (msg.tools?.length ?? 0) : 0) +
-        (hasVisibleThinking ? wrappedLines(msg.thinking ?? '', bodyWidth) : 0)
+        (hasVisibleThinking ? (thinkingExpanded ? wrappedLines(msg.thinking ?? '', bodyWidth) : 1) : 0)
 
       if (msg.role === 'assistant' && /\S/.test(msg.text)) {
         h += 2
@@ -136,14 +135,18 @@ export const estimatedMsgHeight = (
   }
 
   if (msg.role === 'user' || msg.kind === 'diff') {
+    // Top + bottom blank line.
     h += 2
   } else if (msg.kind === 'slash') {
     h++
   }
 
-  // Group-boundary blank line owned by BlockSlot. The caller resolves the
-  // boundary against the previous row and passes it here so the estimate
-  // matches the rendered margin before Yoga remeasures.
+  // Group-boundary blank line owned by BlockSlot: model prose, reasoning/tool
+  // trails, and notes/errors each start a new visual group when the block
+  // above them is a different kind. The caller resolves the boundary against
+  // the previous row (see domain/blockLayout.ts::hasLeadGap) and passes the
+  // result here so the estimate matches the rendered marginTop before Yoga
+  // remeasures. user / diff / slash never set this — they own their margins.
   if (leadGap) {
     h++
   }

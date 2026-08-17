@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import pathlib
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -334,6 +335,24 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     ok, output = _run_job_script("/etc/passwd")
     assert ok is False
     assert "Blocked" in output or "outside" in output
+
+
+def test_run_job_script_nul_rejected_before_path_resolution(hermes_env):
+    from cron.scheduler import _run_job_script
+
+    ok, output = _run_job_script("nul\x00byte.sh")
+    assert ok is False
+    assert "NUL byte" in output
+
+
+def test_run_job_script_accepts_pathlike_script_path(hermes_env):
+    from cron.scheduler import _run_job_script
+
+    script = hermes_env / "scripts" / "probe.py"
+    script.write_text('print("pathlike ok")\n', encoding="utf-8")
+    ok, output = _run_job_script(pathlib.Path(script))
+    assert ok is True
+    assert "pathlike ok" in output
 
 
 # ---------------------------------------------------------------------------

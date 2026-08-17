@@ -190,6 +190,25 @@ def reset_backend_for_tests() -> None:  # pragma: no cover
         _always_allow.clear()
 
 
+def release_computer_use_session(session_id: str) -> bool:
+    """Release the singleton backend and approval state for a finished session."""
+    global _backend
+    sid = str(session_id or "")
+    with _approval_lock:
+        _session_auto_approve.pop(sid, None)
+        _always_allow.pop(sid, None)
+    with _backend_lock:
+        backend = _backend
+        _backend = None
+    if backend is None:
+        return False
+    try:
+        backend.stop()
+    except Exception:
+        logger.debug("computer_use backend release failed", exc_info=True)
+    return True
+
+
 class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     """Test/CI stub. Records calls; returns trivial results."""
 

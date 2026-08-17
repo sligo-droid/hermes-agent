@@ -2060,7 +2060,10 @@ def _truncate_content(
     return head + marker + tail
 
 
-def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
+def load_soul_md(
+    context_length: Optional[int] = None,
+    home_override: "Path | None" = None,
+) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
@@ -2073,7 +2076,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = get_hermes_home() / "SOUL.md"
+    soul_path = (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
     if not soul_path.exists():
         return None
     try:

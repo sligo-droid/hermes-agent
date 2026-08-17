@@ -21,10 +21,12 @@ import {
 import reconciler from '../reconciler.js'
 import { clearSelection, finishSelection, hasSelection, type SelectionState, startSelection } from '../selection.js'
 import { getTerminalFocused, setTerminalFocused } from '../terminal-focus-state.js'
-import { decrqm, isDecrpmModeSettable, TerminalQuerier, xtversion } from '../terminal-querier.js'
+import { decrqm, oscColor, TerminalQuerier, xtversion } from '../terminal-querier.js'
 import {
-  enableSynchronizedOutputFromTerminalQuery,
   isXtermJs,
+  parseOscColor,
+  setTerminalBackgroundHex,
+  setTerminalForegroundHex,
   setXtversionName,
   supportsExtendedKeys
 } from '../terminal.js'
@@ -121,6 +123,11 @@ type Props = {
   // fullscreen) re-enters alt-screen + mouse tracking. Idempotent on the
   // terminal side. Optional so testing.tsx doesn't need to stub it.
   readonly onStdinResume?: () => void
+  // Called for DECSET 1004 terminal focus transitions. The renderer uses
+  // focus-in as a strong signal that the emulator may have coalesced hidden
+  // tab writes or lost physical cursor state, so it can force one clean
+  // repaint instead of trusting incremental damage from before the blur.
+  readonly onTerminalFocusChange?: (isFocused: boolean) => void
   // Receives the declared native-cursor position from useDeclaredCursor
   // so ink.tsx can park the terminal cursor there after each frame.
   // Enables IME composition at the input caret and lets screen readers /
@@ -332,31 +339,52 @@ export default class App extends PureComponent<Props, State> {
           this.props.stdout.write(ENABLE_MODIFY_OTHER_KEYS)
         }
 
-        // Probe terminal identity and DEC 2026 support. Both survive SSH
-        // (query/reply goes through the pty), unlike TERM_PROGRAM/CMUX_*.
-        // Fire-and-forget: the DA1 sentinel bounds the round-trip, and if
-        // the terminal ignores a query, flush() still resolves.
+        // Probe terminal identity. XTVERSION survives SSH (query/reply goes
+        // through the pty), unlike TERM_PROGRAM. Used for wheel-scroll base
+        // detection when env vars are absent. Fire-and-forget: the DA1
+        // sentinel bounds the round-trip, and if the terminal ignores the
+        // query, flush() still resolves and name stays undefined.
         // Deferred to next tick so it fires AFTER the current synchronous
         // init sequence completes — avoids interleaving with alt-screen/mouse
         // tracking enable writes that may happen in the same render cycle.
         setImmediate(() => {
-          void Promise.all([this.querier.send(xtversion()), this.querier.send(decrqm(2026)), this.querier.flush()]).then(
-            ([xtversionResponse, syncOutputResponse]) => {
-              if (xtversionResponse) {
-                setXtversionName(xtversionResponse.name)
-                logForDebugging(`XTVERSION: terminal identified as "${xtversionResponse.name}"`)
-              } else {
-                logForDebugging('XTVERSION: no reply (terminal ignored query)')
-              }
-
-              if (isDecrpmModeSettable(syncOutputResponse)) {
-                enableSynchronizedOutputFromTerminalQuery()
-                logForDebugging('DECRQM 2026: terminal supports synchronized output')
-              } else {
-                logForDebugging('DECRQM 2026: no settable synchronized output reply')
-              }
+          // OSC 11 + OSC 10 ride the same batch: the terminal's actual
+          // background drives light/dark theme detection where env heuristics
+          // (COLORFGBG, TERM_PROGRAM) are blind — notably xterm.js hosts. The
+          // FOREGROUND is the polarity tiebreaker for transparent profiles:
+          // those report the unset-default background (pure black) but the
+          // theme's real foreground, whose luminance reveals the pole.
+          void Promise.all([
+            this.querier.send(xtversion()),
+            this.querier.send(oscColor(11)),
+            this.querier.send(oscColor(10)),
+            this.querier.flush()
+          ]).then(([r, bg, fg]) => {
+            if (r) {
+              setXtversionName(r.name)
+              logForDebugging(`XTVERSION: terminal identified as "${r.name}"`)
+            } else {
+              logForDebugging('XTVERSION: no reply (terminal ignored query)')
             }
-          )
+
+            const bgHex = bg ? parseOscColor(bg.data) : undefined
+            const fgHex = fg ? parseOscColor(fg.data) : undefined
+
+            // Background first: a trusted OSC-11 answer settles polarity
+            // outright, so the foreground listener (the transparent-profile
+            // tiebreaker) sees it already resolved and stays silent.
+            if (bgHex) {
+              setTerminalBackgroundHex(bgHex)
+              logForDebugging(`OSC11: terminal background is ${bgHex}`)
+            } else {
+              logForDebugging('OSC11: no reply (terminal ignored query)')
+            }
+
+            if (fgHex) {
+              setTerminalForegroundHex(fgHex)
+              logForDebugging(`OSC10: terminal foreground is ${fgHex}`)
+            }
+          })
         })
 
         // Re-assert mouse tracking on raw-mode re-entry. <AlternateScreen>
@@ -607,6 +635,7 @@ export default class App extends PureComponent<Props, State> {
     // setTerminalFocused notifies subscribers: TerminalFocusProvider (context)
     // and Clock (interval speed) — no App setState needed.
     setTerminalFocused(isFocused)
+    this.props.onTerminalFocusChange?.(isFocused)
   }
   handleSuspend = (): void => {
     if (!this.isRawModeSupported()) {

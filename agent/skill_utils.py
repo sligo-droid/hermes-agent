@@ -5,6 +5,7 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import ast
 import logging
 import os
 import re
@@ -251,24 +252,19 @@ _ENV_DETECT_CACHE: Dict[str, bool] = {}
 
 
 def _detect_environment(env: str) -> bool:
-    """Return True when the named runtime environment is currently active.
-
-    Cached per process. Unknown env names return True (fail-open: never hide a
-    skill because of a tag we don't understand).
-    """
-    if env in _ENV_DETECT_CACHE:
+    """Return True when the named runtime environment is currently active."""
+    if env != "kanban" and env in _ENV_DETECT_CACHE:
         return _ENV_DETECT_CACHE[env]
 
     result = True
     if env == "kanban":
-        # Kanban is "active" either as a dispatcher-spawned worker (the
-        # dispatcher sets ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_BOARD`` in the
-        # worker env) or as an orchestrator profile that has opted into the
-        # kanban toolset. Mirror the same signals the kanban tools themselves
-        # gate on (``tools/kanban_tools.py``) so the offer filter agrees with
-        # tool availability.
         if os.getenv("HERMES_KANBAN_TASK") or os.getenv("HERMES_KANBAN_BOARD"):
-            result = True
+            try:
+                from agent.delegation_context import is_dispatcher_owned_worker_context
+
+                result = is_dispatcher_owned_worker_context()
+            except Exception:
+                result = True
         else:
             try:
                 from tools.kanban_tools import _profile_has_kanban_toolset
@@ -419,12 +415,26 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
+def parse_config_string_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (ValueError, SyntaxError):
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item) for item in value]
+    return []
+
+
 def _normalize_string_set(values) -> Set[str]:
-    if values is None:
-        return set()
-    if isinstance(values, str):
-        values = [values]
-    return {str(v).strip() for v in values if str(v).strip()}
+    return {name.strip() for name in parse_config_string_list(values) if name.strip()}
 
 
 # ── External skills directories ──────────────────────────────────────────

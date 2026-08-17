@@ -2075,6 +2075,9 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._platform_event_handler: Optional[
+            Callable[[Dict[str, Any], Any], Awaitable[None]]
+        ] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -2293,11 +2296,20 @@ class BasePlatformAdapter(ABC):
 
         preview = event.preview
         if preview:
+            from agent.display import prepare_tool_preview
+
             cap = preview_max_len if preview_max_len > 0 else 40
-            if len(preview) > cap:
-                preview = preview[: cap - 3] + "..."
-            return f'{emoji} {event.tool_name}: "{preview}"'
+            prepared = prepare_tool_preview(
+                event.tool_name,
+                event.args,
+                fallback=preview,
+                max_len=cap,
+            )
+            return f'{emoji} {event.tool_name}: "{self.format_tool_preview(prepared)}"'
         return f"{emoji} {event.tool_name}..."
+
+    def format_tool_preview(self, preview: "ToolPreview") -> str:
+        return preview.text
 
     @property
     def has_fatal_error(self) -> bool:
@@ -2440,6 +2452,12 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_platform_event_handler(
+        self,
+        handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]],
+    ) -> None:
+        self._platform_event_handler = handler
 
     def set_topic_recovery_fn(
         self,
