@@ -15,6 +15,7 @@ from hermes_constants import get_hermes_home
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_LOOPBACK_PORT_PATTERN_RE = re.compile(r"^http://(?:127\.0\.0\.1|\[::1\]):\*$")
 
 
 class BrowserAuthProfileError(ValueError):
@@ -106,6 +107,12 @@ def _normalize_origin(value: Any) -> str:
 
 def _normalize_origin_pattern(value: Any) -> str:
     text = str(value or "").strip().lower()
+    if _LOOPBACK_PORT_PATTERN_RE.fullmatch(text):
+        return text
+    if text.endswith(":*"):
+        raise BrowserAuthProfileError(
+            "browser auth profile has an invalid origin pattern"
+        )
     parsed = urlsplit(text)
     host = parsed.hostname or ""
     if (
@@ -136,6 +143,9 @@ def _normalize_origin_pattern(value: Any) -> str:
 
 
 def _origin_matches_pattern(origin: str, pattern: str) -> bool:
+    if _LOOPBACK_PORT_PATTERN_RE.fullmatch(pattern):
+        prefix = pattern[:-1]
+        return origin.startswith(prefix) and origin[len(prefix) :].isdigit()
     expression = re.escape(pattern).replace(r"\*", r"[a-z0-9-]+")
     return re.fullmatch(expression, origin) is not None
 
