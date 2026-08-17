@@ -17369,7 +17369,10 @@ class _GatewayRunnerCore(
                 )
                 self._release_running_agent_state(_quick_key)
 
-        if _quick_key in self._running_agents:
+        if _quick_key in self._running_agents and not (
+            self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL
+            and _is_startup_resume_event(event)
+        ):
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
 

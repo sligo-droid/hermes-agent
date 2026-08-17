@@ -1993,17 +1993,10 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
               -> _process_message_background      (real)
                 -> _handle_message                (real)
 
-    The risk the pre-claim introduces is a *self-bounce*: the resume
-    turn's own ``_handle_message`` sees the sentinel it pre-claimed at
-    the early running-agent guard, queues the event into
-    ``_pending_messages`` and returns ``None`` without running the
-    agent.  The adapter's late-arrival drain (in
-    ``_process_message_background``'s ``finally``) re-dispatches the
-    queued event, and because the guard wrapper's ``finally`` releases
-    the pre-claim before the spawned drain task starts, the agent runs
-    exactly once.  This test locks that invariant in: the resume agent
-    must run once — never zero (regression) and never twice (the bug
-    the fix targets).
+    The synthetic event owns the sentinel it pre-claimed, so it must bypass
+    the ordinary busy-session queue and run directly. Relying on the
+    pending-message drain made startup recovery timing-sensitive
+    and left interrupted Discord work dormant until a user wrote again.
     """
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="full-path-chat")
@@ -2061,15 +2054,17 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     )
     adapter._run_processing_hook = AsyncMock()
 
-    scheduled = runner._schedule_resume_pending_sessions()
-    assert scheduled == 1
-    # Pre-claim must be visible immediately.
-    assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
+    with patch("gateway.run.merge_pending_message_event") as merge_pending:
+        scheduled = runner._schedule_resume_pending_sessions()
+        assert scheduled == 1
+        # Pre-claim must be visible immediately.
+        assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
-    # Let the guarded task, the background task, and the late-arrival
-    # drain task all settle.
-    for _ in range(20):
-        await asyncio.sleep(0.02)
+        # Let the guarded task and the background task settle.
+        for _ in range(20):
+            await asyncio.sleep(0.02)
+
+    merge_pending.assert_not_called()
 
     # Exactly one agent run for the resumed session — not zero (the
     # pre-claim did not swallow the resume) and not two (no duplicate).
