@@ -170,6 +170,7 @@ def test_gateway_flow_telemetry_formats_ids_and_durations_only():
         dispatch_start_ts=10.25,
         finished_ts=11.0,
         phase_timestamps={
+            "promotion_handoff_ts": 8.0,
             "request_ts": 9.0,
             "adapter_dispatch_ts": 9.1,
             "intake_ts": 9.2,
@@ -197,6 +198,10 @@ def test_gateway_flow_telemetry_formats_ids_and_durations_only():
     assert "session_id=session-4" in line
     assert "admission_to_dispatch_ms=250" in line
     assert "dispatch_to_finish_ms=750" in line
+    assert "handoff_to_intake_ms=1199" in line
+    assert "handoff_to_admission_ms=1300" in line
+    assert "handoff_to_model_ms=1800" in line
+    assert "handoff_to_first_commentary_ms=2400" in line
     assert "request_to_adapter_dispatch_ms=99" in line
     assert "adapter_dispatch_to_intake_ms=99" in line
     assert "intake_to_admission_ms=100" in line

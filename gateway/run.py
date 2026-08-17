@@ -739,6 +739,7 @@ def _gateway_flow_telemetry_fields(
         fields["total_ms"] = max(0, int((float(finished_ts) - float(admission_ts)) * 1000))
     timestamps = phase_timestamps if isinstance(phase_timestamps, dict) else {}
     for key in (
+        "promotion_handoff_ts",
         "request_ts",
         "adapter_dispatch_ts",
         "intake_ts",
@@ -751,6 +752,10 @@ def _gateway_flow_telemetry_fields(
         if value is not None:
             fields[key] = round(float(value), 3)
     phase_pairs = (
+        ("handoff_to_intake_ms", "promotion_handoff_ts", "intake_ts"),
+        ("handoff_to_admission_ms", "promotion_handoff_ts", "admitted_ts"),
+        ("handoff_to_model_ms", "promotion_handoff_ts", "model_start_ts"),
+        ("handoff_to_first_commentary_ms", "promotion_handoff_ts", "first_commentary_ts"),
         ("request_to_adapter_dispatch_ms", "request_ts", "adapter_dispatch_ts"),
         ("adapter_dispatch_to_intake_ms", "adapter_dispatch_ts", "intake_ts"),
         ("intake_to_admission_ms", "intake_ts", "admitted_ts"),
@@ -786,6 +791,7 @@ def _format_gateway_flow_telemetry(fields: dict[str, Any]) -> str:
         "admission_to_dispatch_ms",
         "dispatch_to_finish_ms",
         "total_ms",
+        "promotion_handoff_ts",
         "request_ts",
         "adapter_dispatch_ts",
         "intake_ts",
@@ -793,6 +799,10 @@ def _format_gateway_flow_telemetry(fields: dict[str, Any]) -> str:
         "agent_handler_start_ts",
         "model_start_ts",
         "first_commentary_ts",
+        "handoff_to_intake_ms",
+        "handoff_to_admission_ms",
+        "handoff_to_model_ms",
+        "handoff_to_first_commentary_ms",
         "request_to_adapter_dispatch_ms",
         "adapter_dispatch_to_intake_ms",
         "intake_to_admission_ms",
@@ -3962,6 +3972,11 @@ def _discord_action_worktree_cwd(
         "could not allocate a collision-free Discord action worktree under "
         f"{workspace_root} after 32 attempts"
     )
+
+
+async def _wait_for_action_worktree_worker(started: asyncio.Event) -> None:
+    """Wait until the prefetched worktree resolver owns an executor worker."""
+    await started.wait()
 
 
 def _resolve_gateway_turn_cwd(
@@ -7263,6 +7278,7 @@ class _GatewayRunnerCore(
             return None
         ledger = self._ledger()
         gateway_config = _load_gateway_config()
+        event._discord_work_item_gateway_config = gateway_config
         repository = _gateway_repository_for_source(getattr(event, "source", None))
         _, visual_qa_config = _normalize_gateway_visual_qa_contract(
             None,
@@ -17137,6 +17153,7 @@ class _GatewayRunnerCore(
         7. Return response
         """
         source = event.source
+        _promoted_action_replay = self._is_promoted_discord_replay(event)
         if not await self._consume_promoted_replay_fence(event):
             return None
 
@@ -17256,7 +17273,19 @@ class _GatewayRunnerCore(
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
         self._hydrate_discord_feature_summary_from_adapter(event)
-        _work_item = self._accept_discord_work_item(event, _quick_key)
+        _ledger_accept_started = time.perf_counter()
+        _work_item = await asyncio.to_thread(
+            self._accept_discord_work_item,
+            event,
+            _quick_key,
+        )
+        _event_metadata = getattr(event, "metadata", None)
+        if not isinstance(_event_metadata, dict):
+            _event_metadata = {}
+            event.metadata = _event_metadata
+        _event_metadata["gateway_ledger_accept_ms"] = int(
+            (time.perf_counter() - _ledger_accept_started) * 1000
+        )
         if source.platform == Platform.DISCORD and not _work_item:
             generation = getattr(self._ledger(), "discord_pr_generation", None)
             event.discord_pr_generation = generation(_quick_key) if generation else 1
@@ -18563,6 +18592,7 @@ class _GatewayRunnerCore(
             _event_metadata = {}
             event.metadata = _event_metadata
         _flow_phase_timestamps = {
+            "promotion_handoff_ts": _event_metadata.get("discord_promotion_handoff_ts"),
             "request_ts": _event_metadata.get("discord_request_ts"),
             "adapter_dispatch_ts": _event_metadata.get("discord_adapter_dispatch_ts"),
             "intake_ts": _event_metadata.get("gateway_intake_ts"),
@@ -18570,6 +18600,10 @@ class _GatewayRunnerCore(
             "agent_handler_start_ts": _event_metadata.get("gateway_agent_handler_start_ts"),
         }
         _flow_phase_durations: dict[str, Any] = {}
+        _ledger_accept_ms = _event_metadata.get("gateway_ledger_accept_ms")
+        if _ledger_accept_ms is not None:
+            _flow_phase_durations["ledger_accept_ms"] = int(_ledger_accept_ms)
+            _flow_phase_durations["ledger_accept_calls"] = 1
         _event_metadata["gateway_flow_phase_timestamps"] = _flow_phase_timestamps
         _event_metadata["gateway_flow_phase_durations"] = _flow_phase_durations
         # ── Claim this session before any await ───────────────────────
@@ -18579,6 +18613,7 @@ class _GatewayRunnerCore(
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
+        _action_worktree_task = None
         active_session_lease, limit_message = self._claim_active_session_slot(
             _quick_key,
             source,
@@ -18597,41 +18632,111 @@ class _GatewayRunnerCore(
         self._running_agents_ts[_quick_key] = time.time()
         self._refresh_active_agent_runtime_status()
         _run_generation = self._begin_session_run_generation(_quick_key)
-        if getattr(source, "platform", None) == Platform.DISCORD:
-            _discord_runtime_mode = _discord_runtime_mode_for(event)
-            _discord_pr_generation = self._discord_action_pr_generation(event)
-            if _discord_pr_generation is None:
-                _discord_pr_generation = self._ledger().discord_pr_generation(
-                    _quick_key
-                )
-            self.__dict__.setdefault("_running_discord_pr_generations", {})[
-                _quick_key
-            ] = _discord_pr_generation
-            self.__dict__.setdefault("_running_discord_runtime_modes", {})[
-                _quick_key
-            ] = _discord_runtime_mode.value
-        self._open_start_user_followups(_quick_key, _run_generation)
-        _work_item_id = str(getattr(event, "work_item_id", "") or "")
-        if _work_item_id and getattr(source, "platform", None) == Platform.DISCORD:
-            _ledger_claim_started = time.perf_counter()
-            try:
-                self._ledger().claim(
-                    _work_item_id,
-                    session_key=_quick_key,
-                    run_generation=_run_generation,
-                    process_epoch=self._process_epoch,
-                )
-            except Exception:
-                logger.debug("Discord work ledger run-generation claim failed", exc_info=True)
-            finally:
-                _flow_phase_durations["ledger_claim_ms"] = int(
-                    (time.perf_counter() - _ledger_claim_started) * 1000
-                )
-                _flow_phase_durations["ledger_claim_calls"] = 1
-
         try:
+            if getattr(source, "platform", None) == Platform.DISCORD:
+                _discord_runtime_mode = _discord_runtime_mode_for(event)
+                _discord_pr_generation = self._discord_action_pr_generation(event)
+                if _discord_pr_generation is None:
+                    _discord_pr_generation = self._ledger().discord_pr_generation(
+                        _quick_key
+                    )
+                self.__dict__.setdefault("_running_discord_pr_generations", {})[
+                    _quick_key
+                ] = _discord_pr_generation
+                self.__dict__.setdefault("_running_discord_runtime_modes", {})[
+                    _quick_key
+                ] = _discord_runtime_mode.value
+
+                _fable_metadata = getattr(event, "fable_plan_metadata", None)
+                _opus_metadata = getattr(event, "opus_plan_metadata", None)
+                _premium_implementation = bool(
+                    (
+                        isinstance(_fable_metadata, dict)
+                        and str(_fable_metadata.get("fable_mode") or "").strip().lower()
+                        == "implementation"
+                    )
+                    or (
+                        isinstance(_opus_metadata, dict)
+                        and str(_opus_metadata.get("opus_mode") or "").strip().lower()
+                        == "implementation"
+                    )
+                )
+                _premium_plan = bool(
+                    (_fable_metadata or _opus_metadata) and not _premium_implementation
+                )
+                _effective_worktree_mode = (
+                    RuntimeMode.ACTION if _premium_implementation else _discord_runtime_mode
+                )
+                if (
+                    _promoted_action_replay
+                    and not _premium_plan
+                    and _effective_worktree_mode is RuntimeMode.ACTION
+                ):
+                    _gateway_config = getattr(
+                        event,
+                        "_discord_work_item_gateway_config",
+                        None,
+                    )
+                    if not isinstance(_gateway_config, dict):
+                        _gateway_config = {}
+                    _worktree_worker_started = asyncio.Event()
+                    _worktree_loop = asyncio.get_running_loop()
+
+                    def _resolve_action_worktree():
+                        _worktree_loop.call_soon_threadsafe(
+                            _worktree_worker_started.set
+                        )
+                        return _resolve_gateway_turn_cwd(
+                            source,
+                            getattr(event, "feature_summary", None),
+                            _gateway_config,
+                            _quick_key,
+                            _effective_worktree_mode,
+                            getattr(event, "discord_pr_generation", 1),
+                        )
+
+                    _action_worktree_task = asyncio.create_task(
+                        asyncio.to_thread(_resolve_action_worktree)
+                    )
+                    await _wait_for_action_worktree_worker(
+                        _worktree_worker_started
+                    )
+            self._open_start_user_followups(_quick_key, _run_generation)
+            _work_item_id = str(getattr(event, "work_item_id", "") or "")
+            if _work_item_id and getattr(source, "platform", None) == Platform.DISCORD:
+                _ledger_claim_started = time.perf_counter()
+                try:
+                    await asyncio.to_thread(
+                        self._ledger().claim,
+                        _work_item_id,
+                        session_key=_quick_key,
+                        run_generation=_run_generation,
+                        process_epoch=self._process_epoch,
+                    )
+                except Exception:
+                    logger.debug("Discord work ledger run-generation claim failed", exc_info=True)
+                finally:
+                    _flow_phase_durations["ledger_claim_ms"] = int(
+                        (time.perf_counter() - _ledger_claim_started) * 1000
+                    )
+                    _flow_phase_durations["ledger_claim_calls"] = 1
+
             _flow_dispatch_start_ts = time.time()
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            if _action_worktree_task is None:
+                _agent_result = await self._handle_message_with_agent(
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                )
+            else:
+                _agent_result = await self._handle_message_with_agent(
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                    action_worktree_task=_action_worktree_task,
+                )
             _fable_plan_metadata = getattr(event, "fable_plan_metadata", None)
             _opus_plan_metadata = getattr(event, "opus_plan_metadata", None)
             if (
@@ -18687,11 +18792,18 @@ class _GatewayRunnerCore(
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # The transcript lease is independent from the routing-key busy
-            # guard. Always release this turn's exact token, including early
-            # failures before _run_agent installs a real agent. Normal
-            # _run_agent cleanup also releases it; the helper is idempotent.
-            self._release_turn_lease(_quick_key, _run_generation)
+            if _action_worktree_task is not None:
+                if not _action_worktree_task.done():
+                    _action_worktree_task.cancel()
+                    await asyncio.gather(
+                        _action_worktree_task,
+                        return_exceptions=True,
+                    )
+                else:
+                    try:
+                        _action_worktree_task.exception()
+                    except (asyncio.CancelledError, Exception):
+                        pass
             if getattr(event, "fable_plan_metadata", None):
                 previous_override = getattr(event, "fable_previous_model_override", None)
                 if previous_override is None:
@@ -18717,14 +18829,21 @@ class _GatewayRunnerCore(
             # (exception, command fallthrough, etc.) the sentinel must
             # not linger or the session would be permanently locked out.
             if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(_quick_key)
-            elif _quick_key not in self._running_agents:
-                # Agent path already cleaned _running_agents; make sure
-                # the paired metadata dicts are gone too. A restored older
-                # run still owns them and remains steerable.
-                self._running_agents_ts.pop(_quick_key, None)
-                if hasattr(self, "_busy_ack_ts"):
-                    self._busy_ack_ts.pop(_quick_key, None)
+                self._release_running_agent_state(
+                    _quick_key,
+                    run_generation=_run_generation,
+                )
+            else:
+                # Normal _run_agent cleanup also releases this exact token;
+                # the helper is idempotent for completed and interrupted turns.
+                self._release_turn_lease(_quick_key, _run_generation)
+                if _quick_key not in self._running_agents:
+                    # Agent path already cleaned _running_agents; make sure
+                    # the paired metadata dicts are gone too. A restored older
+                    # run still owns them and remains steerable.
+                    self._running_agents_ts.pop(_quick_key, None)
+                    if hasattr(self, "_busy_ack_ts"):
+                        self._busy_ack_ts.pop(_quick_key, None)
 
     def _restore_pending_one_turn_model_override(self, session_key: str) -> None:
         """Restore a per-session model override after ``/model --once`` runs."""
@@ -19196,7 +19315,15 @@ class _GatewayRunnerCore(
                 pass
         return source
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(
+        self,
+        event,
+        source,
+        _quick_key: str,
+        run_generation: int,
+        *,
+        action_worktree_task=None,
+    ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -19322,13 +19449,17 @@ class _GatewayRunnerCore(
             session_id=session_entry.session_id,
         )
 
-        _pcfg = {}
-        _redact_pii = False
-        try:
-            _pcfg = _load_gateway_config()
-            _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
-        except Exception:
-            pass
+        _pcfg = getattr(event, "_discord_work_item_gateway_config", None)
+        if not isinstance(_pcfg, dict):
+            _pcfg = {}
+            try:
+                _pcfg = _load_gateway_config()
+            except Exception:
+                pass
+        _privacy_config = _pcfg.get("privacy")
+        if not isinstance(_privacy_config, dict):
+            _privacy_config = {}
+        _redact_pii = bool(_privacy_config.get("redact_pii", False))
 
         default_kanban_intake = self._mark_discord_default_kanban_intake_context(
             event,
@@ -19377,6 +19508,10 @@ class _GatewayRunnerCore(
             session_cwd = _resolve_gateway_session_cwd(source, _pcfg)
             session_cwd_error = None
             action_worktree_cwd = None
+        elif action_worktree_task is not None:
+            session_cwd, session_cwd_error, action_worktree_cwd = (
+                await action_worktree_task
+            )
         else:
             session_cwd, session_cwd_error, action_worktree_cwd = await asyncio.to_thread(
                 _resolve_gateway_turn_cwd,
@@ -20189,19 +20324,25 @@ class _GatewayRunnerCore(
             if work_item_id and source.platform == Platform.DISCORD:
                 _ledger_running_started = time.perf_counter()
                 try:
-                    self._ledger().mark_agent_running(
-                        str(work_item_id),
-                        session_id=session_entry.session_id,
-                        session_key=session_key,
-                        run_generation=run_generation,
-                        process_epoch=self._process_epoch,
-                    )
-                    work_item_expected_run_state = self._ledger().capture_run_state(
-                        str(work_item_id),
-                        session_key=session_key,
-                        run_generation=run_generation,
-                        owner_pid=os.getpid(),
-                        process_epoch=self._process_epoch,
+                    def _mark_agent_running_and_capture_state():
+                        ledger = self._ledger()
+                        ledger.mark_agent_running(
+                            str(work_item_id),
+                            session_id=session_entry.session_id,
+                            session_key=session_key,
+                            run_generation=run_generation,
+                            process_epoch=self._process_epoch,
+                        )
+                        return ledger.capture_run_state(
+                            str(work_item_id),
+                            session_key=session_key,
+                            run_generation=run_generation,
+                            owner_pid=os.getpid(),
+                            process_epoch=self._process_epoch,
+                        )
+
+                    work_item_expected_run_state = await asyncio.to_thread(
+                        _mark_agent_running_and_capture_state
                     )
                     if work_item_expected_run_state is not None:
                         async def _renew_work_item_lease() -> None:

@@ -3388,9 +3388,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 or not bool(getattr(source, "thread_id", None))
             ),
         )
+        promoted_metadata = dict(getattr(event, "metadata", None) or {})
+        for key in (
+            "discord_request_ts",
+            "discord_adapter_dispatch_ts",
+            "gateway_intake_ts",
+            "gateway_admitted_ts",
+            "gateway_agent_handler_start_ts",
+            "gateway_flow_phase_timestamps",
+            "gateway_flow_phase_durations",
+        ):
+            promoted_metadata.pop(key, None)
+        promoted_metadata["discord_promotion_handoff_ts"] = time.time()
         promoted_event = replace(
             event,
             text=request_text,
+            metadata=promoted_metadata,
             source=promoted_source,
             channel_prompt=(
                 getattr(event, "discord_action_request_base_channel_prompt", None)
