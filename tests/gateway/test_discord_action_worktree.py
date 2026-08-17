@@ -473,6 +473,125 @@ def test_normal_action_creates_and_reuses_thread_worktree(tmp_path, monkeypatch)
     assert reused_worktree == cwd
 
 
+def test_first_action_worktree_starts_from_fresh_remote_base(tmp_path, monkeypatch):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    remote = tmp_path / "pid-origin.git"
+    updater = tmp_path / "updater"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _run(tmp_path, "init", "--bare", str(remote))
+    _run(canonical, "remote", "add", "origin", str(remote))
+    _run(canonical, "push", "-u", "origin", "main")
+    _run(tmp_path, "clone", str(remote), str(updater))
+    _run(updater, "config", "user.email", "tests@example.invalid")
+    _run(updater, "config", "user.name", "Hermes Tests")
+    _run(updater, "checkout", "main")
+    (updater / "fresh.txt").write_text("fresh\n", encoding="utf-8")
+    _run(updater, "add", "fresh.txt")
+    _run(updater, "commit", "-m", "fresh remote base")
+    _run(updater, "push", "origin", "main")
+    expected_head = _run(updater, "rev-parse", "HEAD").stdout.strip()
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    cwd, error, _ = gateway_run._resolve_gateway_turn_cwd(
+        _source(canonical),
+        _feature_summary(),
+        _config(canonical),
+        "agent:main:discord:thread:thread-123",
+    )
+
+    assert error is None
+    assert _run(Path(cwd), "rev-parse", "HEAD").stdout.strip() == expected_head
+    assert (Path(cwd) / "fresh.txt").read_text(encoding="utf-8") == "fresh\n"
+    snapshot = gateway_run._discord_action_worktree_preflight_prompt(cwd)
+    assert "worktree preflight" in snapshot.lower()
+    assert "recent commits" in snapshot
+    assert "base comparison" in snapshot
+
+
+def test_first_action_worktree_uses_cached_remote_base_when_fetch_fails(
+    tmp_path, monkeypatch
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    remote = tmp_path / "pid-origin.git"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _run(tmp_path, "init", "--bare", str(remote))
+    _run(canonical, "remote", "add", "origin", str(remote))
+    _run(canonical, "push", "-u", "origin", "main")
+    cached_head = _run(canonical, "rev-parse", "origin/main").stdout.strip()
+    remote.rename(tmp_path / "pid-origin-unavailable.git")
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    cwd, error, _ = gateway_run._resolve_gateway_turn_cwd(
+        _source(canonical),
+        _feature_summary(),
+        _config(canonical),
+        "agent:main:discord:thread:thread-123",
+    )
+
+    assert error is None
+    assert _run(Path(cwd), "rev-parse", "HEAD").stdout.strip() == cached_head
+
+
+def test_action_preflight_uses_non_origin_non_main_upstream(tmp_path, monkeypatch):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    remote = tmp_path / "pid-upstream.git"
+    updater = tmp_path / "updater"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _run(canonical, "branch", "-m", "trunk")
+    _run(tmp_path, "init", "--bare", str(remote))
+    _run(canonical, "remote", "add", "upstream", str(remote))
+    _run(canonical, "push", "-u", "upstream", "trunk")
+    _run(tmp_path, "clone", "-b", "trunk", str(remote), str(updater))
+    _run(updater, "config", "user.email", "tests@example.invalid")
+    _run(updater, "config", "user.name", "Hermes Tests")
+    (updater / "fresh-trunk.txt").write_text("fresh\n", encoding="utf-8")
+    _run(updater, "add", "fresh-trunk.txt")
+    _run(updater, "commit", "-m", "fresh trunk base")
+    _run(updater, "push", "origin", "trunk")
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    cwd, error, _ = gateway_run._resolve_gateway_turn_cwd(
+        _source(canonical),
+        _feature_summary(),
+        _config(canonical),
+        "agent:main:discord:thread:thread-123",
+    )
+
+    assert error is None
+    assert (Path(cwd) / "fresh-trunk.txt").is_file()
+    snapshot = gateway_run._discord_action_worktree_preflight_prompt(cwd)
+    assert "base comparison: upstream/trunk" in snapshot
+
+
+def test_action_preflight_omits_unresolved_base(tmp_path, monkeypatch):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    cwd, error, _ = gateway_run._resolve_gateway_turn_cwd(
+        _source(canonical),
+        _feature_summary(),
+        _config(canonical),
+        "agent:main:discord:thread:thread-123",
+    )
+
+    assert error is None
+    snapshot = gateway_run._discord_action_worktree_preflight_prompt(cwd)
+    assert "base comparison:" not in snapshot
+
+
 def test_restarted_action_turn_restores_closeout_contract(tmp_path, monkeypatch):
     canonical_root = tmp_path / "canonical"
     canonical = canonical_root / "PID"

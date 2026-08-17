@@ -18,10 +18,13 @@ from gateway.session import SessionSource
 class _CapturingAgent:
     last_init = None
     last_run = None
+    init_count = 0
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
+        type(self).init_count += 1
         self.tools = []
+        self.iteration_budget = SimpleNamespace(max_total=0)
 
     def run_conversation(self, user_message, conversation_history=None, task_id=None, **kwargs):
         type(self).last_run = {
@@ -114,6 +117,8 @@ async def _run_discord_agent(
     message="Build a deploy dashboard",
     channel_prompt=None,
     escalation_allowed=False,
+    action_preflight_prompt=None,
+    fable_transcript_user_message=None,
 ):
     return await runner._run_agent(
         message=message,
@@ -127,6 +132,8 @@ async def _run_discord_agent(
         discord_runtime_mode="read_only" if intent is False else "action",
         discord_action_request_intent=intent,
         discord_action_escalation_allowed=escalation_allowed,
+        action_preflight_prompt=action_preflight_prompt,
+        fable_transcript_user_message=fable_transcript_user_message,
     )
 
 
@@ -184,7 +191,20 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "include the preview and PR URLs" in init["ephemeral_system_prompt"]
     assert "omit commit hashes" in init["ephemeral_system_prompt"]
     assert "rerun the same package script" in init["ephemeral_system_prompt"]
-    assert "cleanup from the mutable action worktree" in init["ephemeral_system_prompt"]
+    lifecycle_prompt = init["ephemeral_system_prompt"]
+    assert "non-short-circuit" in lifecycle_prompt
+    assert "records every exit status" in lifecycle_prompt
+    assert "one bounded pr_workflow_preflight snapshot" in lifecycle_prompt
+    assert "Stage only owned files" in lifecycle_prompt
+    assert "first feature-branch push as one recoverable" in lifecycle_prompt
+    assert lifecycle_prompt.index("first feature-branch push") < lifecycle_prompt.index("PR creation")
+    assert "separate explicit user authorization" in lifecycle_prompt
+    assert "exact-head protection" in lifecycle_prompt
+    assert "actual merge as a separate mutation" in lifecycle_prompt
+    assert "one bounded post-merge snapshot" in lifecycle_prompt
+    assert "without inspecting recent PR history" in lifecycle_prompt
+    assert "Do not request branch deletion as part of the merge mutation" in lifecycle_prompt
+    assert "cleanup from the mutable action worktree" in lifecycle_prompt
     assert "Do not load github-pr-workflow for routine closeout" in init["ephemeral_system_prompt"]
     assert "diagnosis or recovery" in init["ephemeral_system_prompt"]
     assert "terminal(background=True, notify_on_complete=True)" in init["ephemeral_system_prompt"]
@@ -221,6 +241,75 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "phase timing line" not in init["ephemeral_system_prompt"]
     assert "contradictory done/not-verified" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
+
+
+@pytest.mark.asyncio
+async def test_action_preflight_is_api_only_and_preserves_agent_cache(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+    _CapturingAgent.init_count = 0
+    feature = {"initial_request": "Build it", "message_id": "301", "kanban_board": None}
+
+    await _run_discord_agent(
+        runner,
+        feature,
+        message="first request",
+        action_preflight_prompt="snapshot one",
+    )
+    await _run_discord_agent(
+        runner,
+        feature,
+        message="second request",
+        action_preflight_prompt="snapshot two",
+    )
+
+    assert _CapturingAgent.init_count == 1
+    assert "snapshot one" not in _CapturingAgent.last_init["ephemeral_system_prompt"]
+    assert "snapshot two" not in _CapturingAgent.last_init["ephemeral_system_prompt"]
+    assert _CapturingAgent.last_run["user_message"] == "snapshot two\n\nsecond request"
+    assert _CapturingAgent.last_run["persist_user_message"] == "second request"
+
+
+@pytest.mark.asyncio
+async def test_action_preflight_preserves_premium_transcript_override(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+
+    await _run_discord_agent(
+        runner,
+        {"initial_request": "Build it", "message_id": "303", "kanban_board": None},
+        message="synthetic premium instruction",
+        action_preflight_prompt="fresh snapshot",
+        fable_transcript_user_message="/fable build it",
+    )
+
+    assert _CapturingAgent.last_run["user_message"] == (
+        "fresh snapshot\n\nsynthetic premium instruction"
+    )
+    assert _CapturingAgent.last_run["persist_user_message"] == "/fable build it"
+
+
+@pytest.mark.asyncio
+async def test_action_preflight_preserves_multimodal_payload(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+    clean_message = [
+        {"type": "text", "text": "inspect this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+
+    await _run_discord_agent(
+        runner,
+        {"initial_request": "Build it", "message_id": "302", "kanban_board": None},
+        message=clean_message,
+        action_preflight_prompt="fresh snapshot",
+    )
+
+    api_message = _CapturingAgent.last_run["user_message"]
+    assert api_message[0]["text"] == "fresh snapshot\n\ninspect this"
+    assert api_message[1] == clean_message[1]
+    assert _CapturingAgent.last_run["persist_user_message"] == clean_message
+    assert clean_message[0]["text"] == "inspect this"
 
 
 @pytest.mark.parametrize(

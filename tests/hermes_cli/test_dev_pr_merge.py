@@ -129,6 +129,8 @@ def test_merges_exact_published_head(tmp_path):
     assert result.outcome == "merged"
     assert result.message == f"Merged: {PR_URL}"
     merge_call = next(call for call in run.calls if call[:3] == ["gh", "pr", "merge"])
+    assert "--squash" in merge_call
+    assert "--delete-branch" not in merge_call
     assert merge_call[-2:] == ["--match-head-commit", HEAD]
     assert not any(call[:2] == ["git", "checkout"] for call in run.calls)
 
