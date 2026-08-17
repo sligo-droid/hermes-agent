@@ -50,6 +50,26 @@ class TestReleaseRunningAgentStateUnit:
         runner._release_running_agent_state("missing")
         runner._release_running_agent_state("missing")  # still fine
 
+    def test_restores_older_overlapping_run_for_live_steering(self):
+        runner = _make_runner()
+        runner._session_run_generation = {"k": 2}
+        older = MagicMock()
+        newer = MagicMock()
+        runner._running_agents["k"] = newer
+        runner._running_agents_ts["k"] = 20.0
+        runner._running_agents_by_generation = {
+            ("k", 1): (older, 10.0),
+            ("k", 2): (newer, 20.0),
+        }
+
+        assert runner._release_running_agent_state("k", run_generation=2) is True
+        assert runner._running_agents["k"] is older
+        assert runner._running_agents_ts["k"] == 10.0
+
+        assert runner._release_running_agent_state("k", run_generation=1) is False
+        assert "k" not in runner._running_agents
+        assert "k" not in runner._running_agents_ts
+
 
 class TestNoMoreBareDeleteSites:
     """Regression: all bare `del self._running_agents[key]` sites were
