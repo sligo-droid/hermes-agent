@@ -715,6 +715,21 @@ class QueuedSilenceAgent:
         }
 
 
+class QueuedSnapshotAgent:
+    messages = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, **_kwargs):
+        type(self).messages.append(message)
+        return {
+            "final_response": f"done-{len(type(self).messages)}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedFailedEmptyAgent:
     """First turn fails empty; its normalized error must send before follow-up."""
 
@@ -827,6 +842,8 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     discord_runtime_mode=None,
     pending_discord_runtime_mode=None,
+    action_preflight_prompt=None,
+    action_worktree_cwd=None,
 ):
     if config_data:
         import yaml
@@ -880,6 +897,8 @@ async def _run_with_agent(
         session_id=session_id,
         session_key=session_key,
         discord_runtime_mode=discord_runtime_mode,
+        action_preflight_prompt=action_preflight_prompt,
+        action_worktree_cwd=action_worktree_cwd,
     )
     return adapter, result
 
@@ -1229,6 +1248,70 @@ async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_follo
     assert QueuedSilenceAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert "NO_REPLY" not in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_same_generation_queued_action_refreshes_worktree_snapshot(
+    monkeypatch, tmp_path,
+):
+    QueuedSnapshotAgent.messages = []
+    gateway_run = importlib.import_module("gateway.run")
+    action_worktree = str(tmp_path / "action-worktree")
+    monkeypatch.setattr(
+        gateway_run,
+        "_discord_action_worktree_preflight_prompt",
+        lambda cwd: f"snapshot for {cwd}",
+    )
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedSnapshotAgent,
+        session_id="sess-queued-action-snapshot",
+        pending_text="queued follow-up",
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+        discord_runtime_mode="action",
+        pending_discord_runtime_mode="action",
+        action_preflight_prompt="initial snapshot",
+        action_worktree_cwd=action_worktree,
+    )
+
+    assert result["final_response"] == "done-2"
+    assert QueuedSnapshotAgent.messages == [
+        "initial snapshot\n\nhello",
+        f"snapshot for {action_worktree}\n\nqueued follow-up",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queued_action_without_worktree_gets_no_snapshot(monkeypatch, tmp_path):
+    QueuedSnapshotAgent.messages = []
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run,
+        "_discord_action_worktree_preflight_prompt",
+        lambda _cwd: pytest.fail("no action worktree means no snapshot"),
+    )
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedSnapshotAgent,
+        session_id="sess-queued-action-no-worktree",
+        pending_text="queued follow-up",
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+        discord_runtime_mode="action",
+        pending_discord_runtime_mode="action",
+    )
+
+    assert result["final_response"] == "done-2"
+    assert QueuedSnapshotAgent.messages == ["hello", "queued follow-up"]
 
 
 @pytest.mark.asyncio

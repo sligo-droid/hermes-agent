@@ -538,6 +538,60 @@ def test_first_action_worktree_uses_cached_remote_base_when_fetch_fails(
     assert _run(Path(cwd), "rev-parse", "HEAD").stdout.strip() == cached_head
 
 
+def test_action_preflight_uses_non_origin_non_main_upstream(tmp_path, monkeypatch):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    remote = tmp_path / "pid-upstream.git"
+    updater = tmp_path / "updater"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _run(canonical, "branch", "-m", "trunk")
+    _run(tmp_path, "init", "--bare", str(remote))
+    _run(canonical, "remote", "add", "upstream", str(remote))
+    _run(canonical, "push", "-u", "upstream", "trunk")
+    _run(tmp_path, "clone", "-b", "trunk", str(remote), str(updater))
+    _run(updater, "config", "user.email", "tests@example.invalid")
+    _run(updater, "config", "user.name", "Hermes Tests")
+    (updater / "fresh-trunk.txt").write_text("fresh\n", encoding="utf-8")
+    _run(updater, "add", "fresh-trunk.txt")
+    _run(updater, "commit", "-m", "fresh trunk base")
+    _run(updater, "push", "origin", "trunk")
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    cwd, error, _ = gateway_run._resolve_gateway_turn_cwd(
+        _source(canonical),
+        _feature_summary(),
+        _config(canonical),
+        "agent:main:discord:thread:thread-123",
+    )
+
+    assert error is None
+    assert (Path(cwd) / "fresh-trunk.txt").is_file()
+    snapshot = gateway_run._discord_action_worktree_preflight_prompt(cwd)
+    assert "base comparison: upstream/trunk" in snapshot
+
+
+def test_action_preflight_omits_unresolved_base(tmp_path, monkeypatch):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    cwd, error, _ = gateway_run._resolve_gateway_turn_cwd(
+        _source(canonical),
+        _feature_summary(),
+        _config(canonical),
+        "agent:main:discord:thread:thread-123",
+    )
+
+    assert error is None
+    snapshot = gateway_run._discord_action_worktree_preflight_prompt(cwd)
+    assert "base comparison:" not in snapshot
+
+
 def test_restarted_action_turn_restores_closeout_contract(tmp_path, monkeypatch):
     canonical_root = tmp_path / "canonical"
     canonical = canonical_root / "PID"

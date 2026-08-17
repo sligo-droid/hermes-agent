@@ -174,7 +174,8 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "with exact-head protection, required checks, no force/bypass, then run one bounded "
     "post-merge snapshot. Use the project-established merge strategy without inspecting "
     "recent PR history or repository settings unless the workflow leaves it genuinely "
-    "undefined. Run temporary worktree "
+    "undefined. Do not request branch deletion as part of the merge mutation; leave branch "
+    "cleanup outside this checkpoint. Run temporary worktree "
     "cleanup from the mutable action worktree, not from the protected canonical "
     "checkout. "
     "Do not load github-pr-workflow for routine closeout; reserve it for diagnosis "
@@ -1769,21 +1770,13 @@ def _build_gateway_agent_history(
     return agent_history, observed_context
 
 
-def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
-    """Prepend observed Telegram context to the API-only current user turn."""
+def _prepend_api_message_text(message: Any, prefix: str) -> Any:
+    """Prepend API-only text without mutating the persisted user payload."""
 
-    if not observed_context:
+    if not prefix:
         return message
-
-    prefix = (
-        f"{_OBSERVED_GROUP_CONTEXT_HEADER}\n"
-        f"{observed_context}\n\n"
-        f"{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
-    )
-
     if isinstance(message, str):
         return f"{prefix}{message}"
-
     if isinstance(message, list):
         wrapped = [dict(part) if isinstance(part, dict) else part for part in message]
         for part in wrapped:
@@ -1791,8 +1784,20 @@ def _wrap_current_message_with_observed_context(message: Any, observed_context: 
                 part["text"] = f"{prefix}{part.get('text', '')}"
                 return wrapped
         return [{"type": "text", "text": prefix.rstrip()}] + wrapped
-
     return message
+
+
+def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
+    """Prepend observed Telegram context to the API-only current user turn."""
+
+    if not observed_context:
+        return message
+    return _prepend_api_message_text(
+        message,
+        f"{_OBSERVED_GROUP_CONTEXT_HEADER}\n"
+        f"{observed_context}\n\n"
+        f"{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n",
+    )
 
 
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
@@ -3563,6 +3568,44 @@ def _discord_action_worktree_target(
     )
 
 
+def _discord_action_canonical_upstream_ref(worktree_cwd: str) -> Optional[str]:
+    """Resolve the protected canonical checkout's usable upstream ref."""
+
+    import subprocess
+
+    def _git(cwd: str | Path, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+
+    common = _git(
+        worktree_cwd,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    common_dir = Path(str(common.stdout or "").strip())
+    if common.returncode != 0 or common_dir.name != ".git":
+        return None
+    canonical = common_dir.parent
+    upstream = _git(
+        canonical,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    upstream_ref = str(upstream.stdout or "").strip()
+    if upstream.returncode != 0 or "/" not in upstream_ref:
+        return None
+    verified = _git(
+        worktree_cwd,
+        ["rev-parse", "--verify", f"refs/remotes/{upstream_ref}^{{commit}}"],
+    )
+    return upstream_ref if verified.returncode == 0 else None
+
+
 def _discord_action_worktree_preflight_prompt(worktree_cwd: str) -> str:
     """Return one bounded deterministic Git snapshot for the action model."""
 
@@ -3571,7 +3614,7 @@ def _discord_action_worktree_preflight_prompt(worktree_cwd: str) -> str:
 
         summary = collect_pr_workflow_preflight(
             worktree_cwd,
-            base_branch="origin/main",
+            base_branch=_discord_action_canonical_upstream_ref(worktree_cwd),
             max_output_chars=3_200,
         )
         output = str(summary.get("output") or "").strip()
@@ -19435,8 +19478,6 @@ class _GatewayRunnerCore(
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key
         )
-        if action_preflight_prompt:
-            context_prompt = f"{context_prompt}\n\n{action_preflight_prompt}".strip()
         if default_kanban_intake:
             context_prompt = (
                 context_prompt
@@ -20254,6 +20295,8 @@ class _GatewayRunnerCore(
                         source.platform == Platform.DISCORD
                         and discord_runtime_mode is RuntimeMode.READ_ONLY
                     ),
+                    action_preflight_prompt=action_preflight_prompt or None,
+                    action_worktree_cwd=action_worktree_cwd,
                     fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
                     fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
                     fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
@@ -31003,6 +31046,8 @@ class _GatewayRunnerCore(
         discord_runtime_mode: Optional[str] = None,
         discord_action_request_intent: Optional[bool] = None,
         discord_action_escalation_allowed: bool = False,
+        action_preflight_prompt: Optional[str] = None,
+        action_worktree_cwd: Optional[str] = None,
         fable_plan_metadata: Optional[Dict[str, Any]] = None,
         fable_toolsets: Optional[List[str]] = None,
         fable_reasoning_config: Optional[Dict[str, Any]] = None,
@@ -32959,10 +33004,16 @@ class _GatewayRunnerCore(
                 else:
                     _run_message = message
 
+                _clean_run_message = _run_message
                 _api_run_message = _wrap_current_message_with_observed_context(
                     _run_message,
                     observed_group_context,
                 )
+                if action_preflight_prompt:
+                    _api_run_message = _prepend_api_message_text(
+                        _api_run_message,
+                        f"{action_preflight_prompt}\n\n",
+                    )
                 _conversation_kwargs = {
                     "conversation_history": agent_history,
                     "task_id": session_id,
@@ -32974,7 +33025,11 @@ class _GatewayRunnerCore(
                         or ""
                     ).strip()
                 )
-                if observed_group_context:
+                if action_preflight_prompt:
+                    _conversation_kwargs["persist_user_message"] = (
+                        _persist_user_message or _clean_run_message
+                    )
+                elif observed_group_context:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message or message
                 elif _persist_user_message:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message
@@ -34076,6 +34131,7 @@ class _GatewayRunnerCore(
                 next_origin_work_item_id = str(origin_work_item_id or "")
                 next_session_key = session_key
                 next_session_cwd = session_cwd
+                next_action_worktree_cwd = action_worktree_cwd or None
                 next_runtime_mode = turn_runtime_mode
                 next_legacy_action_intent = None
                 next_action_escalation_allowed = bool(
@@ -34242,6 +34298,16 @@ class _GatewayRunnerCore(
                     _followup_session_id,
                 )
 
+                next_action_preflight_prompt = ""
+                if (
+                    next_runtime_mode is RuntimeMode.ACTION
+                    and next_action_worktree_cwd
+                ):
+                    next_action_preflight_prompt = await asyncio.to_thread(
+                        _discord_action_worktree_preflight_prompt,
+                        next_action_worktree_cwd,
+                    )
+
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -34258,6 +34324,8 @@ class _GatewayRunnerCore(
                     discord_runtime_mode=next_runtime_mode.value,
                     discord_action_request_intent=next_legacy_action_intent,
                     discord_action_escalation_allowed=next_action_escalation_allowed,
+                    action_preflight_prompt=next_action_preflight_prompt or None,
+                    action_worktree_cwd=next_action_worktree_cwd,
                     fable_reasoning_config=fable_reasoning_config,
                     session_cwd_override=next_session_cwd,
                     visual_qa_requirement=(

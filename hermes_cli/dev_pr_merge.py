@@ -291,7 +291,6 @@ def merge_published_pr(
                 "--repo",
                 repository,
                 "--squash",
-                "--delete-branch",
                 "--match-head-commit",
                 head_sha,
             ],
