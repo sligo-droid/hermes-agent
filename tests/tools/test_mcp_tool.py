@@ -95,6 +95,13 @@ class TestFilterMCPChildren:
 # ---------------------------------------------------------------------------
 
 class TestLoadMCPConfig:
+    def test_no_config_returns_empty(self):
+        """No mcp_servers key in config -> empty dict."""
+        with patch("hermes_cli.config.load_config", return_value={"model": "test"}):
+            from tools.mcp_tool import _load_mcp_config
+
+            result = _load_mcp_config()
+            assert result == {}
 
 
 class TestMCPGatewayChildScope:
