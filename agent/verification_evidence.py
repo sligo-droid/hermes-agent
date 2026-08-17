@@ -1904,6 +1904,36 @@ def _surface_claimed(text: str, surface: str) -> bool:
     return bool(_CLAIM_WORD_RE.search(relevant_text))
 
 
+def _verification_check_claimed(text: str, item: dict[str, Any]) -> bool:
+    lines = [
+        line
+        for line in str(text or "").splitlines()
+        if "verification downgrade" not in line.lower()
+    ]
+    if any(
+        re.search(
+            r"\b(?:verification|checks?)\b[^\n.!?]{0,40}\b(?:passed|green|successful)\b",
+            line,
+            flags=re.IGNORECASE,
+        )
+        for line in lines
+    ):
+        return True
+
+    check = str(item.get("check_name") or "").lower()
+    categories = (
+        (("build",), r"\bbuild\b"),
+        (("test", "pytest", "vitest"), r"\b(?:tests?|pytest|vitest)\b"),
+        (("lint",), r"\blint(?:ed|ing)?\b"),
+        (("type-check", "typecheck", "svelte-check", "pnpm check"), r"\b(?:type[ -]?check|svelte check)\b"),
+        (("git diff --check",), r"\bgit\s+diff\s+--check\b"),
+    )
+    for markers, pattern in categories:
+        if any(marker in check for marker in markers):
+            return any(_CLAIM_WORD_RE.search(line) and re.search(pattern, line, re.IGNORECASE) for line in lines)
+    return _surface_claimed(text, "verification")
+
+
 def _surface_terms_present(text: str, surface: str) -> bool:
     lowered = text.lower()
     if surface == "production_browser":
@@ -1970,7 +2000,11 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
         status = str(item.get("status") or "").lower()
         if status not in {"failure", "timeout", "pending"}:
             continue
-        if _surface_claimed(final_text, surface):
+        if (
+            _verification_check_claimed(final_text, item)
+            if surface == "verification"
+            else _surface_claimed(final_text, surface)
+        ):
             blocked.append(
                 {
                     "surface": surface,
