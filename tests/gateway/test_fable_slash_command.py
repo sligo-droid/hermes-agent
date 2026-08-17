@@ -247,6 +247,7 @@ async def test_natural_discord_fable_plan_is_plan_only_without_action_thread(mon
     agent_event = runner._handle_message_with_agent.await_args.args[0]
     assert agent_event.text == "PLAN SKILL: help me plan to build X"
     assert agent_event.fable_implementation is False
+    assert "action_worktree_task" not in runner._handle_message_with_agent.await_args.kwargs
 
 
 @pytest.mark.asyncio

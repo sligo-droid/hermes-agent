@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -2344,6 +2346,93 @@ def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunn
         }
     )
     return runner
+
+
+@pytest.mark.asyncio
+async def test_action_turn_joins_prefetched_worktree_before_agent(
+    tmp_path,
+    monkeypatch,
+):
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    action_cwd = tmp_path / "action-worktree"
+    action_cwd.mkdir()
+    source = _source(tmp_path)
+    event = MessageEvent(
+        text="do a no-op change end-to-end",
+        source=source,
+        message_id="prefetched-worktree",
+        discord_runtime_mode="action",
+        feature_summary=_feature_summary(),
+    )
+    prefetched = asyncio.create_task(
+        asyncio.sleep(
+            0,
+            result=(str(action_cwd), None, str(action_cwd)),
+        )
+    )
+
+    def fail_resolve(*_args, **_kwargs):
+        raise AssertionError("prefetched action turn must not resolve cwd twice")
+
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_turn_cwd", fail_resolve)
+    monkeypatch.setattr(
+        gateway_run,
+        "_discord_action_worktree_preflight_prompt",
+        lambda _cwd: "preflight",
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:discord:thread:thread-123",
+        1,
+        action_worktree_task=prefetched,
+    )
+
+    assert response.startswith("done")
+    assert prefetched.done()
+    assert captured["session_env_cwd"] == str(action_cwd)
+    assert captured["cached_source"].project_path == str(action_cwd)
+
+
+@pytest.mark.asyncio
+async def test_action_running_ledger_updates_are_ordered_off_event_loop(tmp_path):
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    loop_thread = threading.get_ident()
+    calls = []
+
+    class Ledger:
+        def mark_agent_running(self, *_args, **_kwargs):
+            calls.append(("mark", threading.get_ident()))
+
+        def capture_run_state(self, *_args, **_kwargs):
+            calls.append(("capture", threading.get_ident()))
+            return None
+
+    runner.work_ledger = Ledger()
+    runner._discord_work_item_id_for_event = lambda *_args, **_kwargs: "work-1"
+    source = _source(tmp_path)
+    event = MessageEvent(
+        text="do a no-op change end-to-end",
+        source=source,
+        message_id="threaded-ledger-running",
+        discord_runtime_mode="action",
+        work_item_id="work-1",
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:discord:thread:thread-123",
+        1,
+    )
+
+    assert response.startswith("done")
+    assert [name for name, _thread in calls] == ["mark", "capture"]
+    assert all(thread != loop_thread for _name, thread in calls)
+    assert calls[0][1] == calls[1][1]
 
 
 def _accept_enforced_visual_action_item(runner, event, session_key):

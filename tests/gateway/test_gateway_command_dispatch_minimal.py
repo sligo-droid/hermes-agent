@@ -1,9 +1,12 @@
+import asyncio
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key
@@ -100,6 +103,135 @@ def _make_runner():
     runner._begin_session_run_generation = lambda _key: 1
     runner._release_running_agent_state = lambda key: runner._running_agents.pop(key, None)
     return runner, adapter
+
+
+@pytest.mark.asyncio
+async def test_work_item_acceptance_does_not_block_event_loop():
+    runner, _adapter = _make_runner()
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    accept_thread = None
+
+    def slow_accept(_event, _session_key):
+        nonlocal accept_thread
+        accept_thread = threading.get_ident()
+        loop.call_soon_threadsafe(started.set)
+        release.wait(timeout=2)
+        return None
+
+    async def fake_handle_message_with_agent(event, source, key, generation):
+        return {"final_response": "", "messages": []}
+
+    runner._accept_discord_work_item = slow_accept
+    runner._handle_message_with_agent = fake_handle_message_with_agent
+    task = asyncio.create_task(runner._handle_message(_make_event("hello")))
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    heartbeat = asyncio.Event()
+    loop.call_soon(heartbeat.set)
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.1)
+    release.set()
+    await task
+
+    assert accept_thread != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_promoted_action_starts_worktree_before_generation_claim(
+    tmp_path,
+    monkeypatch,
+):
+    runner, adapter = _make_runner()
+    runner.config.platforms = {
+        Platform.DISCORD: PlatformConfig(enabled=True, token="***")
+    }
+    runner.adapters = {Platform.DISCORD: adapter}
+    project = tmp_path / "project"
+    project.mkdir()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="u1",
+        chat_id="thread-1",
+        user_name="tester",
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="parent-1",
+        guild_id="guild-1",
+        project_path=str(project),
+    )
+    event = MessageEvent(
+        text="build it",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+        discord_runtime_mode="action",
+        participates_in_work_lifecycle=True,
+        feature_summary={"initial_request": "build it"},
+    )
+    event._discord_promotion_origin_session_key = build_session_key(source)
+    event._discord_promotion_origin_generation = 1
+    runner._consume_promoted_replay_fence = AsyncMock(return_value=True)
+    runner._hydrate_discord_feature_summary_from_adapter = lambda _event: None
+    runner._claim_active_session_slot = lambda *_args: (None, None)
+    runner._begin_session_run_generation = lambda _key: 1
+    runner._open_start_user_followups = lambda *_args: None
+    runner._refresh_active_agent_runtime_status = lambda: None
+    runner._release_turn_lease = lambda *_args: None
+    captured = {}
+
+    async def handle_with_prefetch(
+        _event,
+        _source,
+        _session_key,
+        _generation,
+        *,
+        action_worktree_task,
+    ):
+        captured["worktree"] = await action_worktree_task
+        return {"final_response": ""}
+
+    runner._handle_message_with_agent = AsyncMock(side_effect=handle_with_prefetch)
+
+    def accept_item(accepted_event, _session_key):
+        accepted_event.work_item_id = "work-1"
+        accepted_event.discord_pr_generation = 1
+        accepted_event._discord_work_item_gateway_config = {}
+        return {"id": "work-1", "status": "claimed"}
+
+    runner._accept_discord_work_item = accept_item
+    worker_started = threading.Event()
+    resolver_release = threading.Event()
+
+    def resolve_worktree(*_args, **_kwargs):
+        worker_started.set()
+        resolver_release.wait(timeout=2)
+        return str(project), None, str(project)
+
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_turn_cwd", resolve_worktree)
+
+    class Ledger:
+        def normalize_discord_pr_generation(self, value):
+            return int(value)
+
+        def discord_pr_generation(self, _session_key):
+            return 1
+
+        def claim(self, *_args, **_kwargs):
+            assert worker_started.is_set()
+            resolver_release.set()
+
+    runner._ledger = lambda: Ledger()
+
+    await runner._handle_message(event)
+
+    assert runner._handle_message_with_agent.await_count == 1
+    worktree_task = runner._handle_message_with_agent.await_args.kwargs[
+        "action_worktree_task"
+    ]
+    assert worktree_task.done()
+    assert captured["worktree"] == (str(project), None, str(project))
 
 
 @pytest.mark.asyncio

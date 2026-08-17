@@ -560,6 +560,16 @@ async def test_promote_existing_question_thread_initializes_action_event(adapter
         discord_action_request_base_channel_prompt="base prompt",
         discord_runtime_mode="read_only",
         discord_action_escalation_allowed=True,
+        metadata={
+            "discord_request_ts": 1.0,
+            "discord_adapter_dispatch_ts": 2.0,
+            "gateway_intake_ts": 3.0,
+            "gateway_admitted_ts": 4.0,
+            "gateway_agent_handler_start_ts": 5.0,
+            "gateway_flow_phase_timestamps": {"request_ts": 1.0},
+            "gateway_flow_phase_durations": {"ledger_claim_ms": 7},
+            "preserved": "yes",
+        },
     )
     adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
     adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
@@ -596,6 +606,20 @@ async def test_promote_existing_question_thread_initializes_action_event(adapter
     assert promoted.reply_to_text == "Earlier context"
     assert promoted.channel_context == "[Recent channel messages]\nprior context"
     assert promoted.goal_thread_context == "[Goal thread context]\nprior goal context"
+    assert promoted.metadata is not event.metadata
+    assert promoted.metadata["preserved"] == "yes"
+    assert promoted.metadata["discord_promotion_handoff_ts"] > 0
+    for key in (
+        "discord_request_ts",
+        "discord_adapter_dispatch_ts",
+        "gateway_intake_ts",
+        "gateway_admitted_ts",
+        "gateway_agent_handler_start_ts",
+        "gateway_flow_phase_timestamps",
+        "gateway_flow_phase_durations",
+    ):
+        assert key not in promoted.metadata
+    assert event.metadata["discord_request_ts"] == 1.0
     assert url == "https://discord.com/channels/5/200"
 
 
