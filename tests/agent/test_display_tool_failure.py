@@ -14,6 +14,7 @@ from agent.display import (
     _ERROR_SUFFIX_MAX_LEN,
     get_cute_tool_message,
 )
+from agent.tool_guardrails import classify_tool_failure
 
 
 class TestTrimError:
@@ -134,6 +135,11 @@ class TestDetectToolFailureStructured:
             "error": None,
         })
         assert _detect_tool_failure("delegate_coding_task", result) == (False, "")
+
+    def test_successful_result_with_stderr_warning_not_flagged(self):
+        result = json.dumps({"success": True, "exit_code": 0, "error": "warning"})
+        assert _detect_tool_failure("read_only_verify", result) == (False, "")
+        assert classify_tool_failure("read_only_verify", result) == (False, "")
 
     def test_success_false_without_error_is_flagged(self):
         result = json.dumps({"success": False, "status": "partial"})

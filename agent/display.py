@@ -1306,7 +1306,7 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     # Structured error in JSON result (any tool that surfaces {"error": ...}).
     if isinstance(data, dict):
         err = data.get("error")
-        if err and (data.get("success") is False or "error" in data):
+        if err and data.get("success") is not True:
             return True, f" [{_trim_error(str(err))}]"
         msg = data.get("message")
         if msg and data.get("success") is False:

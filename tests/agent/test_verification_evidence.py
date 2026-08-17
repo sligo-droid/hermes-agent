@@ -1043,6 +1043,41 @@ def test_final_response_downgrade_skips_later_success():
     assert downgraded == text
 
 
+def test_failed_build_does_not_block_precise_success_claims_for_other_checks():
+    text = (
+        "**Fresh verification**\n"
+        "- Focused tests: 6 passed\n"
+        "- Svelte check: 0 errors, 0 warnings\n"
+        "- Vercel: passed\n"
+    )
+    evidence = [
+        {
+            "surface": "verification",
+            "check_name": "pnpm --dir dashboard build",
+            "status": "failure",
+            "order": 1,
+        }
+    ]
+
+    assert claim_constraints_for_text(text, evidence)["allowed"] is True
+
+
+def test_failed_test_blocks_matching_focused_test_success_claim():
+    evidence = [
+        {
+            "surface": "verification",
+            "check_name": "pnpm test -- src/routes/state/page-source.test.ts",
+            "status": "failure",
+            "order": 1,
+        }
+    ]
+
+    constraints = claim_constraints_for_text("Focused tests: 6 passed", evidence)
+
+    assert constraints["allowed"] is False
+    assert constraints["blocked_surfaces"][0]["check_name"].startswith("pnpm test")
+
+
 def test_read_only_verify_accepts_success_receipt_before_loop_warning():
     receipt = {
         "success": True,

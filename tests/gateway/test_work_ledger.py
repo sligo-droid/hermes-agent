@@ -2596,8 +2596,24 @@ def test_merge_never_policy_allows_unmerged_pr_after_passed_visual_qa(tmp_path):
 
     ledger.mark_agent_done(
         item["id"],
-        final_response="PR opened but not merged; approval is pending.",
+        final_response=(
+            "Fresh verification:\n"
+            "- Focused tests: 6 passed\n"
+            "- Svelte check: 0 errors, 0 warnings\n"
+            "- Vercel: passed\n"
+            "PR opened but not merged; approval is pending."
+        ),
         summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "verification",
+                    "check_name": "pnpm --dir dashboard build",
+                    "status": "failure",
+                    "order": 1,
+                }
+            ]
+        },
         visual_qa_receipts=[_visual_receipt(requirement, order=3)],
         visual_qa_code_mutation_observed=True,
         visual_qa_min_receipt_order=2,
@@ -2607,7 +2623,7 @@ def test_merge_never_policy_allows_unmerged_pr_after_passed_visual_qa(tmp_path):
     assert stored["completion_gate"]["allowed_to_complete"] is True
     assert stored["completion_gate"]["reason"] == "no_self_declared_delivery_gap"
     assert stored["completion_gate"]["visual_qa"]["status"] == "passed"
-    assert stored["final_response"] == "PR opened but not merged; approval is pending."
+    assert stored["final_response"].endswith("PR opened but not merged; approval is pending.")
 
 
 def test_full_lifecycle_blocks_unsynced_runtime_and_unverified_live_pickup(tmp_path):
