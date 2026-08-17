@@ -114,6 +114,42 @@ def test_matching_profiles_returns_only_valid_exact_origin_profiles(
     ) == ()
 
 
+def test_profile_matches_dynamic_loopback_port_pattern(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    secrets = hermes_home / "secrets"
+    secrets.mkdir(parents=True)
+    env_file = secrets / "pid-qa-readonly.env"
+    env_file.write_text(
+        "PID_QA_USERNAME=hermes_qa\nPID_QA_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = _profile_config(env_file)
+    profile = config["browser"]["auth_profiles"]["pid_hermes_qa"]
+    profile["origins"] = []
+    profile["origin_patterns"] = ["http://127.0.0.1:*"]
+
+    for port in (1, 41649, 65535):
+        assert matching_browser_auth_profile_names(
+            f"http://127.0.0.1:{port}", config=config
+        ) == ("pid_hermes_qa",)
+    assert matching_browser_auth_profile_names(
+        "http://127.0.0.1", config=config
+    ) == ()
+    assert matching_browser_auth_profile_names(
+        "http://localhost:41649", config=config
+    ) == ()
+    for origin in ("http://127.0.0.1:0", "http://127.0.0.1:65536"):
+        with pytest.raises(BrowserAuthProfileError, match="invalid origin"):
+            matching_browser_auth_profile_names(origin, config=config)
+
+    profile["origin_patterns"] = ["http://[::1]:*"]
+    assert matching_browser_auth_profile_names(
+        "http://[::1]:41649", config=config
+    ) == ("pid_hermes_qa",)
+
+
 def test_profile_matches_narrow_vercel_preview_origin_pattern(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     secrets = hermes_home / "secrets"
@@ -153,6 +189,16 @@ def test_profile_matches_narrow_vercel_preview_origin_pattern(tmp_path, monkeypa
         "https://pid-git-*-example.com:443",
         "https://pid-git-*-example.com/path",
         "https://pid-*-*.vercel.app",
+        "http://0.0.0.0:*",
+        "http://127.0.0.*:*",
+        "https://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::2]:*",
+        "http://user@127.0.0.1:*",
+        "http://127.0.0.1:*/",
+        "http://127.0.0.1:*?query=1",
+        "http://127.0.0.1:*#fragment",
+        "https://example.com:*/",
     ],
 )
 def test_profile_rejects_broad_or_invalid_origin_patterns(

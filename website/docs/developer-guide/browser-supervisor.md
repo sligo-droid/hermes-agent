@@ -109,6 +109,7 @@ browser:
       origins:
         - http://127.0.0.1:5173
       origin_patterns:
+        - http://127.0.0.1:*
         - https://pid-git-*-sligo-labs.vercel.app
       env_file: pid-qa-readonly.env
       username_env: PID_QA_USERNAME
@@ -119,10 +120,12 @@ browser:
       success_selector: "#header"
 ```
 
-`origins` are exact. `origin_patterns` support one wildcard inside one HTTPS
-hostname label. Patterns must include a fixed, specific prefix and suffix;
-broad patterns such as `https://*.vercel.app` are rejected. Use a project and
-team-specific pattern so credentials cannot reach an unrelated preview.
+`origins` are exact. `origin_patterns` support either one wildcard inside one
+HTTPS hostname label or an explicit dynamic-port pattern for
+`http://127.0.0.1:*` / `http://[::1]:*`. Hostname patterns must include a fixed,
+specific prefix and suffix; broad patterns such as `https://*.vercel.app` are
+rejected. A loopback wildcard trusts every process listening on that host, so
+use it only for repository launchers with dedicated least-privilege credentials.
 
 Relative credential paths resolve beneath `$HERMES_HOME/secrets`. The file
 must be a regular file owned by the Hermes user with no group or world access.

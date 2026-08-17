@@ -15,6 +15,7 @@ from hermes_constants import get_hermes_home
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_LOOPBACK_PORT_PATTERN_RE = re.compile(r"^http://(?:127\.0\.0\.1|\[::1\]):\*$")
 
 
 class BrowserAuthProfileError(ValueError):
@@ -86,7 +87,13 @@ def matching_browser_auth_profile_names(
 
 def _normalize_origin(value: Any) -> str:
     text = str(value or "").strip()
-    parsed = urlsplit(text)
+    try:
+        parsed = urlsplit(text)
+        parsed_port = parsed.port
+    except ValueError:
+        raise BrowserAuthProfileError(
+            "browser auth profile has an invalid origin"
+        ) from None
     if (
         parsed.scheme.lower() not in {"http", "https"}
         or not parsed.hostname
@@ -95,24 +102,33 @@ def _normalize_origin(value: Any) -> str:
         or parsed.query
         or parsed.fragment
         or parsed.path not in {"", "/"}
+        or parsed_port == 0
     ):
         raise BrowserAuthProfileError("browser auth profile has an invalid origin")
     host = parsed.hostname.lower()
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    port = f":{parsed.port}" if parsed.port is not None else ""
+    port = f":{parsed_port}" if parsed_port is not None else ""
     return f"{parsed.scheme.lower()}://{host}{port}"
 
 
 def _normalize_origin_pattern(value: Any) -> str:
     text = str(value or "").strip().lower()
-    parsed = urlsplit(text)
+    if _LOOPBACK_PORT_PATTERN_RE.fullmatch(text):
+        return text
+    try:
+        parsed = urlsplit(text)
+        parsed_port = parsed.port
+    except ValueError:
+        raise BrowserAuthProfileError(
+            "browser auth profile has an invalid origin pattern"
+        ) from None
     host = parsed.hostname or ""
     if (
         parsed.scheme != "https"
         or parsed.username
         or parsed.password
-        or parsed.port is not None
+        or parsed_port is not None
         or parsed.query
         or parsed.fragment
         or parsed.path not in {"", "/"}
@@ -136,6 +152,9 @@ def _normalize_origin_pattern(value: Any) -> str:
 
 
 def _origin_matches_pattern(origin: str, pattern: str) -> bool:
+    if _LOOPBACK_PORT_PATTERN_RE.fullmatch(pattern):
+        prefix = pattern[:-1]
+        return origin.startswith(prefix) and origin[len(prefix) :].isdigit()
     expression = re.escape(pattern).replace(r"\*", r"[a-z0-9-]+")
     return re.fullmatch(expression, origin) is not None
 
