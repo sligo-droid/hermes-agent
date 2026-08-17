@@ -130,15 +130,24 @@ def test_profile_matches_dynamic_loopback_port_pattern(tmp_path, monkeypatch):
     profile["origins"] = []
     profile["origin_patterns"] = ["http://127.0.0.1:*"]
 
-    assert matching_browser_auth_profile_names(
-        "http://127.0.0.1:41649", config=config
-    ) == ("pid_hermes_qa",)
+    for port in (1, 41649, 65535):
+        assert matching_browser_auth_profile_names(
+            f"http://127.0.0.1:{port}", config=config
+        ) == ("pid_hermes_qa",)
     assert matching_browser_auth_profile_names(
         "http://127.0.0.1", config=config
     ) == ()
     assert matching_browser_auth_profile_names(
         "http://localhost:41649", config=config
     ) == ()
+    for origin in ("http://127.0.0.1:0", "http://127.0.0.1:65536"):
+        with pytest.raises(BrowserAuthProfileError, match="invalid origin"):
+            matching_browser_auth_profile_names(origin, config=config)
+
+    profile["origin_patterns"] = ["http://[::1]:*"]
+    assert matching_browser_auth_profile_names(
+        "http://[::1]:41649", config=config
+    ) == ("pid_hermes_qa",)
 
 
 def test_profile_matches_narrow_vercel_preview_origin_pattern(tmp_path, monkeypatch):
@@ -183,6 +192,13 @@ def test_profile_matches_narrow_vercel_preview_origin_pattern(tmp_path, monkeypa
         "http://0.0.0.0:*",
         "http://127.0.0.*:*",
         "https://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::2]:*",
+        "http://user@127.0.0.1:*",
+        "http://127.0.0.1:*/",
+        "http://127.0.0.1:*?query=1",
+        "http://127.0.0.1:*#fragment",
+        "https://example.com:*/",
     ],
 )
 def test_profile_rejects_broad_or_invalid_origin_patterns(
