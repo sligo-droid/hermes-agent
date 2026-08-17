@@ -7057,9 +7057,15 @@ class DiscordAdapter(BasePlatformAdapter):
             str(target.get("message_id") or "").strip(),
             str(target.get("source_message_id") or "").strip(),
         }
-        if latest_summary_state is not None and latest_summary_state[0] not in target_message_ids:
+        if latest_summary_state is not None and (
+            latest_summary_state[0] not in target_message_ids
+            or (
+                latest_summary_state[1] in {"done", "blocked", "errored"}
+                and state in {"active", "running"}
+            )
+        ):
             origin_state = latest_summary_state[1]
-        elif latest_summary_state is not None and latest_summary_state[0] in target_message_ids:
+        elif latest_summary_state is not None:
             origin_state = state
         else:
             origin_state = self._kanban_thread_origin_reaction_state(target, state)
