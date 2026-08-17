@@ -473,6 +473,60 @@ def test_normal_action_creates_and_reuses_thread_worktree(tmp_path, monkeypatch)
     assert reused_worktree == cwd
 
 
+def test_restarted_action_turn_restores_closeout_contract(tmp_path, monkeypatch):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+    session_key = "agent:main:discord:thread:thread-123"
+    feature_summary = {
+        "initial_request": "please resume",
+        "project_context": {"project_path": str(canonical)},
+    }
+    cwd, error, _ = gateway_run._resolve_gateway_turn_cwd(
+        _source(canonical), feature_summary, _config(canonical), session_key
+    )
+    assert error is None
+
+    recovered_source = _source(Path(cwd))
+    resumed_cwd, resumed_error, action_worktree = gateway_run._resolve_gateway_turn_cwd(
+        recovered_source, feature_summary, _config(canonical), session_key
+    )
+    assert resumed_error is None
+    assert resumed_cwd == action_worktree == cwd
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "ledger.json")
+    event = MessageEvent(
+        text="please resume",
+        source=recovered_source,
+        message_id="resume-message",
+        discord_runtime_mode="action",
+        feature_summary=feature_summary,
+    )
+    item = runner.work_ledger.accept_event(
+        event, session_key=session_key, freshness_seconds=60
+    )
+    event.work_item_id = item["id"]
+    state = runner._persist_action_closeout_workspace(
+        event,
+        mutable_path=action_worktree,
+        canonical_path=recovered_source.project_path,
+        config={},
+        mode="enforce",
+        policy={"merge": "never"},
+    )
+    assert state["workspace"]["canonical_path"] == str(canonical)
+
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response="PR ready. It is not merged; approval is pending.",
+    )
+    assert runner.work_ledger.get(item["id"])["completion_gate"]["allowed_to_complete"] is True
+
+
 def test_read_only_turn_never_provisions_but_can_reuse_existing_action_worktree(
     tmp_path,
     monkeypatch,
@@ -592,6 +646,7 @@ def test_next_pr_generation_uses_distinct_worktree_from_refreshed_remote_main(
     _run(updater, "commit", "-m", "merge first PR")
     _run(updater, "push", "origin", "main")
     remote_main = _run(updater, "rev-parse", "HEAD").stdout.strip()
+    source = _source(Path(first_cwd))
 
     second_cwd, second_error, _second_worktree = gateway_run._resolve_gateway_turn_cwd(
         source,

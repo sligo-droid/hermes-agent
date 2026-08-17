@@ -3584,6 +3584,11 @@ def _discord_action_worktree_cwd(
     if not mapped_value:
         return None, None
 
+    mapped_path = Path(mapped_value).expanduser().resolve(strict=False)
+    workspace_root = _DISCORD_ACTION_WORKTREE_ROOT.expanduser().resolve(strict=False)
+    relative_cwd: Optional[Path] = None
+    import subprocess
+
     try:
         from tools.canonical_repo_guard import _repo_info_for_path
 
@@ -3593,19 +3598,46 @@ def _discord_action_worktree_cwd(
             "could not inspect the mapped project checkout before starting: "
             f"{exc}"
         )
+    if info is None and _path_within(mapped_path, workspace_root):
+        try:
+            recovered = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(mapped_path),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--show-toplevel",
+                    "--git-common-dir",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            lines = str(recovered.stdout or "").splitlines()
+            if recovered.returncode == 0 and len(lines) == 2:
+                managed_root, common_dir = map(Path, lines)
+                if common_dir.name == ".git":
+                    info = _repo_info_for_path(common_dir.parent)
+                    relative_cwd = mapped_path.relative_to(managed_root)
+        except Exception:
+            info = None
+            relative_cwd = None
     if info is None:
         return None, None
 
-    try:
-        mapped_path = Path(mapped_value).expanduser().resolve(strict=False)
-        relative_cwd = mapped_path.relative_to(info.repo_root)
-    except Exception:
-        return None, (
-            "the mapped Discord project path is not inside its protected canonical "
-            f"repository: {mapped_value}"
-        )
+    if relative_cwd is None:
+        try:
+            relative_cwd = mapped_path.relative_to(info.repo_root)
+        except Exception:
+            return None, (
+                "the mapped Discord project path is not inside its protected canonical "
+                f"repository: {mapped_value}"
+            )
 
-    workspace_root = _DISCORD_ACTION_WORKTREE_ROOT.expanduser().resolve(strict=False)
     if provision:
         try:
             workspace_root.mkdir(parents=True, exist_ok=True)
@@ -3613,8 +3645,6 @@ def _discord_action_worktree_cwd(
             return None, (
                 f"could not prepare the mutable action-worktree root {workspace_root}: {exc}"
             )
-
-    import subprocess
 
     def _git(args: list[str], *, timeout: float = 30.0) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -6776,6 +6806,14 @@ class _GatewayRunnerCore(
         if not work_id or not root_text:
             return None
         root = Path(root_text).expanduser().resolve(strict=False)
+        feature_summary = getattr(event, "feature_summary", None)
+        project_context = (
+            feature_summary.get("project_context")
+            if isinstance(feature_summary, dict)
+            and isinstance(feature_summary.get("project_context"), dict)
+            else {}
+        )
+        canonical_path = str(project_context.get("project_path") or canonical_path or "")
         repository = ""
         branch = ""
         try:
