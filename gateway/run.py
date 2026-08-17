@@ -23727,6 +23727,8 @@ class _GatewayRunnerCore(
             return fallback
         if not isinstance(item, dict):
             return fallback
+        status = str(item.get("status") or "")
+        summary_status = str(item.get("summary_status") or "").strip().lower()
         if item.get("closeout_authoritative") is True and isinstance(
             item.get("closeout"),
             dict,
@@ -23747,6 +23749,24 @@ class _GatewayRunnerCore(
                         "errored",
                     }:
                         return "Failed"
+                    delivered_terminal_statuses = {
+                        "complete",
+                        "completed",
+                        "done",
+                        "success",
+                        "succeeded",
+                        "failed",
+                        "failure",
+                        "error",
+                        "errored",
+                        "interrupted",
+                        "blocked",
+                    }
+                    if (
+                        status in {"response_delivered", "summary_updated", "completed", "failed", "blocked"}
+                        and summary_status in delivered_terminal_statuses
+                    ):
+                        return str(item.get("summary_status") or fallback)
                     return "Running"
             except Exception:
                 return "Running"

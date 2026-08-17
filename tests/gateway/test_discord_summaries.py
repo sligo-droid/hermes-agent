@@ -3599,6 +3599,24 @@ def test_successful_rollout_ledger_status_maps_to_complete_reaction(adapter, tmp
     assert adapter._summary_status_reaction_emoji(status) == "✅"
 
 
+def test_delivered_terminal_summary_is_not_reopened_by_pending_closeout():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = SimpleNamespace(
+        get=lambda _work_id: {
+            "status": "summary_updated",
+            "summary_status": "Complete",
+            "closeout_authoritative": True,
+            "closeout": {
+                "mode": "enforce",
+                "status": "waiting_for_preview",
+                "policy": {"require_preview": True},
+            },
+        }
+    )
+
+    assert runner._discord_ledger_summary_status("work-1", "Complete") == "Complete"
+
+
 def test_runner_summarizes_long_discord_feature_outcome():
     runner = object.__new__(gateway_run.GatewayRunner)
     response = SimpleNamespace(
