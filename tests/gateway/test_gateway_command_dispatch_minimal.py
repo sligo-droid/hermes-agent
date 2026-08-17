@@ -275,13 +275,18 @@ async def test_promoted_action_startup_cancellation_releases_scoped_state(
     event._discord_promotion_origin_generation = 1
     runner._consume_promoted_replay_fence = AsyncMock(return_value=True)
     runner._hydrate_discord_feature_summary_from_adapter = lambda _event: None
-    runner._claim_active_session_slot = lambda *_args: (MagicMock(), None)
+    session_slot_lease = MagicMock()
+    runner._claim_active_session_slot = lambda *_args: (session_slot_lease, None)
+    runner._session_run_generation[session_key] = 7
     runner._begin_session_run_generation = lambda _key: 7
-    runner._open_start_user_followups = lambda *_args: None
     runner._refresh_active_agent_runtime_status = lambda: None
     runner._release_turn_lease = MagicMock()
-    runner._release_running_agent_state = MagicMock(return_value=True)
+    runner._release_running_agent_state = (
+        gateway_run.GatewayRunner._release_running_agent_state.__get__(runner)
+    )
     runner._handle_message_with_agent = AsyncMock()
+    runner._pending_start_user_followups = {session_key: {7: ["queued"]}}
+    runner._busy_ack_ts = {session_key: 1.0}
 
     def accept_item(accepted_event, _session_key):
         accepted_event.work_item_id = "work-1"
@@ -333,7 +338,16 @@ async def test_promoted_action_startup_cancellation_releases_scoped_state(
 
     ledger = Ledger()
     runner._ledger = lambda: ledger
-    task = asyncio.create_task(runner._handle_message(event))
+    original_create_task = asyncio.create_task
+    created_tasks = []
+
+    def capture_create_task(coro, *args, **kwargs):
+        created = original_create_task(coro, *args, **kwargs)
+        created_tasks.append(created)
+        return created
+
+    monkeypatch.setattr(gateway_run.asyncio, "create_task", capture_create_task)
+    task = original_create_task(runner._handle_message(event))
     await asyncio.wait_for(stage_entered.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -341,11 +355,50 @@ async def test_promoted_action_startup_cancellation_releases_scoped_state(
     claim_release.set()
 
     runner._handle_message_with_agent.assert_not_awaited()
-    runner._release_running_agent_state.assert_called_once_with(
-        session_key,
-        run_generation=7,
+    assert len(created_tasks) == 1
+    assert created_tasks[0].done()
+    runner._release_turn_lease.assert_called_once_with(session_key, 7)
+    assert session_key not in runner._running_agents
+    assert session_key not in runner._running_agents_ts
+    assert session_key not in runner._running_discord_pr_generations
+    assert session_key not in runner._running_discord_runtime_modes
+    assert session_key not in runner._pending_start_user_followups
+    assert session_key not in runner._active_session_leases
+    assert session_key not in runner._busy_ack_ts
+    session_slot_lease.release.assert_called_once_with()
+
+
+def test_scoped_running_state_cleanup_preserves_newer_generation():
+    runner, _adapter = _make_runner()
+    session_key = build_session_key(_make_source())
+    newer_agent = object()
+    newer_slot_lease = MagicMock()
+    runner._session_run_generation[session_key] = 8
+    runner._running_agents[session_key] = newer_agent
+    runner._running_agents_ts[session_key] = 8.0
+    runner._running_discord_pr_generations = {session_key: 8}
+    runner._running_discord_runtime_modes = {session_key: "action"}
+    runner._pending_start_user_followups = {
+        session_key: {7: ["old"], 8: ["newer"]}
+    }
+    runner._active_session_leases = {session_key: newer_slot_lease}
+    runner._busy_ack_ts = {session_key: 8.0}
+    runner._release_turn_lease = MagicMock()
+    runner._release_running_agent_state = (
+        gateway_run.GatewayRunner._release_running_agent_state.__get__(runner)
     )
-    runner._release_turn_lease.assert_not_called()
+
+    assert runner._release_running_agent_state(session_key, run_generation=7) is False
+
+    runner._release_turn_lease.assert_called_once_with(session_key, 7)
+    assert runner._running_agents[session_key] is newer_agent
+    assert runner._running_agents_ts[session_key] == 8.0
+    assert runner._running_discord_pr_generations[session_key] == 8
+    assert runner._running_discord_runtime_modes[session_key] == "action"
+    assert runner._pending_start_user_followups[session_key] == {8: ["newer"]}
+    assert runner._active_session_leases[session_key] is newer_slot_lease
+    assert runner._busy_ack_ts[session_key] == 8.0
+    newer_slot_lease.release.assert_not_called()
 
 
 @pytest.mark.asyncio
