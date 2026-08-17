@@ -2124,10 +2124,13 @@ def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
     """Record a served skill_view so an identical repeat can be deduped."""
     if not task_id:
         return
-    # Never dedup setup-needed views: readiness depends on config/env state
-    # that can change without the skill file changing, and the model must
-    # see the refreshed setup status on a re-view.
-    if payload.get("setup_needed") or payload.get("readiness_status") == "setup_needed":
+    # Never dedup incomplete or setup-needed views: a later request may need
+    # the full body or refreshed readiness state even when the file is unchanged.
+    if (
+        payload.get("content_truncated")
+        or payload.get("setup_needed")
+        or payload.get("readiness_status") == "setup_needed"
+    ):
         return
     fp = _skill_view_fingerprint(payload)
     if fp is None:

@@ -31,8 +31,8 @@ def skills_home(tmp_path, monkeypatch):
     return home
 
 
-def _view(name, file_path=None, task="t-svd"):
-    args = {"name": name}
+def _view(name, file_path=None, task="t-svd", full_content=False):
+    args = {"name": name, "full_content": full_content}
     if file_path:
         args["file_path"] = file_path
     return json.loads(_skill_view_with_bump(args, task_id=task))
@@ -52,6 +52,18 @@ class TestSkillViewDedup:
         assert r2.get("content_returned") is False
         assert "unchanged" in r2["message"]
         assert "content" not in r2
+
+    def test_bounded_view_does_not_block_full_content_retry(self, skills_home):
+        md = skills_home / "skills" / "demo-dedup-skill" / "SKILL.md"
+        md.write_text(md.read_text() + ("x" * 20_000))
+
+        bounded = _view("demo-dedup-skill")
+        full = _view("demo-dedup-skill", full_content=True)
+
+        assert bounded["content_truncated"] is True
+        assert full.get("dedup") is None
+        assert full["content_truncated"] is False
+        assert len(full["content"]) == full["content_total_chars"]
 
     def test_modified_skill_returns_full_content(self, skills_home):
         _view("demo-dedup-skill")
