@@ -1244,6 +1244,33 @@ def test_expiration_terminalizes_active_run_and_marks_reaction_repair(tmp_path):
     assert stored["terminal_reaction_state"] == "errored"
 
 
+def test_expiration_preserves_delivered_success(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="delivered-success")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Done and delivered.",
+        summary_status="Complete",
+        already_delivered=True,
+    )
+    assert ledger.mark_summary_updated(item["id"])
+
+    assert ledger.mark_expired(item["id"])
+
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "completed"
+    assert stored["summary_status"] == "Complete"
+    assert stored["final_response"] == "Done and delivered."
+    assert stored["terminal_reaction_state"] == "done"
+    assert stored["terminal_reaction_sync_pending"] is True
+
+
 def test_discord_thread_reaction_uses_latest_terminal_after_incomplete_clears(tmp_path):
     now = [100.0]
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now[0])

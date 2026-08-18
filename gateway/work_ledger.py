@@ -6020,6 +6020,17 @@ class GatewayWorkLedger:
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
             return False
+        if (
+            str(item.get("status") or "") in {"response_delivered", "summary_updated"}
+            and str(item.get("summary_status") or "").strip().lower()
+            in {"complete", "completed", "done", "success", "succeeded"}
+        ):
+            item["status"] = "completed"
+            item["updated_at"] = self._now()
+            item["terminal_reaction_state"] = "done"
+            item["terminal_reaction_sync_pending"] = True
+            self._write(data)
+            return True
         terminal_delivery = (
             item.get("terminal_delivery")
             if isinstance(item.get("terminal_delivery"), dict)
